@@ -1,5 +1,6 @@
 """Packed target rows preserve long per-request windows and accepted cache records."""
 import os
+from copy import copy
 from pathlib import Path
 import pytest
 import torch
@@ -9,6 +10,7 @@ from ignition.components.paged_batch import Metadata
 from ignition.components.ring_commit import PreparedRingCommit
 from ignition.preparation.aot import aot_forward
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.graphs import PreparedGraphBundle
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.deepseek41.attention import AttentionScratch, PreparedAttention, Rotary
@@ -40,9 +42,22 @@ class Forward:
         self.attention(self.source)
         self.commit(self.lengths)
 
+
+class QueryReuseForward(Forward):
+    def __init__(self, attention, commit, source, lengths, scratch, arena):
+        super().__init__(attention, commit, source, lengths)
+        self.scratch, self.arena = scratch, arena
+
+    def __call__(self):
+        super().__call__()
+        # Later decoder work may immediately reuse the branch input and arena.
+        self.scratch.query_low.fill_(float('nan'))
+        self.arena.tensor.fill_(255)
+
+@pytest.mark.parametrize('overlap',[False,True])
 @pytest.mark.parametrize('lengths',[(6,2),(6,5,4,3,2,2,1,1),(6,4,1,1,1,1,1,1)])
 @torch.no_grad()
-def test_packed_attention_and_ring_commit_cross_window_boundary(weights,lengths):
+def test_packed_attention_and_ring_commit_cross_window_boundary(weights,lengths,overlap):
     torch._dynamo.reset()
     data,config=weights
     device=torch.device('cuda:0');batch=len(lengths);tokens=sum(lengths);width=max(lengths)
@@ -58,7 +73,7 @@ def test_packed_attention_and_ring_commit_cross_window_boundary(weights,lengths)
     source=torch.randn((tokens,5120),dtype=torch.bfloat16,device=device)*.1
     commit=PreparedRingCommit(pool.reserved_backing,[pool.layout.region('layer0.window').offset],
         metadata.state_rows,metadata.starts,token_capacity=width,window_tokens=128,record_bytes=528)
-    arena=ScratchArena(device,overlap=True)
+    arena=ScratchArena(device,overlap=overlap)
     with RecordedPreparationSession(device=device,checkpoint='ds41-packed-window',
             workload_schema='packed-prefix-window',numerical_policy='checkpoint',compile_workers=16) as session:
         session.register_scratch(arena)
@@ -85,3 +100,86 @@ def test_packed_attention_and_ring_commit_cross_window_boundary(weights,lengths)
                         assert torch.equal(pool.window(0)[row+1,start:start+528],expected[offset+column])
                     offset+=count
         finally:graph.reset()
+
+
+@torch.no_grad()
+def test_query_expansion_overlap_preserves_native_attention_and_cache_bytes(weights):
+    """Shared numerical plans isolate stream scheduling under mutable packed inputs."""
+    torch._dynamo.reset()
+    data, config = weights
+    device = torch.device('cuda:0')
+    tokens, batch, width = 12, 2, 8
+    pool = ContinuationPool.allocate(config, batch + 1, 3, device)
+    metadata = Metadata.allocate(tokens, batch, 1, device, max_query_tokens=width)
+    scratch = AttentionScratch.allocate(tokens, 4, device)
+    source = torch.randn((tokens, 5120), dtype=torch.bfloat16, device=device) * .1
+    counts = torch.tensor([8, 4], dtype=torch.int32, device=device)
+    starts = torch.full((batch,), 4093, dtype=torch.int64, device=device)
+    states = torch.arange(1, batch + 1, dtype=torch.int64, device=device)
+    pages = torch.ones((batch, 1), dtype=torch.int32, device=device)
+    inputs = torch.zeros((batch, width), dtype=torch.int64, device=device)
+    live = torch.tensor([batch], dtype=torch.int32, device=device)
+    metadata.set(starts, counts, states, pages, inputs, live)
+    commit = PreparedRingCommit(pool.reserved_backing, [pool.layout.region('layer0.window').offset],
+        metadata.state_rows, metadata.starts, token_capacity=width, window_tokens=128, record_bytes=528)
+    arena = ScratchArena(device, overlap=True)
+    graphs, owners = {}, []
+    with RecordedPreparationSession(device=device, checkpoint='ds41-query-overlap',
+            workload_schema='packed-native-query', numerical_policy='checkpoint', compile_workers=16) as session:
+        session.register_scratch(arena)
+        attention = PreparedAttention(0, data, source, scratch, metadata, pool, Rotary(config, device),
+            mode='verify', world=4, session=session, name='attention', workspace=arena,
+            window_staging=commit.staging[0])
+        assert attention.concurrent_query is not None
+        serial = copy(attention)
+        serial.concurrent_query = None
+        session.tune(show_progress=False)
+        for name, operation in (('serial', serial), ('overlap', attention)):
+            forward = QueryReuseForward(operation, commit, source, metadata.lengths, scratch, arena)
+            compiled = aot_forward(forward)
+            compiled(forward)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                compiled(forward)
+            graphs[name] = graph
+            owners.extend((forward, compiled))
+        session.freeze()
+        bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers={'source': source},
+            resources=(data, pool, scratch, metadata, commit, arena, session, owners))
+        worker = bundle.start_worker()
+        try:
+            for lengths in ((8, 4), (1, 0), (5, 2)):
+                counts.copy_(torch.tensor(lengths, dtype=torch.int32, device=device))
+                metadata.set(starts, counts, states, pages, inputs, live)
+                source.normal_(std=.1)
+                pool.clear_for_preparation()
+                window = pool.window(0)
+                history = torch.randn((window.shape[0] * 128, 512), dtype=torch.bfloat16, device=device) * .1
+                window.copy_(pack_deepseek_v41_cache_reference(history, page_size=128,
+                             cache_kind='swa').reshape_as(window))
+                saved = pool.backing.clone()
+                expected = None
+                for name in ('serial', 'overlap', 'overlap', 'serial'):
+                    pool.backing.copy_(saved)
+                    arena.tensor.fill_(0xA5)
+                    scratch.output.fill_(float('nan'))
+                    torch.cuda.synchronize()
+                    before = torch.cuda.memory_stats()
+                    ticket = worker.submit(bundle.graph_indices[name])
+                    result = worker.poll(timeout_ms=120000)
+                    assert result is not None and result.ticket == ticket and result.error is None
+                    after = torch.cuda.memory_stats()
+                    for counter in ('allocation.all.allocated', 'allocation.all.freed',
+                                    'segment.all.allocated', 'segment.all.freed'):
+                        assert before[counter] == after[counter]
+                    actual = (scratch.query, scratch.attended, scratch.output, pool.backing)
+                    if expected is None:
+                        expected = tuple(value.clone() for value in actual)
+                    else:
+                        for value, reference in zip(actual, expected, strict=True):
+                            assert torch.equal(value, reference)
+        finally:
+            worker.close()
+            for graph in graphs.values():
+                graph.reset()
