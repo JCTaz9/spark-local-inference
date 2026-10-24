@@ -66,11 +66,14 @@ Windows native builds also require Perl for the bundled static OpenSSL build,
 alongside the C/C++ toolchain. The resulting binaries do not require OpenSSL DLLs.
 
 The JPEG decoder builds its bundled libjpeg-turbo source. Preparation requires
-the CUDA toolkit, including `nvcc` and CUPTI; configure `[paths] cuda` when it
-is not supplied by the Python environment.
+the CUDA toolkit, including `nvcc` and CUPTI. Native build libraries discover
+the system toolkit; `[paths] cuda` overrides that discovery with an explicit
+toolkit directory.
 
 The `prepare` extra installs `cuda-tile[tileiras]`, including the `tileiras`
 compiler toolchain required by cuTile kernels during model preparation.
+cuTile discovers its matching compiler tools in the Python environment
+independently of the toolkit used for native builds.
 
 The DeepSeek Rust crates share a pinned revision of
 [`local-inference-lab/deepseek-recipe`](https://github.com/local-inference-lab/deepseek-recipe)

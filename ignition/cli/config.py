@@ -180,7 +180,7 @@ class Configuration:
             f'# kernel_cache = "{self.get("paths.kernel_cache").value}"',
             f'# package_cache = "{self.get("paths.package_cache").value}"',
             '# export_staging = ""            # rank files an export assembles from; empty: beside the package',
-            '# cuda = "/opt/cuda"              # used only when the toolkit is not found in installed packages',
+            '# cuda = "/opt/cuda"              # explicit CUDA toolkit directory for native builds',
         ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("\n".join(lines) + "\n")
