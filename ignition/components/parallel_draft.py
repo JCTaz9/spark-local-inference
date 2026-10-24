@@ -3,7 +3,7 @@
 import torch
 
 from .collectives import PreparedAllReduce
-from .draft_sampling import PreparedDraftDistribution
+from .draft_sampling import PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, PreparedBatch
 from .speculation import (
     DRAFT_RNG_DOMAIN,
@@ -193,6 +193,7 @@ class PreparedParallelDraftRound:
             torch.zeros_like(self.before) for _ in range(4)
         )
         self.operations = None
+        self.proposal_block = None
 
     def prepare(self):
         if self.operations is not None:
@@ -226,8 +227,20 @@ class PreparedParallelDraftRound:
                 proposal.bind_logits(self.draft.scratch.logits.view(b, block, -1)[:, index + o.logit_offset],
                     bias)
             proposal.prepare()
+        broadcast_proposals = proposals
+        if proposals and getattr(o, "block_proposal_broadcast", False):
+            if o.markov_runtime is not None or self.selector is not None:
+                raise ValueError("block proposal broadcast requires replicated Markov work without a selector")
+            runtime = getattr(o, "result_runtime", None)
+            if runtime is None:
+                runtime = o.collectives["vocabulary_runtime"]
+            self.proposal_block = PreparedDraftBlockBroadcast(
+                proposals, self.drafts, self.probabilities, self.valid, self.sampled,
+                runtime=runtime, session=o.session, coordinator=o.collectives["coordinator"],
+                name=self.name + ".proposal_block", buffers=self.buffers)
+            broadcast_proposals = ()
         if self.proposal_only:
-            prepare_sampling_broadcasts(proposals, None, collectives=o.collectives, session=o.session,
+            prepare_sampling_broadcasts(broadcast_proposals, None, collectives=o.collectives, session=o.session,
                                         name=self.name, buffers=self.buffers,
                                         result_runtime=getattr(o, "result_runtime", None))
             self.operations = None, proposals, None, None
@@ -244,7 +257,7 @@ class PreparedParallelDraftRound:
             workspace=self.sampling_scratch.get("verify"),
         )
         verify.prepare()
-        prepare_sampling_broadcasts(proposals, verify, collectives=o.collectives, session=o.session,
+        prepare_sampling_broadcasts(broadcast_proposals, verify, collectives=o.collectives, session=o.session,
                                     name=self.name, buffers=self.buffers,
                                     result_runtime=getattr(o, "result_runtime", None))
         commit = PreparedSpeculativeCommit(
@@ -327,8 +340,14 @@ class PreparedParallelDraftRound:
                 self.offset.copy_(self.base_offset + 4 * i)
                 proposal()
                 self.drafts[:, i].copy_(self.sampled)
-                self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
-                self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
+                if self.proposal_block is None:
+                    self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
+                    self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
+                else:
+                    self.proposal_block.retain(i, proposal)
+                self.markov_token.copy_(self.sampled)
+            if self.proposal_block is not None:
+                self.proposal_block.finish(self.active, limits)
                 self.markov_token.copy_(self.sampled)
             if advance_rng:
                 self.commit_draft_rng()
