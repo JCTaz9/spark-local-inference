@@ -36,7 +36,7 @@ class SamplingRound:
                 self.verify.state.seed.view(torch.int64), self.verify.state.rng_counter.view(torch.int64))
 
 
-def _rank(rank, world, rendezvous, result_channel=False):
+def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False):
     from ignition.components.draft_sampling import PreparedDraftDistribution
     from ignition.components.parallel_draft import prepare_sampling_broadcasts, prepare_sampling_scratch
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
@@ -95,6 +95,23 @@ def _rank(rank, world, rendezvous, result_channel=False):
                 proposals = tuple(PreparedDraftDistribution(logits, state, slots[:batch], epochs[:batch], live, ids,
                     prefix_offset=index, seed=seed, offset=offset, sampled=sampled,
                     workspace=workspace["proposal"]) for index in range(width - 1))
+                if divergent_invalid:
+                    if rank == 0:
+                        logits[0].fill_(float("nan"))
+                        if batch > 1:
+                            logits[1].zero_()
+                        if batch > 2:
+                            logits[2].fill_(-10.)
+                            logits[2, :, 0] = 2.
+                            state.top_k[2] = 3
+                    else:
+                        if batch > 1:
+                            logits[1].fill_(float("nan"))
+                        if batch > 2:
+                            logits[2].fill_(-10.)
+                            logits[2, :, 11] = 2.
+                    for proposal in proposals:
+                        proposal.bind_logits(logits[:, 0])
                 for proposal in proposals:
                     proposal.prepare()
                 target = torch.softmax(torch.randn((batch, width, 257),
@@ -183,6 +200,15 @@ def test_native_sampling_result_channel_catalog(tmp_path, world):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     assert torch.cuda.device_count() >= world
     mp.spawn(_rank, args=(world, (tmp_path / "rendezvous").as_uri(), True), nprocs=world, join=True)
+
+
+
+@pytest.mark.parametrize("result_channel", [False, True])
+def test_native_sampling_divergent_support_tp2(tmp_path, result_channel):
+    assert os.environ.get("CUDA_VISIBLE_DEVICES")
+    assert torch.cuda.device_count() >= 2
+    mp.spawn(_rank, args=(2, (tmp_path / "rendezvous").as_uri(), result_channel, True),
+             nprocs=2, join=True)
 
 
 def _byte_rank(rank, world, rendezvous):
