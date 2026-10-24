@@ -48,11 +48,8 @@ def test_reference_policy_preserves_local_csf_checkpoint_and_plan(
     assert "deepseek-v4.1-flash-reference-gemv" not in aliases()
     assert selected.recipe.b12x_environment == RECIPE.b12x_environment
     assert "B12X_DENSE_SPLITK_TURBO" not in RECIPE.b12x_environment
-    assert (
-        selected.recipe.draft_head_quantizations
-        == selected.recipe.markov_head_quantizations
-        == ()
-    )
+    assert selected.recipe.draft_head_quantizations == ("mxfp8",)
+    assert selected.recipe.markov_head_quantizations == ()
     gpus = tuple(
         planning.Gpu(i, "SM120", f"GPU-{i}", 96 << 30, 95 << 30, (12, 0))
         for i in range(4)
@@ -106,7 +103,7 @@ def test_policy_flag_rejects_other_recipes(policy):
         select_attention_projection_policy(resolve("qwen3.8-flash"), policy)
 
 
-def test_reference_config_requires_bf16_mla_and_checkpoint_heads():
+def test_reference_config_requires_bf16_mla_and_explicit_draft_precision():
     from ignition.recipes.deepseek41.bootstrap import PreparationConfig
 
     assert PreparationConfig().attention_projection_policy == "auto"
@@ -114,6 +111,10 @@ def test_reference_config_requires_bf16_mla_and_checkpoint_heads():
         attention_projection_policy="reference-gemv", mla_compute_mode="bf16"
     )
     assert reference.attention_projection_policy == "reference-gemv"
+    draft = replace(reference, draft_head_quantization="mxfp8")
+    assert draft.draft_head_quantization == "mxfp8"
+    assert draft.markov_head_quantization is None
+    assert reference.draft_head_quantization is None
     with pytest.raises(ValueError, match="policy"):
         PreparationConfig(attention_projection_policy="unknown")
     with pytest.raises(ValueError, match="BF16 MLA"):
@@ -126,6 +127,8 @@ def test_reference_config_requires_bf16_mla_and_checkpoint_heads():
             mla_compute_mode="bf16",
             draft_head_quantization="nvfp4",
         )
+    with pytest.raises(ValueError, match="checkpoint heads"):
+        replace(reference, markov_head_quantization="nvfp4")
 
 
 def test_reference_policy_reaches_both_forward_factories():

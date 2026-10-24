@@ -109,8 +109,9 @@ class PreparationConfig:
         if self.attention_projection_policy == "reference-gemv" and self.mla_compute_mode != "bf16":
             raise ValueError("reference attention projection preparation requires BF16 MLA")
         if self.attention_projection_policy == "reference-gemv" and (
-                self.draft_head_quantization is not None or self.markov_head_quantization is not None):
-            raise ValueError("reference attention projection preparation preserves the checkpoint heads")
+                self.draft_head_quantization not in (None, "mxfp8") or self.markov_head_quantization is not None):
+            raise ValueError("reference attention projection preparation preserves checkpoint heads"
+                             " unless an MXFP8 draft head is explicitly selected")
         from ignition.recipes.declaration import Speculation
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
                     markov_head_quantization=self.markov_head_quantization)

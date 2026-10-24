@@ -47,6 +47,28 @@ def test_independent_draft_precision_flags_require_learned_proposals(model, flag
         speculation(args, resolve(model))
 
 
+@pytest.mark.parametrize("policy", ["auto", "reference-gemv"])
+def test_mxfp8_draft_precision_reaches_deepseek41_plan(policy):
+    from ignition import planning
+    from ignition.cli.preparation import speculation
+    from ignition.recipes.deepseek41.recipe import select_attention_projection_policy
+
+    args = _parser().parse_args(["export", "deepseek-v4.1-flash", "--output", "model.safetensors",
+                                "--draft-head-quantization", "mxfp8", "--attention-projection-policy", policy])
+    model = select_attention_projection_policy(resolve(args.model), args.attention_projection_policy)
+    selected = speculation(args, model)
+    gpus = tuple(planning.Gpu(i, "SM120", f"GPU-{i}", 96 << 30, 95 << 30, (12, 0)) for i in range(4))
+    plan = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=1, reserve_bytes=0,
+                        speculation=selected)
+    assert plan.speculation.draft_head_quantization == "mxfp8"
+    assert plan.speculation.markov_head_quantization is None
+    assert plan.attention_projection_policy == policy
+    unsupported = resolve("deepseek-v4-flash")
+    with pytest.raises(UsageError, match="proposal head format"):
+        planning.fit(unsupported.recipe, unsupported.checkpoint, gpus, concurrency=1, reserve_bytes=0,
+                     speculation=selected)
+
+
 @pytest.mark.parametrize("command", [[], ["export"], ["serve"]])
 def test_help_lists_every_recipe(command, capsys):
     with pytest.raises(SystemExit) as error:

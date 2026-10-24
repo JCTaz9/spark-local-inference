@@ -473,6 +473,14 @@ it cannot change an existing package at serving time. The same options apply to
 the DeepSeek V4 Flash recipe. Quantization changes proposal probabilities and can
 change acceptance and throughput; measure both separately and together.
 
+DeepSeek V4.1 also accepts `--draft-head-quantization mxfp8` for an E4M3
+proposal head with one power-of-two scale per 32 weights. Use this option when
+reducing draft projection bandwidth is useful while retaining BF16 activations,
+the BF16 target head, and the checkpoint Markov projection. The default remains
+checkpoint precision; omitting `--draft-head-quantization` selects it. The option
+also composes with `--attention-projection-policy reference-gemv`. It retains a
+separate quantized copy in addition to the target weights, using more GPU memory.
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

@@ -165,16 +165,17 @@ def _preparation_arguments(running):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
-    advanced.add_argument("--draft-head-quantization", choices=("nvfp4",),
-                          help="prepare a separate NVFP4 vocabulary head for learned draft proposals;"
-                               " target verification retains its precision (DeepSeek V4/V4.1)")
+    advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
+                          help="prepare a separate quantized vocabulary head for learned draft proposals;"
+                               " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
+                               " MXFP8: DeepSeek V4.1; default: checkpoint precision)")
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4",),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " (DeepSeek V4/V4.1; default: checkpoint precision)")
     advanced.add_argument("--attention-projection-policy", choices=("auto", "reference-gemv"),
                           help="DeepSeek V4.1 attention projection preparation: auto keeps normal tuning;"
                                " reference-gemv uses reference FP8 activations and source-built GEMV with"
-                               " fused query normalization; preserves checkpoint heads and requires BF16 MLA"
+                               " fused query normalization; requires BF16 MLA and checkpoint Markov weights"
                                " (default: auto)")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
