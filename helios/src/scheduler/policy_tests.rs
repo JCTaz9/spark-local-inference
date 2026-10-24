@@ -53,6 +53,15 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
 }
 
 fn engine(active: usize, speculative: bool) -> RequestScheduler {
+    engine_with_geometry(active, speculative, 64, None)
+}
+
+fn engine_with_geometry(
+    active: usize,
+    speculative: bool,
+    page_tokens: usize,
+    state_rows_per_request: Option<usize>,
+) -> RequestScheduler {
     let mut s = RequestScheduler::new(
         [7; 32],
         SchedulerLimits {
@@ -65,11 +74,11 @@ fn engine(active: usize, speculative: bool) -> RequestScheduler {
         },
         SchedulerCapabilities {
             vocabulary: 1024,
-            page_tokens: 64,
+            page_tokens,
             vision: crate::model::VisionCapabilities::disabled(),
             draft_pages_per_request: 0,
             completion_inputs: vec![],
-            state_rows_per_request: None,
+            state_rows_per_request,
         },
     )
     .unwrap();
@@ -1390,6 +1399,226 @@ fn terminal_snapshot_completes_while_another_long_prompt_is_still_prefilling() {
     }
     assert!(s.request(short).is_err());
     assert!(s.request(long).unwrap().consumed_tokens < 32768);
+}
+
+fn terminal_snapshot_progress_with_ready_decode(policy: PolicyConfig) {
+    let mut s = interactive_engine(2, false);
+    s.configure_policy(policy).unwrap();
+    let continuing = add(&mut s, 1, 64, 4096);
+    let terminal = add(&mut s, 2, 64, 1);
+    let execute = |s: &mut RequestScheduler, kind, handle| {
+        let plan = s.phase_plan(kind, Some(handle));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        s.advance_to(s.now_ns + plan.estimated_duration_ns()).unwrap();
+        complete_timed(s, &plan, fence, 0, true, gpu_time(plan.estimated_duration_ns()));
+    };
+    for handle in [continuing, terminal] {
+        execute(&mut s, GraphKind::Init, handle);
+    }
+    execute(&mut s, GraphKind::Prefill, continuing);
+    execute(&mut s, GraphKind::Snapshot, continuing);
+    execute(&mut s, GraphKind::Prefill, terminal);
+    assert_eq!(s.request(continuing).unwrap().phase, RequestPhase::Decode);
+    assert_eq!(s.request(terminal).unwrap().phase, RequestPhase::Snapshot);
+    assert_eq!(s.request(terminal).unwrap().generated_tokens, 1);
+    assert_eq!(s.request(terminal).unwrap().pending, 0);
+    assert_eq!(s.costs.duration(GraphKind::Snapshot, 1, 1), Some(MS / 10));
+    assert_eq!(s.costs.duration(GraphKind::Decode, 1, 1), Some(15 * MS));
+
+    // Both requests reached these phases through ordinary completion records.
+    // Only the policy chooses subsequent work; the helper retires requests
+    // after Finishing, which is also the runtime's terminal-publication gate.
+    let start = s.now_ns;
+    let mut decode_steps = 0;
+    let mut snapshot_steps = 0;
+    while s.request(terminal).is_ok() && s.now_ns - start < 1000 * MS {
+        match step(&mut s, 0).kind {
+            GraphKind::Decode => decode_steps += 1,
+            GraphKind::Snapshot => snapshot_steps += 1,
+            kind => panic!("unexpected operation while terminal snapshot competes with decode: {kind:?}"),
+        }
+    }
+    eprintln!(
+        "terminal snapshot: elapsed_ns={}, decode_steps={decode_steps}, snapshot_steps={snapshot_steps}, terminal_phase={:?}, continuing_generated={}",
+        s.now_ns - start,
+        s.request(terminal).ok().map(|r| r.phase),
+        s.request(continuing).unwrap().generated_tokens,
+    );
+    assert!(s.request(continuing).unwrap().generated_tokens < 4096);
+    assert!(
+        s.request(terminal).is_err(),
+        "terminal snapshot did not complete within one simulated second while another request continued decoding"
+    );
+}
+
+#[test]
+fn terminal_snapshot_progresses_with_ready_decode_under_balanced_policy() {
+    terminal_snapshot_progress_with_ready_decode(PolicyConfig::default());
+}
+
+#[test]
+fn terminal_snapshot_progresses_with_ready_decode_under_throughput_policy() {
+    terminal_snapshot_progress_with_ready_decode(PolicyConfig::throughput());
+}
+
+fn execute_phase(s: &mut RequestScheduler, kind: GraphKind, handle: RequestHandle) {
+    let plan = s.phase_plan(kind, Some(handle));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    s.advance_to(s.now_ns + plan.estimated_duration_ns()).unwrap();
+    complete_timed(s, &plan, fence, 0, true, gpu_time(plan.estimated_duration_ns()));
+}
+
+#[test]
+fn terminal_snapshot_drains_queued_decode_before_another_submission() {
+    let mut s = engine(2, false);
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    let terminal = add(&mut s, 1, 64, 2);
+    let continuing = add(&mut s, 2, 64, 4096);
+    for handle in [terminal, continuing] {
+        for kind in [GraphKind::Init, GraphKind::Prefill, GraphKind::Snapshot] {
+            execute_phase(&mut s, kind, handle);
+        }
+    }
+    let finish = s.phase_plan(GraphKind::Decode, Some(terminal));
+    assert!(!s.plan_requires_feedback(&finish));
+    let a = Fence(s.submitted.0 + 1);
+    s.commit(&finish, a).unwrap();
+    let other = s.phase_plan(GraphKind::Decode, Some(continuing));
+    assert!(!s.plan_requires_feedback(&other));
+    let b = Fence(a.0 + 1);
+    s.commit(&other, b).unwrap();
+    complete_timed(&mut s, &finish, a, 0, true, gpu_time(MS));
+    assert_eq!(s.request(terminal).unwrap().phase, RequestPhase::Snapshot);
+    assert_eq!(s.submissions.len(), 1);
+    assert!(s.plan().is_none(), "terminal cleanup must stop refilling the pipeline");
+    complete_timed(&mut s, &other, b, 0, true, gpu_time(MS));
+    let publications = s.stats().snapshot_publications;
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Snapshot);
+    assert_eq!(plan.lanes[0].request, terminal);
+    let c = Fence(b.0 + 1);
+    s.commit(&plan, c).unwrap();
+    assert_eq!(s.request(terminal).unwrap().phase, RequestPhase::Snapshot);
+    assert_eq!(s.stats().snapshot_publications, publications);
+    complete_timed(&mut s, &plan, c, 0, true, gpu_time(MS / 10));
+    assert!(s.request(terminal).is_err());
+    assert_eq!(s.stats().snapshot_publications, publications + 1);
+    assert_eq!(s.plan().unwrap().kind, GraphKind::Decode);
+}
+
+#[test]
+fn terminal_snapshot_batch_includes_other_ready_checkpoints() {
+    let mut s = engine(4, false);
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    let handles = [add(&mut s, 1, 64, 1), add(&mut s, 2, 64, 1),
+        add(&mut s, 3, 64, 1), add(&mut s, 4, 64, 4096)];
+    for handle in handles {
+        execute_phase(&mut s, GraphKind::Init, handle);
+        execute_phase(&mut s, GraphKind::Prefill, handle);
+    }
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Snapshot);
+    assert_eq!(plan.batch_capacity, 4);
+    assert_eq!(plan.lanes.len(), 4);
+    step(&mut s, 0);
+    assert!(handles[..3].iter().all(|h| s.request(*h).is_err()));
+    assert_eq!(s.request(handles[3]).unwrap().phase, RequestPhase::Decode);
+}
+
+#[test]
+fn terminal_snapshot_keeps_oldest_request_ahead_of_new_terminal_arrivals() {
+    let mut s = engine(4, false);
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    // Make slot order disagree with admission order.
+    let vacant = add(&mut s, 1, 64, 1);
+    let oldest = add(&mut s, 2, 64, 1);
+    let boundary = add(&mut s, 3, 64, 4096);
+    s.cancel(vacant).unwrap();
+    let younger = add(&mut s, 4, 64, 1);
+    assert!(younger.slot < oldest.slot);
+    for handle in [oldest, boundary, younger] {
+        execute_phase(&mut s, GraphKind::Init, handle);
+        execute_phase(&mut s, GraphKind::Prefill, handle);
+    }
+    for batch in [2, 4] {
+        set_cost(&mut s, GraphKind::Snapshot, batch, 1, 100 * MS);
+    }
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Snapshot);
+    assert_eq!(plan.lanes.len(), 1);
+    assert_eq!(plan.lanes[0].request, oldest);
+    step(&mut s, 0);
+    let arrival = add(&mut s, 5, 64, 1);
+    execute_phase(&mut s, GraphKind::Init, arrival);
+    execute_phase(&mut s, GraphKind::Prefill, arrival);
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Snapshot);
+    assert_eq!(plan.lanes[0].request, younger);
+    step(&mut s, 0);
+    step(&mut s, 0);
+    assert!(s.request(arrival).is_err());
+    assert_eq!(step(&mut s, 0).kind, GraphKind::Snapshot);
+    assert_eq!(s.request(boundary).unwrap().phase, RequestPhase::Decode);
+}
+
+#[test]
+fn terminal_snapshot_publishes_exact_partial_page_for_shared_cache_geometries() {
+    for (page_tokens, state_rows) in [(64, None), (128, Some(1)), (256, Some(3))] {
+        let mut s = engine_with_geometry(4, false, page_tokens, state_rows);
+        s.configure_policy(PolicyConfig::throughput()).unwrap();
+        let terminal = add(&mut s, 1, page_tokens + 1, 1);
+        let continuing = add(&mut s, 2, 64, 4096);
+        for handle in [terminal, continuing] {
+            execute_phase(&mut s, GraphKind::Init, handle);
+            while s.request(handle).unwrap().phase == RequestPhase::Prefill {
+                execute_phase(&mut s, GraphKind::Prefill, handle);
+            }
+        }
+        assert_eq!(s.request(terminal).unwrap().phase, RequestPhase::Snapshot);
+        let plan = s.plan().unwrap();
+        assert_eq!(plan.kind, GraphKind::Snapshot);
+        let publications = s.stats().snapshot_publications;
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+        let spec = RequestSpec { prompt: vec![1; page_tokens + 1], message_boundaries: vec![],
+            conditioning: vec![], max_new_tokens: 1, grammar_constrained: false,
+            host_stops: false, prompt_logprobs: false, growable_output: false };
+        assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), 0);
+        assert_eq!(s.stats().snapshot_publications, publications);
+        complete_timed(&mut s, &plan, fence, 0, true, gpu_time(MS / 10));
+        assert!(s.request(terminal).is_err());
+        assert_eq!(s.plan_admission(&spec).unwrap().resident_tokens(), (page_tokens + 1) as u64);
+    }
+}
+
+#[test]
+fn terminal_snapshot_uses_loaded_shape_with_known_or_unknown_timing() {
+    for nanos in [0, MS / 10] {
+        let mut s = engine(2, false);
+        let mut graphs = super::tests::duration_graphs(2);
+        graphs.retain(|g| g.kind != GraphKind::Snapshot || g.batch_capacity == 2);
+        for graph in &mut graphs {
+            if graph.kind == GraphKind::Snapshot {
+                graph.estimated_duration_ns = nanos;
+            }
+        }
+        s.measured_graph_durations(&graphs).unwrap();
+        s.configure_policy(PolicyConfig::throughput()).unwrap();
+        let terminal = add(&mut s, 1, 64, 1);
+        execute_phase(&mut s, GraphKind::Init, terminal);
+        execute_phase(&mut s, GraphKind::Prefill, terminal);
+        assert_eq!(s.costs.duration(GraphKind::Snapshot, 1, 1), None);
+        assert_eq!(s.costs.duration(GraphKind::Snapshot, 2, 1), Some(nanos));
+        let plan = s.plan().unwrap();
+        assert_eq!(plan.kind, GraphKind::Snapshot);
+        assert_eq!(plan.batch_capacity, 2);
+        assert_eq!(plan.lanes.len(), 1);
+        assert_eq!(plan.origin, if nanos == 0 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary });
+        step(&mut s, 0);
+        assert!(s.request(terminal).is_err());
+    }
 }
 
 #[test]
