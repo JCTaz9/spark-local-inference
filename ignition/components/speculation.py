@@ -88,7 +88,7 @@ class SpeculativeAcceptance:
 
     @classmethod
     def broadcast_layout(cls, batch, width):
-        return {name: layout for name, layout in cls.storage_layout(batch, width).items() if name != "survival"}
+        return cls.storage_layout(batch, width)
 
     @classmethod
     def allocate(cls, batch, width, device):
@@ -292,8 +292,7 @@ class PreparedStochasticVerification:
     def prepare_broadcast(self, **kwargs):
         from .collectives import PreparedBroadcast
 
-        self.broadcast = PreparedBroadcast(tuple(value for name, value in vars(self.output).items()
-                                                 if name != "survival"), **kwargs)
+        self.broadcast = PreparedBroadcast(tuple(vars(self.output).values()), **kwargs)
 
     def prepare(self):
         if self.target_probs.device.type != "cuda":
