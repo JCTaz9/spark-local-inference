@@ -9,7 +9,7 @@ from .decoder import PreparedLayer
 
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
-                 coordinator, session, name, workspace, mla_compute_mode="auto"):
+                 coordinator, session, name, workspace, mla_compute_mode="auto", attention_projection_policy="auto"):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
@@ -22,6 +22,7 @@ class PreparedDraft:
             shard=weights.shard, mode="draft", runtime=runtime, coordinator=coordinator,
             session=session, name=f"{name}.layer{i}", workspace=workspace, carry=i > 0,
             defer_post=i + 1 < len(weights.draft.layers), mla_compute_mode=mla_compute_mode,
+            attention_projection_policy=attention_projection_policy,
             window_metadata=self.window_metadata)
             for i, layer in enumerate(weights.draft.layers))
         self.head_hidden = scratch.buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype)

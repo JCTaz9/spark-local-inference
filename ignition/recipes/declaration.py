@@ -214,6 +214,7 @@ class Recipe:
     b12x_environment: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     mla_compute_modes: tuple[str, ...] = ("auto",)
     mla_compute_mode: str = "auto"
+    attention_projection_policy: str = "auto"
     expert_scale_compression: str | None = None
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
@@ -231,6 +232,8 @@ class Recipe:
                                         speculation.token_capacity if enabled else None))
 
     def __post_init__(self):
+        if self.attention_projection_policy not in ("auto", "reference-gemv"):
+            raise ValueError("unsupported attention projection policy")
         if self.export_repository:
             import re
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*', self.export_repository) or '..' in self.export_repository:

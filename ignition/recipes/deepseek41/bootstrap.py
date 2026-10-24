@@ -52,11 +52,11 @@ from .weights import ModelWeights
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
 
 
-def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision):
+def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision, attention_projection_policy="auto"):
     """Bind one arithmetic contract to target, prefill, and draft attention."""
     return (partial(PreparedDecoder, window_staging=window_staging, suffix_scratch=suffix_scratch,
-                    vision=vision, mla_compute_mode=mla_compute_mode),
-            partial(PreparedDraft, mla_compute_mode=mla_compute_mode))
+                    vision=vision, mla_compute_mode=mla_compute_mode, attention_projection_policy=attention_projection_policy),
+            partial(PreparedDraft, mla_compute_mode=mla_compute_mode, attention_projection_policy=attention_projection_policy))
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,7 @@ class PreparationConfig:
     stream_overlap: bool = True
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
+    attention_projection_policy: str = "auto"
     split_speculation: bool | None = None
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
@@ -103,6 +104,13 @@ class PreparationConfig:
         from ignition.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
+        if self.attention_projection_policy not in ("auto", "reference-gemv"):
+            raise ValueError("attention projection policy must be auto or reference-gemv")
+        if self.attention_projection_policy == "reference-gemv" and self.mla_compute_mode != "bf16":
+            raise ValueError("reference attention projection preparation requires BF16 MLA")
+        if self.attention_projection_policy == "reference-gemv" and (
+                self.draft_head_quantization is not None or self.markov_head_quantization is not None):
+            raise ValueError("reference attention projection preparation preserves the checkpoint heads")
         from ignition.recipes.declaration import Speculation
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
                     markov_head_quantization=self.markov_head_quantization)
@@ -349,7 +357,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity,
-            workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
+            workload_schema="deepseek41-text",
+            numerical_policy=("default" if config.attention_projection_policy == "auto" else
+                              "reference-gemv-e4m3-g32-floor1e-4-bf16-norm"), coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
         session.__enter__()
         session.register_benchmark_resource("continuations", pool, restore=pool.clear_for_preparation)
@@ -387,7 +397,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
-            window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state)
+            window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state,
+            attention_projection_policy=config.attention_projection_policy)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -556,6 +567,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
         "mla_compute_mode": config.mla_compute_mode,
+        "attention_projection_policy": config.attention_projection_policy,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264

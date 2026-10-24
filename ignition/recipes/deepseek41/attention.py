@@ -243,7 +243,7 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", buffers=None, window_metadata=None):
+                 mla_compute_mode="auto", buffers=None, window_metadata=None, attention_projection_policy="auto"):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -291,15 +291,27 @@ class PreparedAttention:
         self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
         self.page_table = metadata.token_page_table
         self.projections = {}
+        self.reference_query_norm = None
+        projection_type = QuantizedProjection
+        if attention_projection_policy == "reference-gemv":
+            from ignition.components.reference_mxfp8 import ReferenceMXFP8Projection, ReferenceQueryNormQuant
+            projection_type = ReferenceMXFP8Projection
+            self.reference_query_norm = ReferenceQueryNormQuant(scratch.projected,
+                (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values, buffers=buffers)
+        elif attention_projection_policy != "auto":
+            raise ValueError("unsupported attention projection policy")
         for key, values, out in (
             ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
         ):
-            self.projections[key] = QuantizedProjection(values, weights[key], out,
-                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
-        self.query_norm = PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
-            eps=self.eps, session=session, name=name + ".q_norm")
-        self.window_norm = PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
-            eps=self.eps, session=session, name=name + ".kv_norm")
+            options = ({"activation_mode": "auto"} if self.reference_query_norm is None else
+                       {"quantized": (self.reference_query_norm.quantized, self.reference_query_norm.scales)}
+                       if key == "q_b" else {})
+            self.projections[key] = projection_type(values, weights[key], out,
+                session=session, name=f"{name}.{key}", workspace=workspace, **options)
+        self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
+            eps=self.eps, session=session, name=name + ".q_norm") if self.reference_query_norm is None else None)
+        self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
+            eps=self.eps, session=session, name=name + ".kv_norm") if self.reference_query_norm is None else None)
         self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
             weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
@@ -355,7 +367,9 @@ class PreparedAttention:
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
         self.concurrent_query = None
         if mode in ("decode", "verify", "draft") and isinstance(workspace, ScratchArena) and workspace.overlap:
-            parallel_plans = [self.window_norm.plan, self.window_writer.plan]
+            parallel_plans = [self.window_writer.plan]
+            if self.window_norm is not None:
+                parallel_plans.append(self.window_norm.plan)
             if self.global_kv is not None:
                 global_kv = self.global_kv
                 compressor = global_kv.compressor
@@ -366,8 +380,13 @@ class PreparedAttention:
             if self.selectors:
                 parallel_plans.extend((self.index_query.plan, self.index_weight.plan))
                 parallel_plans.extend(selector.plan for selector in self.selectors)
-            self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
-                parallel_plans=parallel_plans, session=session, workspace=workspace)
+            if self.reference_query_norm is None:
+                self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
+                    parallel_plans=parallel_plans, session=session, workspace=workspace)
+            else:
+                from ignition.components.reference_mxfp8 import ReferenceProjectionChain
+                self.concurrent_query = ReferenceProjectionChain(self.projections["q_b"],
+                    parallel_plans=parallel_plans, session=session, workspace=workspace)
 
     def __call__(self, source):
         m, s = self.metadata, self.scratch
@@ -377,10 +396,14 @@ class PreparedAttention:
         if self.mode != "decode":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         self.projections["qkv_a"](source)
-        self.query_norm(s.projected[:, :1280])
+        if self.reference_query_norm is None:
+            self.query_norm(s.projected[:, :1280])
+        else:
+            self.reference_query_norm(s.projected)
         if self.concurrent_query is not None:
             self.concurrent_query.start(s.query_low)
-        self.window_norm(s.projected[:, 1280:])
+        if self.reference_query_norm is None:
+            self.window_norm(s.projected[:, 1280:])
         if self.concurrent_query is None:
             self.projections["q_b"](s.query_low)
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))

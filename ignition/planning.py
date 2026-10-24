@@ -177,6 +177,7 @@ class Plan:
     prompt_logprobs: bool = False
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
+    attention_projection_policy: str = "auto"
     roce_ring: bool = False
     roce_chain: bool = False
     compile_workers: int | None = None
@@ -293,6 +294,7 @@ class Plan:
             "prompt_logprobs": self.prompt_logprobs,
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
+            "attention_projection_policy": self.attention_projection_policy,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
@@ -371,7 +373,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                mla_compute_mode=mla_compute_mode,
+                mla_compute_mode=mla_compute_mode, attention_projection_policy=recipe.attention_projection_policy,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,

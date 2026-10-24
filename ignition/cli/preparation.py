@@ -29,11 +29,14 @@ class Host:
         return cls(gpus, restriction)
 
 
-def resolve_model(configuration: Configuration, name: str | None) -> ResolvedModel:
+def resolve_model(configuration: Configuration, name: str | None, *,
+                  attention_projection_policy: str | None = None) -> ResolvedModel:
     name = configuration.model if name is None else name
     if name is None:
         raise UsageError("no MODEL given and defaults.model is not set in the configuration file")
     model = resolve(name, configuration.directory("hub_cache"))
+    from ignition.recipes.deepseek41.recipe import select_attention_projection_policy
+    model = select_attention_projection_policy(model, attention_projection_policy)
     model.verify(configuration.directory("hub_cache"))
     return model
 

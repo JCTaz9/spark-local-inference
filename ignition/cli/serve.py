@@ -52,6 +52,13 @@ def _keep_reserve(plan, usage) -> None:
                             f"[memory] reserve requires {plan.reserve_bytes / gib:.1f} GiB.")
 
 
+def _resolve_preparation_model(configuration, args):
+    policy = getattr(args, "attention_projection_policy", None)
+    if policy is None:
+        return resolve_model(configuration, args.model)
+    return resolve_model(configuration, args.model, attention_projection_policy=policy)
+
+
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
@@ -121,7 +128,7 @@ def export(args) -> int:
     from .publishing import snapshot_destination, validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
-    model = resolve_model(configuration, args.model)
+    model = _resolve_preparation_model(configuration, args)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
         validate_repository(repository)
@@ -161,7 +168,7 @@ def _export_hosts(args, *, export_path) -> int:
     progress = _serving_progress(args.verbose)
     configuration = Configuration.load(args.config)
     hub_cache = configuration.directory("hub_cache")
-    model = resolve_model(configuration, args.model)
+    model = _resolve_preparation_model(configuration, args)
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; a single-host export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -244,7 +251,7 @@ def _prepare(args, *, export_path) -> int:
     _publisher(configuration, args)
     hub_cache = configuration.directory("hub_cache")
     with phase(progress, "Resolve checkpoint") as stage:
-        model = resolve_model(configuration, args.model)
+        model = _resolve_preparation_model(configuration, args)
         cached = model.cached(hub_cache)
         stage.update(f"{model.checkpoint.alias} · {model.source} · {'cached' if cached else 'not cached'}")
     with phase(progress, "Select GPUs") as stage:
@@ -262,6 +269,8 @@ def _prepare(args, *, export_path) -> int:
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
+        if plan.attention_projection_policy != "auto":
+            progress(f"Attention projection policy: {plan.attention_projection_policy}")
         # A caller's restriction changes which GPU each index names.
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
         serial = "" if plan.stream_overlap or not plan.recipe.stream_overlap else " · branches serialized"
@@ -396,7 +405,7 @@ def serve(args) -> int:
     progress = _serving_progress(args.verbose)
     configuration = Configuration.load(args.config)
     hub_cache = configuration.directory("hub_cache")
-    model = resolve_model(configuration, args.model)
+    model = _resolve_preparation_model(configuration, args)
     if not model.cached(hub_cache):
         raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
