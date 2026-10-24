@@ -49,6 +49,7 @@ class ScratchArena:
         self._finalizers = []
         self._parallel_plans = []
         self._auxiliary_stream = None
+        self._background_stream = None
         self._recorded_views = None
         self._binding_views = None
 
@@ -62,9 +63,17 @@ class ScratchArena:
 
     @property
     def auxiliary_stream(self):
+        return self._stream("_auxiliary_stream")
+
+    @property
+    def background_stream(self):
+        """Retain an independent branch across an auxiliary-stream fork/join."""
+        return self._stream("_background_stream")
+
+    def _stream(self, slot):
         if not self.overlap:
             raise RuntimeError("stream overlap is disabled; compose this branch on the main stream")
-        if self._auxiliary_stream is None:
+        if getattr(self, slot) is None:
             from cuda.bindings import driver as cuda
 
             # PyTorch's round-robin stream pool can alias a later capture stream.
@@ -74,8 +83,8 @@ class ScratchArena:
                     raise RuntimeError(f"cannot create overlap stream: {status}")
                 stream = torch.cuda.ExternalStream(int(handle), device=self.device)
             finalize(stream, cuda.cuStreamDestroy, handle).atexit = False
-            self._auxiliary_stream = stream
-        return self._auxiliary_stream
+            setattr(self, slot, stream)
+        return getattr(self, slot)
 
     def register_parallel(self, *plans):
         """Declare plans whose workspaces must coexist within a captured fork."""

@@ -92,7 +92,9 @@ class PreparedMHC:
 
     def __init__(self, inputs, weights: MHCWeights, scratch: MHCScratch, *,
                  session, name, workspace, rms_eps, hc_eps, sinkhorn_iters, norm_eps,
-                 pre_mix=None, pre_out=None, max_rows_per_call=None):
+                 pre_mix=None, pre_out=None, max_rows_per_call=None, split_lagged=False):
+        if type(split_lagged) is not bool:
+            raise TypeError("split lagged execution must be boolean")
         if max_rows_per_call is not None and (type(max_rows_per_call) is not int
                                               or max_rows_per_call <= 0):
             raise ValueError("mHC row capacity per call must be a positive integer")
@@ -103,6 +105,9 @@ class PreparedMHC:
         if residual.ndim != 3 or residual.shape[1] != 4 or residual.dtype != torch.bfloat16:
             raise ValueError("mHC residual requires BF16 [tokens, 4, hidden]")
         tokens, _, hidden = residual.shape
+        if split_lagged and (pre_mix is None or pre_out is None
+                or (max_rows_per_call is not None and tokens > max_rows_per_call)):
+            raise ValueError("split lagged execution requires an unchunked lagged invocation")
         if (weights.fn.shape != (24, 4 * hidden) or weights.fn.dtype != torch.float32
                 or weights.scale.shape != (3,) or weights.scale.dtype != torch.float32
                 or weights.base.shape != (24,) or weights.base.dtype != torch.float32
@@ -139,7 +144,7 @@ class PreparedMHC:
                 "norm_weight_dtype": str(weights.norm.dtype).removeprefix("torch."),
                 "expanded_residual": self.operation == "pre",
                 "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
-                "lagged_mix": pre_mix is not None})
+                "lagged_mix": pre_mix is not None, "split_lagged": split_lagged})
         entry = getattr(_impl, f"_b12x_mhc_{self.operation}_impl")
         parameters = (weights.fn, weights.scale, weights.base)
 
@@ -182,6 +187,15 @@ class PreparedMHC:
         entry(*inputs, self.weights.fn, self.weights.scale, self.weights.base,
               **self.options, binding=self.binding)
         return self.scratch.normalized
+
+    def input(self, *inputs):
+        """Produce normalized input, retaining private partials for coefficients."""
+        return mhc.run_input(self.binding, (*inputs, self.weights.fn, self.weights.scale, self.weights.base),
+                             norm_weight=self.weights.norm, pre_mix=self.options["pre_mix"])
+
+    def coefficients(self):
+        """Finish coefficients before their consumption or private-partial reuse."""
+        mhc.run_coefficients(self.binding, self.weights.scale, self.weights.base)
 
 
 class PreparedMHCPost:

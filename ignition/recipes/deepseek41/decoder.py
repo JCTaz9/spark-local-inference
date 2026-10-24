@@ -3,6 +3,7 @@
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
+from b12x.norm import mhc
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
@@ -10,6 +11,7 @@ from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.ring_commit import PreparedRingCommit
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mhc import MHCWeights, MHCScratch, PreparedMHC, PreparedMHCPost
+from ignition.components.mhc_overlap import ConcurrentMHC
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import RouterScratch, PreparedRouter, PreparedRoutedExperts
 from ignition.components.vocabulary import PreparedVocabularyProjection
@@ -31,6 +33,7 @@ class Scratch:
     attn_mix: torch.Tensor
     attention_hc: MHCScratch
     ffn_hc: MHCScratch
+    mhc_partials: torch.Tensor
     attention: AttentionScratch
     attention_output: torch.Tensor
     shared: MLPScratch
@@ -80,7 +83,10 @@ class Scratch:
         router = RouterScratch.allocate(tokens, device, experts=experts, top_k=top_k, buffers=ffn)
         routed, partial = zeros(tokens, 5120, cursor=ffn), zeros(tokens, 5120, cursor=ffn)
         buffers.join(embed, lookup, ffn)
-        return cls(embedding, residual, engram_residual, engram, pre_mix, attn_mix, attention_hc, ffn_hc,
+        # A coefficient branch retains partials while attention/expert work reuses the arena.
+        partial_bytes = 4 * 5120 // mhc.DEFAULT_BLOCK_K * mhc.PARTIALS * torch.float32.itemsize
+        mhc_partials = zeros(min(tokens, 32), partial_bytes, dtype=torch.uint8)
+        return cls(embedding, residual, engram_residual, engram, pre_mix, attn_mix, attention_hc, ffn_hc, mhc_partials,
             attention, attention_output, shared, router_logits, router, routed, partial, mlp_output,
             hidden, local_logits, logits, buffers)
 
@@ -145,9 +151,15 @@ class PreparedLayer:
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb) if carry else (source,))
+        overlap_mhc = (mode in ("decode", "verify", "draft") and workspace.overlap
+                       and source.shape[0] <= 32)
+        mhc_workspace = s.mhc_partials.view(-1) if overlap_mhc else workspace
         self.attention_hc = None if boundary is not None else PreparedMHC(
             incoming, _mhc_weights(weights, "attn", "attn_norm"), s.attention_hc,
-            session=session, name=name + ".attn_hc", workspace=workspace, pre_mix=s.pre_mix, pre_out=s.attn_mix, **options)
+            session=session, name=name + ".attn_hc", workspace=mhc_workspace,
+            pre_mix=s.pre_mix, pre_out=s.attn_mix, split_lagged=overlap_mhc, **options)
+        self.concurrent_attention_hc = (ConcurrentMHC(self.attention_hc, stream=workspace.background_stream)
+                                        if overlap_mhc and self.attention_hc is not None else None)
         self.attention = PreparedAttention(index, weights.attention, s.attention_hc.normalized, s.attention,
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
@@ -156,8 +168,10 @@ class PreparedLayer:
         self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
-            _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
-            pre_mix=s.attn_mix, pre_out=s.pre_mix, **options)
+            _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=mhc_workspace,
+            pre_mix=s.attn_mix, pre_out=s.pre_mix, split_lagged=overlap_mhc, **options)
+        self.concurrent_ffn_hc = (ConcurrentMHC(self.ffn_hc, stream=workspace.background_stream)
+                                  if overlap_mhc else None)
         self.router_projection = UnquantizedProjection(s.ffn_hc.normalized, weights.experts.router, s.router_logits,
             session=session, name=name + ".router")
         self.router = PreparedRouter(s.router_logits, s.router, session=session, name=name + ".topk",
@@ -191,11 +205,20 @@ class PreparedLayer:
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
         if self.boundary is None:
-            self.attention_hc(*incoming)
+            if self.concurrent_attention_hc is None:
+                self.attention_hc(*incoming)
+            else:
+                self.concurrent_attention_hc.start(*incoming)
         else:
             self.boundary(self.attention.selectors[0])
         self.attention_reduce(self.attention(s.attention_hc.normalized))
-        self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
+        if self.concurrent_attention_hc is not None:
+            self.concurrent_attention_hc.finish(s.attention_output)
+        ffn_inputs = (s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
+        if self.concurrent_ffn_hc is None:
+            self.ffn_hc(*ffn_inputs)
+        else:
+            self.concurrent_ffn_hc.start(*ffn_inputs)
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(s.ffn_hc.normalized)
         if self.image_mask is not None:
@@ -208,6 +231,8 @@ class PreparedLayer:
             self.concurrent_shared.finish(s.ffn_hc.normalized, s.routed)
         torch.add(s.routed, s.shared.output, out=s.mlp_partial)
         self.mlp_reduce(s.mlp_partial)
+        if self.concurrent_ffn_hc is not None:
+            self.concurrent_ffn_hc.finish(s.mlp_output)
         if self.post is not None:
             self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
 

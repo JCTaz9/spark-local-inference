@@ -125,6 +125,16 @@ captured graph; its internal streams require no host intervention. Measure
 complete graph latency, including synchronization and resource contention, at
 each relevant row capacity and with each candidate node-construction order.
 
+DeepSeek V4.1 overlaps lagged mHC coefficient finalization with attention and
+feedforward consumers through 32 rows. The input producer preserves BF16
+residual and collapse rounding and FP32 projection arithmetic; normalization
+does not wait for the independent Sinkhorn coefficients. One dedicated
+background stream is shared across serialized layers and graph variants,
+separate from the stream used by query projections and shared experts.
+Projection partials remain in private graph-buffer storage until the join after
+the consumer's all-reduce. Prefill and larger capacities retain complete mHC
+execution. `--no-stream-overlap` also retains complete mHC execution.
+
 ## Compressed scale loading
 
 The [compressed scale layout](tp-checkpoint-layout.md) supports TP1, TP2, and

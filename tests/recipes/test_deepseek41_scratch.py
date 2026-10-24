@@ -18,7 +18,7 @@ def test_serial_stages_share_storage_without_overwriting_live_residuals_or_selec
     scratch = Scratch.allocate(128, 1, 4, "cpu", candidate_tokens=16)
     retained = (scratch.residual, scratch.engram_residual, scratch.attention_hc.residual,
                 scratch.ffn_hc.residual, scratch.attention.selected, scratch.attention.candidates,
-                scratch.attention.candidate_counts, scratch.mlp_output)
+                scratch.attention.candidate_counts, scratch.mlp_output, scratch.mhc_partials)
     concurrent = (scratch.shared.gate_up, scratch.shared.intermediate, scratch.shared.output,
                   scratch.routed, scratch.mlp_partial)
     for index, value in enumerate(retained):
@@ -36,6 +36,8 @@ def test_serial_stages_share_storage_without_overwriting_live_residuals_or_selec
         assert value.eq(index + 1).all()
     assert scratch.rows(64, 1).attention.candidates.shape == (16, 16384)
     assert scratch.rows(8, 1).attention.candidates.shape == (8, 16384)
+    assert scratch.mhc_partials.nbytes == 32 * 80 * 25 * 4
+    assert scratch.rows(8, 1).mhc_partials.shape == (8, 80 * 25 * 4)
 
 
 def test_suffix_destinations_and_variant_private_buffers_preserve_activation_storage():
