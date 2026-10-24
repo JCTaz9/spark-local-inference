@@ -224,7 +224,8 @@ inefficient operations mandatory at a fixed deadline.
 ## Prerequisites and completion
 
 Initialization, restore, vision execution, and intermediate snapshots enable
-subsequent useful work. When a prerequisite immediately enables inference,
+subsequent useful work. Their utility scoring compares prerequisite and inference
+pairs. When a prerequisite immediately enables inference,
 compare every pair of prepared prerequisite and following inference shapes.
 Both cohorts are selected jointly. The first graph can also finish terminal
 requests; the following graph can include already ready requests.
@@ -273,10 +274,19 @@ nor require host caching. Existing snapshot and restore operations preserve
 partial pages and every declared continuation history.
 
 A terminal snapshot enables the visible response completion and frees the
-request's execution resources. It contributes a delivery with zero output
-tokens. Its delivery-rate reference comes from applicable snapshot graphs.
-The completion event's price can grow while other requests run. Error and
-cancellation paths preserve fenced resource ownership regardless of utility.
+request's execution resources. Its service cannot depend on output-token or
+delivery utility: throughput policy assigns no value to another output burst
+when no tokens remain. Once a request needs terminal snapshotting, the scheduler
+stops refilling queued model work and drains its submitted fences. An already
+owned proposal-verification episode completes before snapshot selection.
+
+At the next idle scheduling opportunity, terminal snapshot work precedes new
+model work, discovery, or probe episodes. Every candidate includes the oldest
+admitted eligible terminal request. Cohorts maximize terminal completions per
+estimated graph time within the loaded capacities, and spare lanes can capture
+other ready checkpoints. Unknown costs retain ordinary discovery semantics.
+Successful snapshot completion still precedes terminal publication and resource
+release; cancellation and failed copies retain their existing fence guarantees.
 
 ## Duration estimates
 

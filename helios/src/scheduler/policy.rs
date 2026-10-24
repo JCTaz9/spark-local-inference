@@ -1051,8 +1051,82 @@ impl RequestScheduler {
         }
     }
 
+    fn terminal_snapshot_candidate(
+        &self,
+        terminal_mask: u64,
+        values: &[LaneValue; REQUEST_LANES],
+        age_price: f64,
+    ) -> Option<Candidate> {
+        let mut terminal = [(0u64, 0usize); REQUEST_LANES];
+        let mut count = 0;
+        let mut ready = 0u64;
+        for (slot, entry) in self.slots.iter().enumerate() {
+            let Some(request) = entry.request.as_ref().filter(|r| {
+                self.eligible(r) && self.request_kind(r) == Some(GraphKind::Snapshot)
+            }) else {
+                continue;
+            };
+            ready |= 1 << slot;
+            if terminal_mask & (1 << slot) != 0 {
+                terminal[count] = (request.admission_order, slot);
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        terminal[..count].sort_unstable();
+        let oldest = 1u64 << terminal[0].1;
+        let mut candidates = Vec::new();
+        for batch in crate::execution::BATCH_CAPACITIES
+            .into_iter()
+            .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
+        {
+            let Some(duration) = self.costs.duration(GraphKind::Snapshot, batch, 1) else {
+                continue;
+            };
+            let mut mask = terminal[..count.min(batch)]
+                .iter()
+                .fold(0u64, |mask, &(_, slot)| mask | (1 << slot));
+            let remaining = batch - mask.count_ones() as usize;
+            if remaining > 0 {
+                let mut offers = [(0, 0.0); REQUEST_LANES];
+                let mut n = 0;
+                for slot in bits(ready & !terminal_mask) {
+                    let request = self.slots[slot].request.as_ref().unwrap();
+                    offers[n] = (slot, self.lane_value(
+                        request, GraphKind::Snapshot, 1, duration, values[slot],
+                    ));
+                    n += 1;
+                }
+                mask |= best_cohort::<REQUEST_LANES>(&offers[..n], remaining);
+            }
+            self.add_candidate(
+                &mut candidates, GraphKind::Snapshot, batch, 1, mask, values, age_price,
+            );
+        }
+        let count = self.prune_padding(&mut candidates);
+        candidates[..count].iter().copied().max_by(|a, b| {
+            debug_assert!(a.mask & oldest != 0 && b.mask & oldest != 0);
+            let rate = |c: &Candidate| ValueRate::new(
+                c.duration_ns, (c.mask & terminal_mask).count_ones() as f64, 0.0,
+            );
+            rate(a).compare(rate(b))
+                .then(a.mask.count_ones().cmp(&b.mask.count_ones()))
+                .then(b.batch.cmp(&a.batch))
+        })
+    }
+
     pub(super) fn select_plan(&self) -> Option<ScheduledPlan> {
         if self.submissions.len() >= 2 || self.submissions.values().any(|s| s.requires_feedback) {
+            return None;
+        }
+        let terminal_mask = self.slots.iter().enumerate().filter_map(|(slot, entry)| {
+            entry.request.as_ref().filter(|r| terminal_cleanup(r)).map(|_| 1u64 << slot)
+        }).fold(0, |mask, bit| mask | bit);
+        // Terminal publication and ownership release require the snapshot copy.
+        // Stop filling the decode pipeline so this feedback operation can run.
+        if terminal_mask != 0 && !self.submissions.is_empty() {
             return None;
         }
         let window = self.window_remaining()?;
@@ -1090,6 +1164,12 @@ impl RequestScheduler {
             let candidate = *continuations[..count].iter().max_by(|a, b| compare(a, b))?;
             return Some(self.materialize(candidate, log_scale,
                 episode.continuation()));
+        }
+        if terminal_mask != 0 {
+            if let Some(candidate) = self.terminal_snapshot_candidate(terminal_mask, &values, age_price) {
+                let origin = if candidate.duration_ns == 0 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary };
+                return Some(self.materialize(candidate, log_scale, origin));
+            }
         }
         if ordinary.rate.duration_ns == 0 {
             return Some(self.materialize(ordinary, log_scale, PlanOrigin::Discovery));

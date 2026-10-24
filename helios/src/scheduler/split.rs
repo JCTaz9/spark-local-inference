@@ -1483,6 +1483,32 @@ mod tests {
     }
 
     #[test]
+    fn terminal_snapshot_waits_for_owned_probe_verification() {
+        let mut s = engine(2);
+        s.configure_policy(PolicyConfig::throughput()).unwrap();
+        let handles = [ready(&mut s), ready(&mut s)];
+        let target = cost::Key { drafts: 0, kind: GraphKind::Proposal,
+            batch: 1, tokens: 8, prefill: 0, packed: 0 };
+        stale_only(&mut s, target);
+        let proposal = s.plan().unwrap();
+        assert_eq!(proposal.origin, PlanOrigin::RefreshStart(target));
+        assert_eq!(proposal.lanes.len(), 1);
+        let waiting = *handles.iter().find(|&&h| h != proposal.lanes[0].request).unwrap();
+        finish_refresh_proposal(&mut s, &proposal, &[[0.9; 7]; 2], 1000);
+        let episode = s.refresh_episode().unwrap().id;
+        s.finish_early(waiting, true).unwrap();
+        assert_eq!(s.request(waiting).unwrap().phase, RequestPhase::Snapshot);
+        let verify = s.plan().unwrap();
+        assert_eq!(verify.kind, GraphKind::Verification);
+        assert_eq!(verify.origin, PlanOrigin::RefreshContinuation(episode));
+        finish_refresh_verification(&mut s, &verify, 1000);
+        assert!(s.refresh_episode().is_none());
+        let snapshot = s.plan().unwrap();
+        assert_eq!(snapshot.kind, GraphKind::Snapshot);
+        assert!(snapshot.lanes.iter().any(|lane| lane.request == waiting));
+    }
+
+    #[test]
     fn refresh_reaches_a_dominated_proposal_and_pays_for_each_verification_capture() {
         let mut s = engine(4);
         s.configure_policy(PolicyConfig::throughput()).unwrap();
