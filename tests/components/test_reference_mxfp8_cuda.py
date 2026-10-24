@@ -45,7 +45,7 @@ def _reference_quantize(source):
 
 
 @torch.no_grad()
-def test_reference_projection_capacities_and_native_lifetimes(tmp_path):
+def test_reference_projection_capacities_and_native_lifetimes(tmp_path, monkeypatch):
     import torch
 
     native = pytest.importorskip("flare_heliopause")
@@ -168,8 +168,10 @@ def test_reference_projection_capacities_and_native_lifetimes(tmp_path):
         and last.plan.query.codegen == global_codegen
         for rows, source, projected, query, kv, out, norm, first, last, main, side, poison in cases
     )
+    requests = dict(session._recorded_requests)
     session.tune(show_progress=False)
     assert _codegen_snapshot() == global_codegen
+    _check_priming_and_benchmark_owners(requests, cases, arena, monkeypatch)
     for (
         rows,
         source,
@@ -375,6 +377,52 @@ def test_reference_projection_capacities_and_native_lifetimes(tmp_path):
     assert report["passed"] and report["native_allocation_stable"]
     torch.cuda.synchronize()
     session.close()
+
+
+def _check_priming_and_benchmark_owners(requests, cases, arena, monkeypatch):
+    import gc
+    import weakref
+
+    def unexpected_fixture(*args, **kwargs):
+        raise AssertionError("serving priming allocated random benchmark inputs")
+
+    for case in cases:
+        rows, source, projected, query = case[:4]
+        for name, projection, inputs in (
+            (f"qkv-{rows}", case[7], source),
+            (f"qb-{rows}", case[8], query),
+        ):
+            request = requests[name]
+            state = projection.plan.prepared.state
+            assert projection.plan.prepared.owners == (projection, arena)
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "randn_like", unexpected_fixture)
+                priming = request.prepare_call(state)
+            assert priming.produce is None
+            assert priming.owners == (projection, arena)
+            del priming
+
+            enabled = gc.isenabled()
+            gc.disable()
+            try:
+                benchmark = request.benchmark_call(state)
+                seed, = (owner for owner in benchmark.owners if isinstance(owner, torch.Tensor))
+                seed_ref = weakref.ref(seed)
+                benchmark.produce()
+                torch.testing.assert_close(inputs, seed, rtol=0, atol=0)
+                if projection.prequantized:
+                    expected, _ = _reference_quantize(inputs)
+                    torch.testing.assert_close(
+                        projection.prequantized[0].view(torch.uint8),
+                        expected.view(torch.uint8), rtol=0, atol=0,
+                    )
+                torch.cuda.synchronize()
+                del seed, benchmark
+                assert seed_ref() is None, "benchmark seed requires cyclic collection"
+                assert projection.plan.prepared.owners == (projection, arena)
+            finally:
+                if enabled:
+                    gc.enable()
 
 
 class Forward:

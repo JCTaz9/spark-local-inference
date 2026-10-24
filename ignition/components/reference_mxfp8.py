@@ -151,14 +151,6 @@ class ReferenceMXFP8Projection:
 
         def prepare(state):
             scratch = storage(state)
-            # Tuning must receive actual activations and prequantized values.
-            seed = torch.randn_like(source) * 0.125
-
-            def produce():
-                source.copy_(seed)
-                if self.prequantized:
-                    self.quantize(source, *self.prequantized)
-
             return PreparedCall(
                 run=lambda: _run_projection(
                     state,
@@ -170,15 +162,27 @@ class ReferenceMXFP8Projection:
                     self.alpha,
                 ),
                 output=output,
-                produce=produce,
-                owners=(self, seed, *prime_owners(workspace, scratch)),
+                owners=(self, *prime_owners(workspace, scratch)),
             )
+
+        def benchmark(state):
+            call = prepare(state)
+            # Only candidate timing needs fixture activations. Priming owners
+            # survive tuning, so they must not retain this benchmark seed.
+            seed = torch.randn_like(source) * 0.125
+
+            def produce():
+                source.copy_(seed)
+                if self.prequantized:
+                    self.quantize(source, *self.prequantized)
+
+            return replace(call, produce=produce, owners=(*call.owners, seed))
 
         declare(
             session,
             (
                 self.plan.request(
-                    name=name, prepare_call=prepare, benchmark_call=prepare
+                    name=name, prepare_call=prepare, benchmark_call=benchmark
                 ),
             ),
         )
