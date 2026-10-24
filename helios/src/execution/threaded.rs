@@ -59,14 +59,16 @@ enum Command {
 }
 enum Reply {
     Ready,
-    Complete(FrameCompletion),
+    // Keep readiness and drain messages small; the completion owns its records
+    // until the coordinator validates every rank and retires the submission.
+    Complete(Box<FrameCompletion>),
     Drained,
 }
 struct Peer {
     sender: mpsc::Sender<Command>,
     receiver: mpsc::Receiver<Result<Reply>>,
     thread: Option<JoinHandle<Shutdown>>,
-    completion: Option<FrameCompletion>,
+    completion: Option<Box<FrameCompletion>>,
 }
 impl Peer {
     fn send(&self, command: Command) -> Result<()> {
@@ -380,7 +382,7 @@ fn rank_loop(
                     match executor.poll() {
                         Ok(None) => {}
                         Ok(Some(completion)) => {
-                            send(Reply::Complete(completion))?;
+                            send(Reply::Complete(Box::new(completion)))?;
                             break;
                         }
                         Err(error) => return Err(error),
@@ -486,6 +488,52 @@ mod tests {
         assert_eq!(receive(&receiver, Some(Duration::from_secs(1))), Ok(17));
         worker.join().unwrap();
     }
+
+    #[test]
+    fn peer_completion_owns_records_and_sidecars_through_drain_reply() {
+        use super::super::{CompletionRecord, ExecutionTiming, TokenLogprobs, TokenVector};
+
+        let records = std::array::from_fn::<_, 64, _>(|slot| CompletionRecord {
+            generation: 11 + slot as i64,
+            submission_sequence: 17,
+            token_id: 100 + slot as i64,
+            vector: Some(TokenVector { tokens: [100 + slot as i64; 8], ..Default::default() }),
+            ..Default::default()
+        });
+        let (commands, _) = mpsc::channel();
+        let (replies, receiver) = mpsc::channel();
+        let mut peer = Peer { sender: commands, receiver, thread: None, completion: None };
+        replies.send(Ok(Reply::Ready)).unwrap();
+        replies.send(Ok(Reply::Complete(Box::new(FrameCompletion {
+            fence: Fence(17), graph_index: 3,
+            timing: ExecutionTiming { wall_ns: 1234, ..Default::default() },
+            records: records.into(),
+            logprobs: Some(vec![std::array::from_fn(|token| Some(TokenLogprobs {
+                token: token as u32, logprob: -0.5, top: vec![(7, -0.25)],
+            }))]),
+            prompt_logprobs: None,
+            proposal_confidence: Some([[0.5; 7]; 64]),
+            speculative_survival: Some([[0.25; 7]; 64]),
+        })))).unwrap();
+        replies.send(Ok(Reply::Drained)).unwrap();
+        drop(replies);
+
+        assert!(matches!(peer.receive().unwrap(), Reply::Ready));
+        let Reply::Complete(completion) = peer.receive().unwrap() else { panic!("missing completion") };
+        peer.completion = Some(completion);
+        assert!(matches!(peer.receive().unwrap(), Reply::Drained));
+        assert!(peer.receive().is_err());
+        let completion = peer.completion.take().unwrap();
+        assert_eq!(completion.fence, Fence(17));
+        assert_eq!(completion.graph_index, 3);
+        assert_eq!(completion.timing.wall_ns, 1234);
+        assert_eq!(&*completion.records, &records);
+        assert_eq!(completion.proposal_confidence, Some([[0.5; 7]; 64]));
+        assert_eq!(completion.speculative_survival, Some([[0.25; 7]; 64]));
+        let token = completion.logprobs.as_ref().unwrap()[0][7].as_ref().unwrap();
+        assert_eq!((token.token, token.logprob, token.top.as_slice()), (7, -0.5, [(7, -0.25)].as_slice()));
+    }
+
     #[test]
     fn rank_layout_compares_bindings_but_not_cuda_addresses() {
         let root = super::super::tests::manifest();
