@@ -846,7 +846,7 @@ hub_cache = "~/.cache/huggingface/hub"
 kernel_cache = "~/.cache/flare/kernels"
 package_cache = "~/.cache/flare/packages"
 export_staging = ""               # Rank files an export assembles from; empty: beside the package.
-cuda = "/opt/cuda"                # Used when installed packages provide no toolkit.
+cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
 
 `[models.<alias>]` overrides `[defaults]`; flags override both.
@@ -911,7 +911,7 @@ Configuration assigns each decision to one owner:
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `medium` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
-| CUDA toolkit | Installed packages, then `[paths] cuda` |
+| CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
 | Served names | Recipe alias and repository ID, exposed through `/v1/models` |
 | API key | Ignition configuration or native `--api-key-file`; excluded from packages |
 | Sampling distribution controls | Recipe defaults and optional model-author ranges; request values clamp to ranges, or to defaults when no range exists |

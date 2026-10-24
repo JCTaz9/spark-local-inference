@@ -455,7 +455,6 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
         monkeypatch.setenv(name, "previous")
     path = tmp_path / "config.toml"
     path.write_text(f'[paths]\ncuda = "{tmp_path}/cuda"\nkernel_cache = "{tmp_path}/kernels"\n')
-    monkeypatch.setattr(environment, "toolkit", lambda configured: configured)
     gpus = (types.SimpleNamespace(uuid="GPU-b"), types.SimpleNamespace(uuid="GPU-a"))
     environment.apply(Configuration.load(path), gpus)
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-b,GPU-a"
@@ -465,7 +464,35 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == f"{tmp_path}/kernels/inductor"
     assert os.environ["HF_HUB_CACHE"] == f"{tmp_path}/.cache/huggingface/hub"
     assert os.environ["CUDA_HOME"] == f"{tmp_path}/cuda"
-    assert environment.toolkit(None) is None or (environment.toolkit(None) / "bin/nvcc").is_file()
+
+
+@pytest.mark.parametrize("configured", (False, True))
+@pytest.mark.parametrize("inherited_cuda", (None, "/system/cuda"))
+def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, tmp_path, configured, inherited_cuda):
+    package = tmp_path / "site-packages" / "nvidia"
+    compiler = package / "cu13" / "bin" / "nvcc"
+    compiler.parent.mkdir(parents=True)
+    compiler.touch()
+    (package / "__init__.py").write_text("")
+    monkeypatch.delitem(sys.modules, "nvidia", raising=False)
+    monkeypatch.syspath_prepend(str(package.parent))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "TRITON_PTXAS.EXE_PATH",
+                 "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
+                 "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
+        monkeypatch.setenv(name, "previous")
+    if inherited_cuda is None:
+        monkeypatch.delenv("CUDA_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_HOME", inherited_cuda)
+    cuda = tmp_path / "cuda"
+    path = tmp_path / "config.toml"
+    path.write_text(f'[paths]\ncuda = "{cuda}"\n' if configured else "")
+
+    environment.apply(Configuration.load(path), ())
+
+    assert os.environ.get("CUDA_HOME") == (str(cuda) if configured else inherited_cuda)
+    assert "nvidia" not in sys.modules
 
 
 def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeypatch, tmp_path):
