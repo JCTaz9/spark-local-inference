@@ -1,4 +1,12 @@
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use flare_helios::package::{
+    PayloadId, cache, container, export, protection, reader,
+    schema::wire,
+};
+use flare_helios::runtime_package::Publisher;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 fn flare(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_flare"))
@@ -109,48 +117,246 @@ fn help_exits_successfully_before_accessing_files() {
             assert!(help.contains("--host"), "{help}");
             assert!(help.contains("--port"), "{help}");
             assert!(help.contains("--served-model-name"), "{help}");
+            assert!(help.contains("--scheduler-terminal-value"), "{help}");
+            assert!(help.contains("--scheduler-terminal-age-price"), "{help}");
             assert!(help.contains("127.0.0.1"), "{help}");
             assert!(!help.contains("--bind"), "{help}");
         }
     }
 }
 
+fn signed_package(scratch: &Path) -> (PathBuf, Publisher) {
+    let package = scratch.join("package");
+    std::fs::create_dir_all(&package).unwrap();
+    let weights = b"offline cli package weights".repeat(16);
+    let weight_path = scratch.join("weights.bin");
+    std::fs::write(&weight_path, &weights).unwrap();
+    let weight_id = PayloadId::of(&weights);
+    let graph = scratch.join("graph.bin");
+    std::fs::write(&graph, b"graph-bytes").unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(
+        Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+    let publisher = Publisher {
+        name: "CLI fixture".into(),
+        namespace: "local-development".into(),
+        public_key,
+        development: true,
+    };
+    let contract = flare_helios::runtime_package::wire::ServingContract {
+        model_id: "cli-model".into(),
+        identity: "cli-model".into(),
+        max_sequence_tokens: 8,
+        prefill_chunk_size: 1,
+        pages: 1,
+        state_rows: 1,
+        page_tokens: 1,
+        model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+            vocabulary: 8,
+            graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                graph: "decode".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let rank = wire::RankBody {
+        rank: 0,
+        deployment_id: "gb202-tp1".into(),
+        context: Some(Default::default()),
+        allocations: vec![wire::Allocation {
+            name: "device-0".into(),
+            nbytes: weights.len() as u64,
+            alignment: 4096,
+            ..Default::default()
+        }],
+        initializers: vec![wire::Initializer {
+            allocation: "device-0".into(),
+            destination_offset: 0,
+            source: Some(wire::PayloadUse {
+                slice: Some(wire::PayloadSlice {
+                    payload_id: weight_id.as_bytes().to_vec(),
+                    offset: 0,
+                    nbytes: weights.len() as u64,
+                }),
+                role: wire::PayloadRole::Weights as i32,
+            }),
+        }],
+        graphs: vec![wire::Graph {
+            name: "decode".into(),
+            resource: 0,
+            node_count: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let request = export::PublishRequest {
+        package: wire::PackageBody {
+            model_identity: "owner/model".into(),
+            hardware_identity: "gb202".into(),
+            frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+            sampling_defaults: Some(
+                flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+            ),
+            publisher: Some(wire::PublisherMetadata {
+                namespace: "local-development".into(),
+                official_source: "local-development".into(),
+                development: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        payloads: vec![],
+        deployments: vec![export::PublishDeployment {
+            body: wire::DeploymentBody {
+                deployment_id: "gb202-tp1".into(),
+                architecture: vec![12, 0],
+                tensor_parallel: 1,
+                contract: Some(contract),
+                ..Default::default()
+            },
+            ranks: vec![export::PublishRank {
+                body: rank,
+                payloads: vec![export::PublishPayload {
+                    role: wire::PayloadRole::Weights,
+                    relative: "weights/model.safetensors".into(),
+                    source: container::Slice::new(
+                        std::sync::Arc::new(std::fs::File::open(&weight_path).unwrap()),
+                        0,
+                        weights.len() as u64,
+                    )
+                    .unwrap(),
+                    id: weight_id,
+                    tensor: None,
+                }],
+                resources: vec![export::PublishResource {
+                    kind: wire::ExecutableKind::Graph,
+                    path: graph,
+                    nbytes: 11,
+                }],
+            }],
+            payloads: vec![],
+        }],
+        package_id: [73u8; 32],
+        public_key,
+        accepted: "local-development".into(),
+        no_weights: false,
+    };
+    export::publish(&request, &key, export::Destination::Directory(&package)).unwrap();
+    (package, publisher)
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[test]
-fn offline_download_and_run_share_the_cached_package_path() {
+fn offline_download_uses_the_selected_flare_cache_entry_and_rejects_hf_only_cache() {
     let temp = tempfile::tempdir().unwrap();
     let commit = "0123456789012345678901234567890123456789";
-    let directory = temp
-        .path()
+    let (package, publisher) = signed_package(temp.path());
+    let profile = temp.path().join("publisher.json");
+    std::fs::write(
+        &profile,
+        serde_json::to_vec(&vec![publisher.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    let model_cache = temp.path().join("flare-cache");
+    let trust_store = temp.path().join("trust.toml");
+    let store = cache::Root::open(&model_cache).unwrap();
+    let metadata = reader::Metadata::open(&package).unwrap();
+    let source = cache::PackageSource::open(
+        &package,
+        std::slice::from_ref(&publisher),
+        protection::Selection::Deployment {
+            deployment: 0,
+            rank: None,
+        },
+    )
+    .unwrap();
+    let model_key = cache::model_key("owner/model").unwrap();
+    let entry = store.install_package(source, &model_key, "entry").unwrap();
+    let selector = serde_json::json!([
+        "huggingface",
+        "owner/model",
+        commit,
+        serde_json::Value::Null,
+        []
+    ])
+    .to_string();
+    store
+        .publish_source_ref(
+            &selector,
+            commit,
+            &entry,
+            *PayloadId::of(&metadata.envelope).as_bytes(),
+        )
+        .unwrap();
+
+    store.publish_entry_source(
+        &serde_json::json!(["huggingface", "owner/model", commit, "model.safetensors", [1]]).to_string(),
+        commit, &entry, *PayloadId::of(&metadata.envelope).as_bytes(),
+    ).unwrap();
+
+    for command in [vec!["download"], vec!["models", "download"]] {
+        let repository = format!("owner/model@{commit}");
+        let mut arguments = command;
+        arguments.extend([
+            &repository,
+            "--offline",
+            "--model-cache",
+            model_cache.to_str().unwrap(),
+            "--publisher-keys",
+            profile.to_str().unwrap(),
+            "--trust-store",
+            trust_store.to_str().unwrap(),
+        ]);
+        let output = flare(&arguments);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            entry.directory().display().to_string()
+        );
+    }
+
+    let hf_cache = temp.path().join("hf-only");
+    let snapshot = hf_cache
         .join("models--owner--model")
         .join("snapshots")
         .join(commit);
-    std::fs::create_dir_all(&directory).unwrap();
-    let package = directory.join("model.safetensors");
-    // Discoverable format-4 metadata without publisher authentication.
-    let envelope = b"\x08\x04\x22\x08\x08\x01\x12\x04\x0a\x02\x08\x04\x22\x02\x08\x02\x22\x02\x08\x03\x2a\x06\x08\x04\x12\x02\x12\x00";
-    let header = serde_json::json!({
-        "__metadata__": {"format": "flare"},
-        "flare.payload": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
-        "flare.metadata": {"dtype": "U8", "shape": [envelope.len()], "data_offsets": [0, envelope.len()]},
-    });
-    let mut bytes = 4088u64.to_le_bytes().to_vec();
-    bytes.extend(serde_json::to_vec(&header).unwrap());
-    bytes.resize(4096, b' ');
-    bytes.extend(envelope);
-    std::fs::write(&package, bytes).unwrap();
-    let cache = temp.path().to_str().unwrap();
+    copy_tree(&package, &snapshot);
+    let empty_model_cache = temp.path().join("empty-flare-cache");
     let output = flare(&[
         "download",
         &format!("owner/model@{commit}"),
         "--offline",
         "--cache-dir",
-        cache,
+        hf_cache.to_str().unwrap(),
+        "--model-cache",
+        empty_model_cache.to_str().unwrap(),
+        "--publisher-keys",
+        profile.to_str().unwrap(),
+        "--trust-store",
+        trust_store.to_str().unwrap(),
     ]);
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        package.to_str().unwrap()
-    );
+    assert!(!output.status.success(), "{output:?}");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("not available in the Flare cache"), "{error}");
 
     let output = flare(&[
         "run",
@@ -158,14 +364,49 @@ fn offline_download_and_run_share_the_cached_package_path() {
         "--revision",
         commit,
         "--offline",
-        "--cache-dir",
-        cache,
+        "--model-cache",
+        empty_model_cache.to_str().unwrap(),
+        "--publisher-keys",
+        profile.to_str().unwrap(),
+        "--trust-store",
+        trust_store.to_str().unwrap(),
     ]);
-    assert!(!output.status.success());
+    assert!(!output.status.success(), "{output:?}");
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("Verify package"), "{error}");
+    assert!(error.contains("not available in the Flare cache"), "{error}");
+    assert!(!error.contains("cannot load NVIDIA"), "{error}");
+
+    let output = flare(&[
+        "run",
+        "owner/model",
+        "--revision",
+        commit,
+        "--offline",
+        "--model-cache",
+        model_cache.to_str().unwrap(),
+        "--publisher-keys",
+        profile.to_str().unwrap(),
+        "--trust-store",
+        trust_store.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "{output:?}");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains(
+            "unattended first use requires --dangerously-approve-key FINGERPRINT --dangerously-accept-publisher NAMESPACE"
+        ),
+        "{error}"
+    );
     assert!(!error.contains("cannot load NVIDIA"), "{error}");
     assert!(!error.contains("cannot access package"), "{error}");
+}
+
+#[test]
+fn inspect_help_lists_the_tensor_parallel_selector() {
+    let output = flare(&["inspect", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--tensor-parallel"), "{help}");
 }
 
 #[test]
@@ -173,7 +414,7 @@ fn usage_errors_identify_the_problem_before_accessing_files() {
     for (arguments, expected) in [
         (vec![], "Usage: flare"),
         (vec!["run"], "<PACKAGE>"),
-        (vec!["inspect"], "<PACKAGE>"),
+        (vec!["inspect"], "<PACKAGE|MODEL[@VERSION]>"),
         (vec!["rnu"], "unrecognized subcommand"),
         (
             vec!["run", "/nonexistent/model", "--bogus"],
@@ -228,4 +469,47 @@ fn usage_errors_identify_the_problem_before_accessing_files() {
         assert!(error.contains(expected), "{arguments:?}: {error}");
         assert!(error.contains("--help"), "{arguments:?}: {error}");
     }
+}
+
+#[test]
+fn configuration_is_loaded_by_the_native_entrypoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    let missing = temp.path().join("missing.safetensors");
+    let config_arg = config.to_str().unwrap();
+    let package_arg = missing.to_str().unwrap();
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read"));
+
+    std::fs::write(&config, "[memory]\nreserve = 'invalid'\n").unwrap();
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("memory.reserve"), "{error}");
+    assert!(!error.contains("cannot access package"), "{error}");
+    assert!(
+        flare(&["run", "--config", config_arg, "--help"])
+            .status
+            .success()
+    );
+
+    let cache = temp.path().join("models");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nhost = '::1'\n[paths]\npackage_cache = {:?}\n",
+            cache.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let output = flare(&["models", "list", "--json", "--config", config_arg]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cache.is_dir(), "configured cache must be opened");
+    let output = flare(&["run", package_arg, "--config", config_arg]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot access package"));
 }

@@ -102,10 +102,6 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
     summary = display.speculation(spec)
     assert (f"draft head {(draft or '').upper()}" in summary) == bool(draft)
     assert ("markov head NVFP4" in summary) == bool(markov)
-    # The rebuild record must distinguish the precision, or a rebuild would silently
-    # produce checkpoint-default heads; an unset field stays absent so BF16 records
-    # remain byte-identical. Encode through the schema the export actually uses, so a
-    # key without a protobuf field fails here rather than at package export.
     from google.protobuf import json_format
     from ignition.preparation import runtime_package_pb2 as proto
 
@@ -121,18 +117,6 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
             derive(speculation=spec)
         with pytest.raises(ValueError, match="positive learned"):
             replace(spec, draft_tokens=0)
-
-
-def test_legacy_rebuild_speculation_without_head_precision_still_loads():
-    from ignition.preparation import runtime_package_pb2 as proto
-
-    # A record written before fields 8 and 9 existed must still load and report the
-    # checkpoint-default precision, so packages prepared earlier keep their meaning.
-    legacy = proto.RebuildSpeculation.FromString(b"\x08\x05\x10\x01\x1a\x03mtp\x30\x01")
-    assert legacy.draft_tokens == 5 and legacy.packed_verification
-    assert not legacy.HasField("draft_head_quantization")
-    assert not legacy.HasField("markov_head_quantization")
-    assert legacy.draft_head_quantization == "" and legacy.markov_head_quantization == ""
 
 
 def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
@@ -294,11 +278,11 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, alia
     assert (plan.concurrency, plan.prefill_chunk, plan.speculative_token_capacity) == expected
     assert plan.speculation.draft_tokens == model.recipe.speculation.draft_tokens and plan.speculation.adaptive
     assert plan.speculation.packed_verification is packed
-    assert plan.speculation.draft_prefix_selection == ("gpu" if packed else "cpu")
+    assert plan.speculation.draft_prefix_selection == model.recipe.speculation.draft_prefix_selection
     record = plan.to_dict()
     assert record["speculative_token_capacity"] == expected[2]
     assert record["speculation"]["packed_verification"] is packed
-    assert record["speculation"]["draft_prefix_selection"] == ("gpu" if packed else "cpu")
+    assert record["speculation"]["draft_prefix_selection"] == model.recipe.speculation.draft_prefix_selection
 
 
 def test_context_parallel_pages_hold_every_rank_share_unless_disabled():

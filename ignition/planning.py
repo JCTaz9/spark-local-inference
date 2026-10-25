@@ -182,6 +182,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "medium"
+    native_dense_activations: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -297,6 +298,7 @@ class Plan:
             "attention_projection_policy": self.attention_projection_policy,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
+            "native_dense_activations": self.native_dense_activations,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
@@ -359,7 +361,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")
-    if (speculation is not None and speculation.packed_verification and speculation.adaptive
+    if (speculation is not None and speculation.packed_verification
             and speculation.draft_tokens > 0
             and speculation.graph_budget is None and recipe.speculation is not None):
         speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)

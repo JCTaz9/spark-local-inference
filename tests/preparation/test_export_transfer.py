@@ -8,6 +8,8 @@ from pathlib import Path
 import resource
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -62,6 +64,38 @@ def manifest(directory, count, *, large=False, blob=True):
     return path, contents
 
 
+_ISOLATED_CHILD = 'FLARE_TEST_EXPORT_TRANSFER_CHILD'
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def isolated_descriptor_stress(request):
+    """Run a descriptor-limit test in a fresh process with no inherited CUDA FDs."""
+    if os.environ.get(_ISOLATED_CHILD) == '1':
+        return False
+    command = [sys.executable, '-m', 'pytest', '-q', request.node.nodeid]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=_ROOT,
+            env={**os.environ, _ISOLATED_CHILD: '1'},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(f'isolated descriptor test timed out after {error.timeout}s')
+    if result.returncode != 0:
+        output = (result.stdout + result.stderr).strip()
+        pytest.fail(
+            f'isolated descriptor test failed (exit {result.returncode}):\n{output[-4000:]}'
+        )
+    return True
+
+
+def descriptor_count():
+    return len(os.listdir('/proc/self/fd')) - 1
+
+
 def launch(function, connections):
     failures = []
 
@@ -84,8 +118,12 @@ def launch(function, connections):
 def receive(control, roots, destination, cache, *, no_weights=False):
     request = dict(control_fd=control.fileno(), channels=host_ranks._export_channels(roots),
                    destination=str(destination))
-    result = json.loads(flare_heliopause.export_receive_ranks(
-        json.dumps([request]), cache, no_weights, (control, roots)))[0]
+    stage = flare_heliopause.NativeExportStage(None, None, cache)
+    try:
+        result = json.loads(flare_heliopause.export_receive_ranks(
+            json.dumps([request]), cache, no_weights, (control, roots), stage))[0]
+    finally:
+        stage.close()
     host_ranks._restore_export_channels(roots, result['channels'])
     return result['stats']
 
@@ -173,17 +211,38 @@ def test_export_rejects_management_payload_fallback(tmp_path):
         with pytest.raises(RuntimeError, match='established fabric channels'):
             host_ranks.send_export_sources(control, package(path), {}, channels=[])
         request = dict(control_fd=control.fileno(), channels=[], destination=str(tmp_path / 'rank.json'))
-        with pytest.raises(RuntimeError, match='management payload transfer is forbidden'):
-            flare_heliopause.export_receive_ranks(json.dumps([request]), tmp_path / 'cache', False, (control,))
+        stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
+        try:
+            with pytest.raises(RuntimeError, match='management payload transfer is forbidden'):
+                flare_heliopause.export_receive_ranks(
+                    json.dumps([request]), tmp_path / 'cache', False, (control,), stage)
+        finally:
+            stage.close()
 
+
+
+def test_export_stage_retention_requires_a_live_stage(tmp_path):
+    stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
+    try:
+        # A live stage accepts retention (nothing to retain here) ...
+        assert stage.retain_sources([]) == 0
+    finally:
+        stage.close()
+    # ... and a closed stage refuses instead of accepting leases it will drop.
+    with pytest.raises(RuntimeError, match='closed'):
+        stage.retain_sources([])
 
 
 def test_export_requires_retained_socket_owners(tmp_path):
     path, _ = manifest(tmp_path / 'peer', 1)
     with pytest.raises(ValueError, match='retained socket owners'):
         flare_heliopause.export_send_rank(package(path).native_output, '{}', -1, '[]', None)
-    with pytest.raises(ValueError, match='retained socket owners'):
-        flare_heliopause.export_receive_ranks('[]', tmp_path / 'cache', False, None)
+    stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
+    try:
+        with pytest.raises(ValueError, match='retained socket owners'):
+            flare_heliopause.export_receive_ranks('[]', tmp_path / 'cache', False, None, stage)
+    finally:
+        stage.close()
 
 
 def test_native_export_requires_missing_weights_and_verifies_cached_content(tmp_path):
@@ -198,7 +257,9 @@ def test_native_export_requires_missing_weights_and_verifies_cached_content(tmp_
         transfer(path, tmp_path / 'corrupt.json', tmp_path / 'cache')
     assert not (tmp_path / 'corrupt.json').exists()
 
-def test_export_thousands_of_files_with_small_descriptor_limit(tmp_path):
+def test_export_thousands_of_files_with_small_descriptor_limit(tmp_path, request):
+    if isolated_descriptor_stress(request):
+        return
     path, contents = manifest(tmp_path / 'peer', 1200)
     limits = resource.getrlimit(resource.RLIMIT_NOFILE)
     try:
@@ -211,7 +272,9 @@ def test_export_thousands_of_files_with_small_descriptor_limit(tmp_path):
 
 
 @pytest.mark.parametrize('disconnect', [False, True])
-def test_large_export_frames_progress_with_scarce_descriptors(tmp_path, disconnect):
+def test_large_export_frames_progress_with_scarce_descriptors(tmp_path, disconnect, request):
+    if isolated_descriptor_stress(request):
+        return
     payload = []
     bundle = BundleIndex()
     size = 2 * BLOCK_BYTES + 17
@@ -231,9 +294,12 @@ def test_large_export_frames_progress_with_scarce_descriptors(tmp_path, disconne
         roots, peers = channels(stack, 8)
         for channel in (*roots, *peers):
             channel.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
-        # Match the available descriptors after preparation has initialized NVIDIA libraries.
-        while len(os.listdir('/proc/self/fd')) - 1 < 116:
+        # Reserve twelve descriptors for the transfer. This test runs in a fresh
+        # subprocess so CUDA initialization in another test cannot consume them.
+        assert descriptor_count() <= 116
+        while descriptor_count() < 116:
             stack.enter_context(open('/dev/null', 'rb'))
+        assert descriptor_count() == 116
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (min(limits[0], 128), limits[1]))
             thread, failures = launch(
@@ -241,7 +307,7 @@ def test_large_export_frames_progress_with_scarce_descriptors(tmp_path, disconne
                 [peer, *(channel.connection for channel in peers)])
             try:
                 time.sleep(0.2)
-                assert thread.is_alive()
+                assert thread.is_alive(), failures
                 if disconnect:
                     roots[3].connection.shutdown(socket.SHUT_RDWR)
                     with pytest.raises(RuntimeError):
@@ -421,8 +487,12 @@ def test_concurrent_native_rank_reuse_publishes_one_complete_blob(tmp_path, cach
                 assert not payload and message['stats'] == stats
 
             workers.append(launch(transmit, [peer, peers[0].connection]))
-        received = json.loads(flare_heliopause.export_receive_ranks(
-            json.dumps(requests), tmp_path / 'cache', cached, (controls, root_channels)))
+        stage = flare_heliopause.NativeExportStage(None, None, tmp_path / 'cache')
+        try:
+            received = json.loads(flare_heliopause.export_receive_ranks(
+                json.dumps(requests), tmp_path / 'cache', cached, (controls, root_channels), stage))
+        finally:
+            stage.close()
         for thread, failures in workers:
             thread.join(5)
             assert not thread.is_alive() and not failures

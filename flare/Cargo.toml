@@ -24,9 +24,10 @@ libloading = "0.8.9"
 # Fleet control signs grants and encrypts agent sessions with the ring Helios already links.
 ring = "0.17.14"
 socket2 = "0.6"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
+prost = "0.14"
 
 # DGX Spark and Grace hosts serve multi-host packages over RoCEnante, which links libibverbs.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]

@@ -13,7 +13,7 @@ from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
-from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_shapes, speculative_token_capacity
+from ignition.components.capacity import batch_capacities, prefill_capacities, request_capacity, speculative_token_capacity
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from ignition.components.paged_generation import PreparedGeneration
@@ -27,6 +27,7 @@ from ignition.preparation.collectives import (CollectivePreparation, create_all_
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -58,6 +59,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(16))
@@ -75,6 +77,7 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    speculative_graph_budget: int = 64
     # Store eligible attention, shared-expert, latent MoE, and DSpark projections as MXFP8.
     online_mxfp8: bool = False
     # Shared experts overlap routing and routed experts on an auxiliary stream.
@@ -96,7 +99,7 @@ class PreparationConfig:
                 raise ValueError("Kimi K3 drafts verify one through eight rows per request")
             if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
                 raise ValueError("fixed verification width must belong to the captured widths")
-            _ = self.speculative_shapes
+            _ = self.speculative_round_shapes
         if not self.page_tokens <= self.context <= 1048576 or self.context % self.page_tokens:
             raise ValueError(f"Kimi K3 context must be {self.page_tokens}-aligned in [{self.page_tokens},1048576]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
@@ -119,13 +122,20 @@ class PreparationConfig:
         return -(-self.prefill_chunk_size // self.page_tokens) + 2 * request_capacity(self.max_active)
 
     @property
-    def speculative_shapes(self):
-        return (speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
-                if self.drafting else ())
+    def speculative_round_shapes(self):
+        from ignition.components.capacity import parallel_speculative_shapes
+
+        return parallel_speculative_shapes(self.max_active, self.speculative_widths,
+            self.speculative_token_capacity, self.speculative_graph_budget,
+            fixed_width=self.speculative_fixed_width) if self.drafting else ()
 
     @property
     def decode_tokens(self):
-        return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
+        return max((packed for _, _, packed in self.speculative_round_shapes), default=request_capacity(self.max_active))
+
+    @property
+    def decode_samples(self):
+        return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
     @property
     def draft_tokens(self):
@@ -175,7 +185,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if drafting else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         coordinator = CollectivePreparation(group)
         # Prefill activations reduce in chunks of the rows decode and verification already need a channel for: a
         # channel sized for whole prefill chunks would stage 448 MiB per rank for 4096 rows.
@@ -183,7 +193,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         collective = create_all_reduce_runtime(group, device, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
-            max_rows=max(config.decode_tokens, slots * (config.draft_tokens or 1)),
+            max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
         context_collective = draft_argmax = None
         if drafting:
@@ -225,6 +235,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "world_size": shard.world_size, "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -254,7 +265,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             mla_output = kda_output
             prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, weights.config, shard.world_size, device,
                                                activations=activation[:config.prefill_chunk_size], buffers=cursor)
-            decode_storage = Scratch.allocate(config.decode_tokens, config.decode_tokens, weights.config, shard.world_size,
+            decode_storage = Scratch.allocate(config.decode_tokens, config.decode_samples, weights.config, shard.world_size,
                                               device, buffers=cursor)
             vision_inputs = VisionInputs.allocate(device) if patches else None
             vision_storage = {}
@@ -299,14 +310,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             page_tokens=config.page_tokens, draft_argmax=draft_argmax)
     modes = (True, False) if drafting else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
-             + len(config.speculative_shapes) + len(patches))
+             + len(config.speculative_round_shapes) + len(patches))
     with phase(progress, "Construct graph catalog", total=count) as stage:
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
-            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled)
+            signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
+                packed_token_capacity=packed_tokens)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -338,12 +350,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
             speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-            for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
-                name = f"speculative{batch}x{width}"
+            for batch, width, packed in sorted(config.speculative_round_shapes, key=lambda shape: (shape[2], shape[0]), reverse=True):
+                name = f"speculative{batch}x{width}-tokens{packed}"
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                    buffers=speculation.sampling_buffers.cursor())
+                    buffers=speculation.sampling_buffers.cursor(), target_token_capacity=packed)
                 forward.prepare()
-                add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"), enabled=True)
+                add(name, forward, "speculative", batch, width, (*inputs.buffers(), "sampling_grammar_mask"), enabled=True, packed_tokens=packed)
 
         for capacity in reversed(patches):
             name = f"vision{capacity}"
@@ -428,14 +440,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if scoring is not None:
         memory.update(scoring.memory_report())
     if drafting:
-        server_config.update(speculative_widths=config.speculative_widths,
+        server_config.update(speculative_widths=tuple(sorted({width for _, width, _ in config.speculative_round_shapes})),
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths),
                                                                   config.speculative_token_capacity),
             speculative_fixed_width=config.speculative_fixed_width)
-        memory.update(speculative_shapes=config.speculative_shapes)
+        memory.update(speculative_round_shapes=config.speculative_round_shapes,
+                      speculative_graph_budget=config.speculative_graph_budget)
     draft_disposable = [] if speculation is None else [speculation.draft_scratch.scratch_tensors(), speculation.context_buffers,
         speculation.kda_records.corrections, speculation.kda_records.keys_and_gates]
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'output_res_score', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

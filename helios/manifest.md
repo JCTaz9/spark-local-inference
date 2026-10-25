@@ -1,6 +1,6 @@
 # Prepared execution manifest
 
-ABI versions `2` and `3` describe graph execution and transport over one existing CUDA
+Execution ABI `4` describes graph execution and transport over one existing CUDA
 context. A resource owner retains the context, graphs and allocations through
 shutdown. `NativeResources` reconstructs these resources from a runtime package written
 by Ignition before native serving starts. The model recipe defines the numerical behavior of each executable.
@@ -9,7 +9,7 @@ The Python representation is a dictionary with these fields:
 
 ```python
 {
-    "abi_version": 2,
+    "abi_version": 4,
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
@@ -31,7 +31,10 @@ The Python representation is a dictionary with these fields:
             "sampling_mode": str,   # general.
             "handle": int,          # Instantiated CUgraphExec handle.
             "batch_capacity": int,
-            "token_capacity": int,
+            "token_capacity": int,  # W, including the pending token.
+            "draft_tokens": int,    # Captured proposal depth D for speculative graphs.
+            "packed_token_capacity": int,  # P, explicit for speculative graphs.
+            "confidence_width": int,  # Produced confidence prefixes, otherwise zero.
             "input_bindings": [
                 {
                     "buffer_name": str,
@@ -52,10 +55,15 @@ lists. Graph executable handles are nonzero and unique. Registered device
 spans do not overlap; captured weights and scratch need not appear in this I/O
 manifest but must remain in the resource owner.
 
-Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `decode`, `resume`,
-`vision`, and, in ABI3, `speculative`. Decode and speculative batch capacities are powers of two through 64.
-Decode has one token per packed lane. Speculative graphs have an integer
-verification width from 1 through 8 in `token_capacity`.
+Graph kinds are `init`, `restore`, `snapshot`, `prefill`, `scored_prefill`,
+`decode`, `speculative`, `mixed`, `resume`, and `vision`. Decode and speculative
+batch capacities are powers of two through 64. Decode has one token per lane.
+A speculative graph performs complete proposal, optional confidence/allocation,
+verification, and commit work. It declares B/D/W/P explicitly: request capacity,
+captured proposal depth, per-request target capacity, and aggregate target rows.
+W is from 1 through 8; P is from B through B × W, including rectangular P = B × W.
+Width-one speculative graphs have D = 0 and maintain draft context. No standalone
+proposal, verification, or packed-speculative graph kind exists.
 Prefill has batch capacity 1. Token capacities are 1, 16, or a multiple of 64
 within 64..=262144. The model configuration separately requires the captured
 catalog for its `prefill_chunk_size`; transport validation does not infer a
@@ -85,7 +93,7 @@ Two graph inputs are reserved and required in every executable's bindings:
 |---|---|---|---|
 | `frame_index` | int32 | `[1]` | Native executor |
 | `submission_sequence` | int64 | `[1]` | Native executor |
-| `completion_records` | int64 | ABI2 `[2,capacity,8]`; ABI3 `[2,capacity,24]` | Captured graph finalizer |
+| `completion_records` | int64 | `[2,capacity,24]` | Captured graph finalizer |
 
 `completion_records` is an output and cannot appear in input bindings. Each
 buffer has one fixed host offset shared across all graph bindings that name
@@ -97,7 +105,7 @@ frame index and positive, monotonic submission sequence. Command callers
 cannot override those two values.
 
 Generation reporting uses `logprob_requested: int32[C]` as a boolean gate,
-where C is padded request capacity. New packages also bind
+where C is padded request capacity. Sampling graphs also bind
 `logprob_token_ids: int32[C,128]` and `logprob_token_id_counts: int32[C]`.
 Counts are cleared every submission: zero selects natural top-20; 1..128 selects
 the uploaded ID prefix. Sampling graphs require the complete input group.
@@ -112,8 +120,7 @@ with W the larger of 20 and the frame's largest explicit count. Source pitch
 follows package storage; compact pinned decoding uses the copied pitch, while
 mapped-host decoding uses package pitch. Frames without reporting copy no
 generation payload. Natural width-20 readback remains 1,344C bytes; explicit
-width 128 uses 8,256C. Legacy packages with natural capacity k in 1..20 retain
-that capacity, request limit, source pitch, and `64C(1+k)` readback bytes.
+width 128 uses 8,256C.
 Prompt output geometry and readback are independent of generation width.
 
 Relative to width-20 packages, persistent generation output adds 13,824C bytes
@@ -159,7 +166,7 @@ Each completion lane begins with eight signed 64-bit fields in this order:
 7. Error code, `0` on success.
 8. Reserved, `0`.
 
-ABI3 appends these fields at zero-based indices:
+The 24-field completion record includes these zero-based indices:
 
 | Index | Meaning |
 |---|---|
@@ -168,7 +175,7 @@ ABI3 appends these fields at zero-based indices:
 | 10 | Accepted drafts within the emitted prefix |
 | 11 | Bitmask of offered drafts supplied by copying; bit zero is the first draft |
 | 12 | Reserved field; every prepared model contract requires `-1` |
-| 13 | Committed draft-cache length, `max(consumed_tokens-1,0)`; `-1` for a copy-only speculative round with no draft cache |
+| 13 | Committed draft-cache length, `max(consumed_tokens-lag_tokens,0)` for the declared completion cursor; `-1` without a draft cache |
 | 14 | Reserved, `0` |
 | 15 | Verification width, an integer from 1 through 8 |
 | 16–23 | Emitted token IDs in order, with unused entries `-1` |
@@ -178,18 +185,18 @@ vector. Accepted drafts number either `emitted_count-1` or `emitted_count`;
 the latter occurs when EOS or the output budget clips inside the accepted draft
 prefix. It never exceeds the offered count. Ordinary sampling emits at most
 one token and reports width one. Maintenance and non-sampling prefill emit
-zero tokens. Every graph in an ABI3 catalog writes the 24-field layout.
+zero tokens. Every graph in an ABI4 catalog writes the 24-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
-request state advances. A speculative or verification completion requires a
+request state advances. A speculative completion requires a
 token vector whose verification width (field 15) equals the submitted graph's
 `token_capacity`, and its record's consumed-token increase since submission
 must equal its emitted count; such a completion without a token vector is
-invalid. Each speculative or verification graph declares one fixed
+invalid. Each speculative graph declares one fixed
 `token_capacity`, so a finalizer writes that value into field 15 of every
 record it emits.
 
-ABI3 optionally declares `completion_speculative_survival`, a contiguous
+ABI4 optionally declares `completion_speculative_survival`, a contiguous
 `float32[2,capacity,7]` output indexed by completion frame, physical request
 slot, and draft-prefix depth. Each value is the cumulative product of
 `min(1, p(token)/q(token))` through that prefix, using the distributions used
@@ -199,11 +206,10 @@ Output/context limits bound logical draft depth; termination inside an accepted
 prefix censors later positions. Prefill rows in mixed graphs contain `-1`.
 The buffer cannot be an input binding.
 
-Transport reads this output only for speculative, verification, packed speculative,
-and mixed graphs with width greater than one, using the existing completion stream and
-fence. Every rank validates its values; rank zero supplies the scheduling
-observations without numeric consensus or an additional collective. Absent
-buffers preserve binary completion feedback for previously exported packages.
+Transport reads this output for speculative and mixed graphs with width greater
+than one, using the completion stream and fence. Every rank validates its values;
+rank zero supplies the scheduling observations without numeric consensus or an additional collective. Absent
+buffers select binary completion feedback.
 The probabilities affect future scheduling only, never token sampling or the
 acceptance decision producing the completion.
 
@@ -219,18 +225,19 @@ The executor allocates two pinned input frames and two pinned completion
 frames. Input updates, graph execution and production events use the model
 stream. A copy stream waits for each production event, transfers the selected
 completion row, and records its completion event. A frame remains occupied
-until that transfer completes. Ordinary work allows at most two submissions
-in flight. Every speculative graph uses a submission barrier, including direct
-executor calls without an explicit grammar flag. Grammar-constrained work and
-host token stops also run with one submission in flight,
-so host token processing finishes before the next generation step.
+until its transfer completes and its completion is consumed. Only decode and
+complete speculative generation may occupy both frames. Grammar-constrained
+work and host token stops require an empty window. Prefill, scored prefill,
+mixed, resume, vision, and state operations also drain the window before replay.
+Scheduler dependencies additionally serialize host-fed pending tokens and
+committed cursors, history inputs, unknown or stale costs, and phase transitions.
 
 Each graph descriptor carries `estimated_duration_ns`; zero denotes an
 indeterminate duration. Ignition leaves this field at zero. Helios starts every
 graph indeterminate and learns its cost from GPU completion intervals, including
 tensor-parallel execution and excluding host queue wait. A first measurement sets
-the estimate; fresh measurements update it with weight 1/8. Estimates expire after
-30 seconds without a valid observation and are learned afresh on the next replay.
+the estimate; fresh measurements use the median of up to nine observations.
+Estimates become stale after 30 seconds without a valid observation and are replaced by the next valid replay.
 
 Every submission uses preallocated CUDA timing events around the entire
 captured graph. `FrameCompletion.timing.gpu_ns` retains each rank's local interval,
@@ -239,7 +246,7 @@ occupied through the transfer fence. `timing.wall_ns` spans host dispatch throug
 observation of all participating ranks' completions, including input staging,
 rank coordination, device queueing and completion delivery. A maximum of local
 GPU intervals is not the rank group's wall interval. `timing.queued` identifies
-single-rank frames dispatched with another frame outstanding; these host
+frames dispatched with another frame outstanding; these host
 intervals must not be summed as GPU busy time or treated as isolated service cost.
 The Heliopause `ExecutionCompletion` exposes `gpu_ns`, `wall_ns` and `queued`.
 
@@ -251,14 +258,14 @@ ownership and reports failure; it cannot authorize memory reuse.
 
 The manifest describes transport and graph capacities. The model recipe's
 request-state, page-table, positional and sampling input names are additional
-named buffers and bindings. A scheduler adapter checks those semantic names
-against the recipe before serving requests.
+named buffers and bindings. Shared input packing validates their semantic
+bindings before serving requests.
 
 ## Native runtime package
 
-`ignition export MODEL --gpus N[,N...] --output model.safetensors` prepares a
-native package for `flare run model.safetensors`. Each TP rank has its own
-resource bundle inside the file. Helios serves ranks as threads in one Rust
+`ignition export MODEL --gpus N[,N...]` prepares a native package in the shared
+cache and prints its entry path. `flare run CACHE_ENTRY` loads that package.
+Each TP rank has its own resource bundle. Helios serves ranks as threads in one Rust
 process. Ignition exits or replaces its Python process through `execv` before
 the native server starts. The CUDA driver creates context, module, function,
 graph, and executable handles from the package descriptions.
@@ -282,23 +289,27 @@ The index is limited to 16 MiB. It includes:
 - Offloaded Engram geometry, encoding, table spans, compact input names, and
   named external event waits.
 
-Native manifests for models with Engram tables carry a shared host reader and
-rank-local event bindings. Table rows use separate preallocated GPU inputs;
-ordinary graph uploads contain the CPU-computed hash IDs. One step may be in
-flight while the reader owns the shared pinned row buffers. Each rank queues
-its readiness wait, H2D copies, and event record before launching the graph.
-Consumer event waits preserve the dependency between those transfers and the
-captured lookup. Reuse requires completion on every rank. Shutdown drains row
-copy streams in addition to model and completion streams.
+Native manifests with Engram tables carry a shared host reader and rank-local
+readiness events. Each table has two pinned payload frames and ready flags.
+Each rank queues its readiness wait, compact H2D copies, and event record before
+launching the consumer. Transfer N+1 waits for the compute-stream start event
+following graph N, protecting reusable device scratch. A host frame is reusable
+only after every participating rank completes its consumer. Shutdown drains row
+copy, model, and completion streams; their owners survive an unconfirmed drain.
+The package memory budget includes both host staging frames once per shared
+rank group.
 
-Graph declarations specify kind, sampling mode, batch capacity, token capacity,
-draft source, draft count, and verification count. Verification count includes
-the pending input. Selection uses these fields before reading graph bodies or
-loading kernels. MTP alternatives for one batch and verification width are
-selected exclusively. Weights, including MTP weights, remain loaded.
+Graph declarations specify operation, sampling mode, B/D/W/P, confidence output
+extent, and mixed prefill extent. D describes actual captured proposal work,
+independent of W and P. The prepared contract's exact `QueryLength` binding or
+ceiling `SpeculativePrefixLimit` binding determines allocation ownership.
+Selection uses concrete metadata before reading graph bodies or loading kernels.
+Tensor-parallel ranks must have identical selected physical catalogs.
 
-Graph bodies, module images, globals, tensor payloads, and frontend assets are
-separate indexed spans in the file. Each graph body contains its declared
+Executable resource spans are one zstd level-3 frame per cubin or graph; the
+manifest does not select a codec or carry executable keys. Graph bodies, module
+images, globals, tensor payloads, and frontend assets are separate indexed spans
+in the file. Each graph body contains its declared
 number of nodes followed by its edges, encoded as u32 little-endian lengths
 and Protobuf records. Records are limited to 1 MiB. Helios decodes one record
 at a time and drops CUDA graph templates after instantiation. Tensor loading

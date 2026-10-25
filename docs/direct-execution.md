@@ -96,9 +96,10 @@ round can leave requests out or run in a larger, padded batch when that graph is
 faster. A request's value is its expected tokens, from Helios's per-depth
 acceptance estimate, priced by its token and delivery fairness, plus its output
 age; the graph with the best value per graph time wins, with Helios's tie
-breaks. Graph times are Helios's estimates: unknown until a step of that shape
-runs, then a 7/8 moving average of observed graph time, forgotten after 30 s
-without an observation. Unknown and forgotten graphs are explored before any
+breaks. Diagnostic graph times are unknown until a step of that shape runs,
+then use a 7/8 moving average of observed graph time and become unknown after
+30 s without an observation. Native Helios instead retains stale costs and uses
+median replay observations with funded refresh. Unknown and forgotten graphs are explored before any
 measured one, the most valuable first, so every batch and width runs at
 startup, and a neglected one, such as a wide verification that lost to a
 narrower one, runs again every 30 s. Service prices are initialized when a
@@ -107,25 +108,22 @@ its committed tokens and deliveries, as in `helios/src/scheduler/service.rs`.
 `tests/direct/test_helios_decode_rounds.py` checks every round against the
 rounds Helios chose for the same requests, graph times and acceptance.
 
-For separate proposal and verification catalogs, a direct step runs the proposal
-at the loaded depth followed by its selected verification graph. Its timing
-covers both graphs. Width selection uses the preceding round's native confidence
-curve, and proposal execution reserves the complete draft block's randomness.
-The diagnostic scheduler does not retain proposals across steps or regroup
-requests using fresh confidence. Those behaviors are exercised through native
-Helios serving.
+Each speculative candidate is one complete captured generation program with
+explicit request capacity B, actual proposal depth D, per-request target
+capacity W, and aggregate target rows P. Timing covers proposal generation,
+optional confidence and allocation, target verification, and accepted-state
+commit in that program. Width-one programs compete independently. No direct
+step dispatches standalone proposal or verification operations.
 
-For combined packed-round catalogs, a candidate retains its graph operation,
-request capacity, logical verification width, physical target-row capacity, and
-proposal depth. Timing and cost estimates identify that complete shape. Cohort scoring uses conditional
-confidence from completed rounds; width-one graphs compete independently. The
-host freezes each request's prefix ceiling from its pending input, captured
-width and depth, remaining output, and context budget. The combined graph
-generates proposals and allocates actual prefixes on the GPU within those
-ceilings and its aggregate physical capacity. Before committing a successful
-batch, direct execution validates terminal completion and confidence for all
-submitted requests. It does not retain proposals across steps or regroup requests
-using fresh confidence.
+Exact `QUERY_LENGTH` bindings use host-selected lengths from completed
+observations, frozen before proposal draws. `SPECULATIVE_PREFIX_LIMIT` bindings
+supply immutable lane ceilings bounded by `min(D + 1, W)`, remaining output,
+and context capacity. The captured GPU allocator selects actual prefixes within
+those ceilings and P. Successful batches validate all terminal completion and
+framed confidence records before request state changes. Fixed selection supports
+host allocation; GPU allocation requires adaptive selection. Direct execution
+runs one diagnostic program at a time; native generation's two-frame queue and
+projected service/age behavior are qualified through Helios serving.
 
 The scheduling clock, which ages requests and expires estimates, advances by
 each step's graph time, and by wall time only while the loop waits for

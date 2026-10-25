@@ -64,7 +64,7 @@ def prepare_sampling_broadcasts(proposals, verification, *, collectives, session
 class PreparedParallelDraftRound:
     """Prepare verification and optionally its draft generator.
 
-    A verification-only round receives retained drafts from PreparedDraftVerification;
+    A target-only forward receives proposals from its enclosing captured round;
     it allocates no draft decoder, Markov projection, or proposal samplers. An owner
     whose ``draft_argmax`` names a vocabulary-parallel argmax runtime proposes greedy
     drafts from the draft head's and Markov bias's vocabulary shards without gathering
@@ -101,9 +101,9 @@ class PreparedParallelDraftRound:
             shard=o.weights.shard,
             pool=o.pool,
             verification_width=w,
+            target_token_capacity=tokens,
             page_tokens=o.page_tokens,
         )
-        self.validator.accept_unsampled = False
         self.validation = PreparedAllReduce(
             self.validator.validation_input,
             self.validator.validation_sum,

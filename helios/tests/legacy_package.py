@@ -1,7 +1,7 @@
-"""Version 4/5 physical package fixtures, independent of the native exporter.
+"""Version 4/5 ModelIndex physical package fixtures with envelope 6, independent of the native exporter.
 
-Executable encryption uses AES-GCM chunks; Ed25519 signatures bind the publisher,
-resource catalogs, stored-data digests, and per-rank bundles. Stored allocations
+Executable payloads use one zstd level-3 frame per resource; Ed25519 signatures bind
+the publisher, resource catalogs, stored-data digests, and per-rank bundles. Stored allocations
 remain in the primary payload or numbered companion files.
 """
 
@@ -14,11 +14,8 @@ import os
 from pathlib import Path
 import re
 import struct
+import subprocess
 import tempfile
-
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ignition.preparation import runtime_package_pb2 as proto
 
@@ -29,7 +26,7 @@ DEFAULT_SHARD_SIZE = 64 << 30
 COPY_BLOCK = 16 << 20
 COPY_THREADS = 16
 CHUNK = 4 << 20
-VERSION = 4
+VERSION = 6
 _ZEROS = bytes(4 << 20)
 
 
@@ -335,19 +332,20 @@ def fields(*values):
 
 
 def signature_message(package_id, signer, kind, body):
-    return fields(b'flare-package-signature-v4', struct.pack('<I', VERSION),
+    return fields(b'flare-package-signature-v6', struct.pack('<I', VERSION),
                   package_id, signer, struct.pack('<I', kind), body)
 
 
-def resource_key(public_key, package_id, offset, namespace):
-    # Bind ciphertext keys to the signing key, publisher, package, and resource.
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=package_id,
-                info=fields(b'flare-executable-v3', struct.pack('<Q', offset), namespace.encode())).derive(public_key)
+def zstd_compress(data):
+    """Compress one fixture resource as one level-3 zstd frame."""
+    return subprocess.run(['zstd', '-q', '-3', '-c'], input=data,
+                          stdout=subprocess.PIPE, check=True).stdout
 
 
-def chunk_aad(package_id, offset, size, chunk):
-    return fields(b'flare-executable-chunk-v3', package_id,
-                  struct.pack('<Q', offset), struct.pack('<Q', size), struct.pack('<Q', chunk))
+def zstd_decompress(data):
+    """Decode one fixture resource frame."""
+    return subprocess.run(['zstd', '-q', '-d', '-c'], input=data,
+                          stdout=subprocess.PIPE, check=True).stdout
 
 
 def resource_roles(index):
@@ -395,20 +393,15 @@ def _read_at(contents, position, length, error):
     return block
 
 
-def _encrypt(cipher, package_id, offset, source, source_offset, size, encrypted):
-    """Encrypt a resource chunk by chunk into `encrypted`; returns each ciphertext chunk's SHA-256.
+def _compress(source, source_offset, size):
+    """Compress one resource into one independent frame and hash its stored chunks."""
 
-    Sources are read by position, so jobs sharing an open source (a package being re-signed) do not race.
-    """
-
-    digests = []
-    with _open_source(source) as contents, encrypted.open('xb') as output:
-        for counter, start in enumerate(range(0, size, CHUNK)):
-            block = _read_at(contents, source_offset + start, min(CHUNK, size - start), 'truncated executable resource')
-            ciphertext = cipher.encrypt(counter.to_bytes(12, 'big'), block, chunk_aad(package_id, offset, size, counter))
-            digests.append(hashlib.sha256(ciphertext).digest())
-            output.write(ciphertext)
-    return digests
+    with _open_source(source) as contents:
+        data = _read_at(contents, source_offset, size, 'truncated executable resource')
+    stored = zstd_compress(data)
+    digests = [hashlib.sha256(stored[start:start + CHUNK]).digest()
+               for start in range(0, len(stored), CHUNK)]
+    return stored, digests
 
 
 def _digest(source, source_offset, size):
@@ -457,7 +450,15 @@ class Protection:
                 raise ValueError('publication ranges differ from classified resources')
         ordered = sorted(ranges, key=lambda offset: (by_offset[offset][0] != 4,
                          owners.index(by_offset[offset][1]) if by_offset[offset][0] == 4 else 0, offset))
-        sizes = {offset: by_offset[offset][2].nbytes for offset in ordered}
+        compressed = {}
+        for offset in ordered:
+            kind, _, span = by_offset[offset]
+            if kind == 2:
+                ((_, source, source_offset, size),) = ranges[offset]
+                compressed[offset] = _compress(source, source_offset, size)
+        original_sizes = {offset: by_offset[offset][2].nbytes for offset in ordered}
+        sizes = {offset: len(compressed[offset][0]) if by_offset[offset][0] == 2
+                 else original_sizes[offset] for offset in ordered}
         self.hashes = {owner: hashlib.sha256() for owner in owners}
 
         def layout(sharded):
@@ -471,7 +472,7 @@ class Protection:
             for offset in ordered:
                 kind, owner, span = by_offset[offset]
                 size = sizes[offset]
-                stored = size + (16 * -(-size // CHUNK) if kind == 2 else 0)
+                stored = size
                 if sharded and kind == 4:
                     if not data_file or (positions[data_file] and align(positions[data_file]) + size + 4096 > shard_size):
                         data_file = str(len(data_files) + 1)
@@ -495,8 +496,8 @@ class Protection:
                 else:
                     catalog = self.code[owner] if kind == 2 else self.support[owner]
                     catalog_entries[offset] = catalog.resources.add(
-                        offset=cursor, plain_bytes=size, stored_bytes=stored,
-                        sha256=[bytes(32)] * (-(-size // CHUNK) if kind == 2 else 1))
+                        offset=cursor, plain_bytes=original_sizes[offset], stored_bytes=stored,
+                        sha256=[bytes(32)] * (len(compressed[offset][1]) if kind == 2 else 1))
             # Assign alignment gaps to the preceding stored-data part, as in single-file packages.
             for filename in positions:
                 parts = sorted((part for parts in self.ranges.values() for part in parts
@@ -534,11 +535,12 @@ class Protection:
                 ((_, source, source_offset, size),) = entries
                 resource = catalog_entries[offset]
                 if kind == 2:
-                    encrypted = Path(stage) / f'executable-{cursor}'
-                    cipher = AESGCM(resource_key(publisher.public_key, self.package_id, cursor, publisher.namespace))
-                    jobs.append((resource, _encrypt, (cipher, self.package_id, cursor, source, source_offset,
-                                                       size, encrypted)))
-                    entries = [(offset, encrypted, 0, resource.stored_bytes)]
+                    stored, digests = compressed[offset]
+                    path = Path(stage) / f'executable-{cursor}'
+                    path.write_bytes(stored)
+                    del resource.sha256[:]
+                    resource.sha256.extend(digests)
+                    entries = [(offset, path, 0, len(stored))]
                 else:
                     jobs.append((resource, _digest, (source, source_offset, size)))
             for _, source, source_offset, size in entries:
@@ -628,10 +630,57 @@ def read_index(path):
         result = proto.ModelIndex.FromString(encoded)
     else:
         envelope = proto.ProtectedIndex.FromString(encoded)
-        if envelope.version != 4 or len(envelope.groups) != 3 or not envelope.ranks:
+        if envelope.version != 6 or len(envelope.groups) != 3 or not envelope.ranks:
             raise ValueError('invalid protected package envelope')
         result = proto.PublisherMetadata.FromString(envelope.groups[0].body).index
         for rank in envelope.ranks:
             result.ranks.add().CopyFrom(proto.RankProtection.FromString(rank.body).bundle)
     _validate_spans(result, length)
     return result, size + 8
+
+
+def snapshot_fixture(source, destination):
+    """Wrap physical envelope-6 fixture bytes in a hash-named snapshot layout."""
+    from ignition.preparation.package_snapshot import read_container
+
+    source, destination = Path(source), Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    index, _ = read_index(source)
+    names = {span.filename for _, _, span in resource_roles(index)} | {''}
+    layout = {'version': 1, 'files': {}}
+    for name in sorted(names):
+        physical = source.parent / name if name else source
+        header, base, envelope, _ = read_container(physical)
+        length = header['flare.payload']['shape'][0]
+        if not name:
+            metadata = envelope
+        if not length:
+            layout['files'][name] = []
+            continue
+        framing = container_header(length)
+        digest = hashlib.sha256(framing)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(framing)
+            with physical.open('rb') as file:
+                file.seek(base)
+                remaining = length
+                while remaining:
+                    block = file.read(min(remaining, COPY_BLOCK))
+                    if not block:
+                        raise ValueError('truncated legacy fixture payload')
+                    output.write(block)
+                    digest.update(block)
+                    remaining -= len(block)
+        blob = digest.hexdigest() + '.safetensors'
+        temporary.replace(destination.parent / blob)
+        layout['files'][name] = [[length, blob]]
+    encoded = json.dumps(layout, separators=(',', ':')).encode()
+    header = {'__metadata__': {'format': 'flare-snapshot'},
+              'flare.payload': {'dtype': 'U8', 'shape': [0], 'data_offsets': [0, 0]},
+              'flare.metadata': {'dtype': 'U8', 'shape': [len(metadata)], 'data_offsets': [0, len(metadata)]},
+              'flare.layout': {'dtype': 'U8', 'shape': [len(encoded)],
+                               'data_offsets': [len(metadata), len(metadata) + len(encoded)]}}
+    raw = json.dumps(header, separators=(',', ':')).encode()
+    raw = raw.ljust(align(8 + len(raw)) - 8, b' ')
+    destination.write_bytes(struct.pack('<Q', len(raw)) + raw + metadata + encoded)

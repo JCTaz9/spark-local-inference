@@ -148,3 +148,17 @@ def mixed_shapes(concurrency, chunk_size, widths=(1,), token_capacity=None):
         for batch in reversed(batch_capacities(concurrency)) if batch > 1
         for width in reversed(widths) if (batch, width) in shapes
         for prompt in reversed(prompts) if width == 1 or prompt == anchor)
+
+
+def parallel_speculative_shapes(concurrency, widths, token_capacity=None, graph_budget=64, *, fixed_width=None):
+    """Complete parallel rounds with independent packed target and sampled row capacities."""
+    speculative_shapes(concurrency, widths, token_capacity)
+    batches = batch_capacities(concurrency)
+    width = max(widths) if fixed_width is None else fixed_width
+    if fixed_width is not None and fixed_width not in widths:
+        raise ValueError("fixed verification width must belong to the prepared widths")
+    rounds = [(batch, 1, batch) for batch in batches]
+    if width > 1:
+        rounds.extend((batch, width, packed) for batch, packed in packed_speculative_shapes(
+            concurrency, width, token_capacity, graph_budget))
+    return tuple(rounds)

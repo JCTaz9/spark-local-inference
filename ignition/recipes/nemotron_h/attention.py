@@ -25,7 +25,7 @@ class PreparedAttention:
             session=session, name=name + ".cache_write", k_scale=key_scale, v_scale=value_scale)
         self.attention = PreparedPagedAttention(self.query, key_cache, value_cache, metadata.page_table,
             cache_metadata.lengths, metadata.query_start_loc, attended, mode=mode,
-            width=1 if mode == "prefill" else tokens // metadata.lengths.numel(),
+            width=1 if mode == "prefill" else metadata.max_query_tokens,
             session=session, name=name + ".attention", workspace=workspace,
             k_descale=key_scale, v_descale=value_scale)
         self.output = QuantizedProjection(attended.flatten(1), weights["output"], output, session=session,

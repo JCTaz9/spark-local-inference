@@ -45,13 +45,15 @@ fn named_external_wait_survives_export_and_native_replay() {
 #[test]
 #[ignore = "requires FLARE_ENGRAM_TEST_PACKAGE exported by engram_package_fixture.py on the assigned GPU"]
 fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
+    use super::{payload::Files, protection::AuthorizedKind};
     use crate::{
         engram::{Binding, Shared, Storage},
         execution::{GraphExecutor, Upload},
     };
     let root = std::path::PathBuf::from(std::env::var_os("FLARE_ENGRAM_TEST_PACKAGE").unwrap());
     let table_rank: usize = std::env::var("FLARE_ENGRAM_TEST_RANK")
-        .map(|rank| rank.parse().unwrap()).unwrap_or(0);
+        .map(|rank| rank.parse().unwrap())
+        .unwrap_or(0);
     let reference_rows: Vec<usize> =
         serde_json::from_slice(&std::fs::read(root.join("reference_rows.json")).unwrap()).unwrap();
     for (storage, cache_bytes, fail_read, resident_scales) in [
@@ -64,14 +66,21 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
         (Storage::Disk, 1 << 20, false, true),
         (Storage::Disk, 1 << 20, true, true),
     ] {
-        let AuthorizedPackage { archive, mut index } =
-            test_support::authorize(root.join("package"));
-        let package = protobuf::decode(index.ranks.remove(0)).unwrap();
+        let authorized = test_support::authorize(root.join("package"));
+        let AuthorizedKind::Payload(payload) = authorized.kind else {
+            panic!("Engram fixture must use a payload package");
+        };
+        let index = payload.descriptor().unwrap();
+        let (archive, mut packages) = payload.into_parts();
+        let package = packages.remove(0);
         package.validate().unwrap();
         archive.validate(&package).unwrap();
         let catalog = index.engram.unwrap();
         let layout = &catalog.tables[0];
         assert_eq!(reference_rows.len(), layout.rows as usize);
+        let weight_source = archive
+            .asset_path(layout.weights.as_ref().unwrap())
+            .unwrap();
         let (first_row, rows, world) = if layout.shards.is_empty() {
             (0, layout.rows, 1)
         } else {
@@ -101,20 +110,18 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             std::process::id()
         ));
         let mut sources = archive
-            .files
-            .values()
-            .map(|file| file.direct().unwrap())
-            .collect::<Vec<_>>();
+            .direct_files()
+            .collect::<crate::Result<Vec<_>>>()
+            .unwrap();
         if fail_read {
             let file = tables.tables[0].planes[0].file;
-            let name = archive.files.keys().nth(file).unwrap();
-            let source = root.join(if name.is_empty() { "package" } else { name });
-            std::fs::copy(source, &failed_source).unwrap();
+            std::fs::copy(&weight_source, &failed_source).unwrap();
             // Corrupt the private copy; snapshot payloads themselves remain read-only.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&failed_source, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::set_permissions(&failed_source, std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
             }
             #[cfg(windows)]
             {
@@ -177,6 +184,28 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
                 )
                 .unwrap()
                 .unwrap();
+            // A second reader job may already be queued when the first disk read fails.
+            // Either preflight observes that error or both queued frames drain explicitly.
+            match executor.submit(
+                0,
+                &[
+                    Upload {
+                        buffer: "engram_1_hashes",
+                        offset: 0,
+                        bytes: &bytes,
+                    },
+                    Upload {
+                        buffer: "transfer_source",
+                        offset: 0,
+                        bytes: &transfer,
+                    },
+                ],
+                false,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("second Engram frame was unavailable"),
+                Err(error) => assert!(error.to_string().contains("Engram read")),
+            }
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 match executor.poll() {
@@ -195,43 +224,71 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             std::fs::remove_file(failed_source).unwrap();
             continue;
         }
-        // Repeat each request to deliver both disk misses and cache hits through
-        // the same native readiness and GPU consumer events.
-        for generation in [1, 1, 2, 2, 3, 3] {
-            let ids: Vec<i64> = (0..96)
-                .map(|row| {
-                    if generation == 3 && row >= 48 {
-                        -1
-                    } else {
-                        (row * 19 + generation) % rows as i64
-                    }
-                })
-                .collect();
-            let bytes: Vec<u8> = ids.iter().flat_map(|n| n.to_le_bytes()).collect();
-            executor
-                .submit(
-                    0,
-                    &[
-                        Upload {
-                            buffer: "engram_1_hashes",
-                            offset: 0,
-                            bytes: &bytes,
-                        },
-                        Upload {
-                            buffer: "transfer_source",
-                            offset: 0,
-                            bytes: &transfer,
-                        },
-                    ],
-                    false,
-                )
-                .unwrap()
-                .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while executor.poll().unwrap().is_none() {
-                assert!(std::time::Instant::now() < deadline);
-                std::thread::yield_now();
+        // Distinct requests exercise both pinned frames before either completion is retired.
+        for generations in [[1, 2], [2, 3], [3, 1]] {
+            let mut pending = Vec::new();
+            for generation in generations {
+                let ids: Vec<i64> = (0..96)
+                    .map(|row| {
+                        if generation == 3 && row >= 48 {
+                            -1
+                        } else {
+                            (row * 19 + generation) % rows as i64
+                        }
+                    })
+                    .collect();
+                let checksum: i64 = ids
+                    .iter()
+                    .filter(|id| **id >= 0)
+                    .map(|id| {
+                        let source_row = reference_rows[first_row as usize + *id as usize];
+                        (0..256)
+                            .map(|column| {
+                                let value = ((source_row * 256 + column) % 15) as i64 - 7;
+                                value * value
+                            })
+                            .sum::<i64>()
+                    })
+                    .sum();
+                let bytes: Vec<u8> = ids.iter().flat_map(|n| n.to_le_bytes()).collect();
+                let fence = executor
+                    .submit(
+                        0,
+                        &[
+                            Upload {
+                                buffer: "engram_1_hashes",
+                                offset: 0,
+                                bytes: &bytes,
+                            },
+                            Upload {
+                                buffer: "transfer_source",
+                                offset: 0,
+                                bytes: &transfer,
+                            },
+                        ],
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                pending.push((fence, checksum, ids));
             }
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            for (fence, checksum, _) in &pending {
+                loop {
+                    if let Some(completion) = executor.poll().unwrap() {
+                        assert_eq!(completion.fence, *fence);
+                        assert_eq!(
+                            completion.records[0].consumed_tokens, *checksum,
+                            "{storage:?}: captured row checksum for {fence:?}"
+                        );
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+            let generation = generations[1];
+            let ids = &pending[1].2;
             unsafe {
                 stream
                     .download(&downloaded, output.address, output.nbytes)

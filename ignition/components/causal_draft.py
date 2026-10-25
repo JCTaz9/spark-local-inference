@@ -29,7 +29,6 @@ class PreparedCausalDraftRound:
         self.metadata = Metadata.allocate(b * w, b, blocks, device, samples=b * w, buffers=buffers)
         self.validator = PreparedBatch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device, buffers=buffers),
             mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w, buffers=buffers)
-        self.validator.accept_unsampled = False
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
             session=o.session, name=name + ".validation")

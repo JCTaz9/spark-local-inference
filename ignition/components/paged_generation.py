@@ -1,7 +1,7 @@
 """Collective text execution and request completion."""
 
 from ignition.components.collectives import PreparedAllReduce
-from ignition.components.sampling import PreparedCompletion, PreparedSampling
+from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
 from ignition.preparation.scratch import bind_scratch
 
@@ -42,25 +42,16 @@ class PreparedGeneration:
             frame,
             sequence,
         )
-        self.replicated_sampling = decoder.weights.draft is not None
-        # Shared forward artifacts require identical pool layouts on sampling and consuming ranks.
         sampling_workspace = None if buffers is None else bind_scratch(
             PreparedSampling.scratch_layout(rows, batch.requests.vocab_size),
             device=decoder.scratch.logits.device, workspace=buffers)
-        self.completion = (
-            PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows], workspace=sampling_workspace)
-            if batch.shard.rank == 0 or self.replicated_sampling
-            else PreparedCompletion(*args)
-        )
+        self.completion = PreparedSampling(decoder.scratch.logits, *args, sample_enabled=b.sample_enabled[:rows], workspace=sampling_workspace)
         self.completion.prepare()
-        if self.replicated_sampling:
-            self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
-                coordinator=coordinator, name=name + ".sampling", buffers=buffers)
-        self.compilation_variant = (
-            "sample" if batch.shard.rank == 0 or self.replicated_sampling else "consume"
-        )
+        self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
+            coordinator=coordinator, name=name + ".sampling", buffers=buffers)
+        self.compilation_variant = "sample"
         self.context = None
-        if self.replicated_sampling:
+        if decoder.weights.draft is not None:
             if context_factory is None:
                 raise ValueError("speculative generation requires a draft context factory")
             self.context = context_factory(

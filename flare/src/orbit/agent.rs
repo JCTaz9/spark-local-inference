@@ -65,19 +65,35 @@ pub struct DownloadRequest {
     pub source: String,
     pub options: crate::cli::HubOptions,
     pub access_token: Option<String>,
+    /// Public publisher profiles supplied by the controller. Never private
+    /// material or controller-local paths.
+    #[serde(default)]
+    pub profiles: Vec<flare_helios::runtime_package::Publisher>,
 }
 
-fn download(request: DownloadRequest) -> Result<Vec<u8>, Failure> {
+fn download(
+    request: DownloadRequest,
+) -> Result<(Vec<u8>, flare_helios::package::cache::Entry), Failure> {
     if request.options.revision.is_none() || request.options.token_file.is_some() {
         return Err(
             "DOWNLOAD requires an explicit revision; token-file paths stay on the controller"
                 .into(),
         );
     }
-    let path =
-        crate::hub::download_with_token(&request.source, &request.options, 0, request.access_token)
-            .map_err(|e| e.to_string())?;
-    Ok(serde_json::to_vec(&json!({"path": path}))?)
+    let path = crate::hub::download_with_token(
+        &request.source,
+        &request.options,
+        0,
+        request.access_token,
+        &[],
+        None,
+        &request.profiles,
+    )
+    .map_err(|e| e.to_string())?;
+    // The response names a cache entry the controller will transfer from, so the
+    // lease must outlive this request rather than dropping with the Entry.
+    let directory = path.directory().to_path_buf();
+    Ok((serde_json::to_vec(&json!({"path": directory}))?, path))
 }
 
 /// Exchange HELLO frames: the initiator sends first. The peer's HELLO must name the key that
@@ -606,6 +622,9 @@ fn session(agent: &Arc<Agent>, stream: TcpStream) -> Result<(), Failure> {
     let mut session = Session::accept(stream, &agent.key)?;
     let hello = exchange_hello(&mut session, &agent.hello()?)?;
     let mut pinned = Pinned::new(&agent.pins);
+    // Downloads stay leased for this controller session, which is the window in
+    // which its transfers read those entries, and drop when the session ends.
+    let mut downloads: Vec<flare_helios::package::cache::Entry> = Vec::new();
     loop {
         let (tag, length) = match session.read_header() {
             Ok(header) => header,
@@ -707,7 +726,13 @@ fn session(agent: &Arc<Agent>, stream: TcpStream) -> Result<(), Failure> {
             }
             frame::DOWNLOAD => {
                 let request = serde_json::from_value(json_body(&mut session, length)?)?;
-                download(request)
+                match download(request) {
+                    Ok((reply, entry)) => {
+                        downloads.push(entry);
+                        Ok(reply)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             _ => Err(format!("unknown request {tag}").into()),
         };
@@ -1656,22 +1681,88 @@ pub mod tests {
             source: "owner/model".into(),
             options: crate::cli::HubOptions {
                 revision: Some(commit.into()),
-                cache_dir: Some(cache),
                 offline: true,
                 ..Default::default()
             },
             access_token: None,
+            profiles: Vec::new(),
         })
         .unwrap();
         let mut unauthorized = connect(&harness, &harness.controller);
         assert!(unauthorized.request(frame::DOWNLOAD, &request).is_err());
         let mut session = pair_accept_first(&harness);
-        let reply: Value =
-            serde_json::from_slice(&session.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
-        assert_eq!(reply["path"], primary.to_str().unwrap());
+        // Offline acquisition resolves only the Flare cache and its source
+        // records; an HF snapshot alone must not satisfy the request.
+        let error = session
+            .request(frame::DOWNLOAD, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not available in the Flare cache"),
+            "{error}"
+        );
+        assert_eq!(primary, snapshot.join("model.safetensors"));
         let mut invalid = request;
         invalid["options"]["token_file"] = json!("/node/secret");
         assert!(session.request(frame::DOWNLOAD, &invalid).is_err());
+    }
+
+    #[test]
+    fn offline_repository_download_resolves_a_real_signed_flare_entry() {
+        use flare_helios::package::cache::{self, PackageSource, Root};
+
+        let harness = harness(74);
+        let (package, _profile_path, publisher, commit) =
+            crate::hub::tests::signed_payload_fixture(harness.temp.path());
+        let model_root = harness.temp.path().join("flare");
+        let root = Root::open(&model_root).unwrap();
+        let metadata = flare_helios::package::reader::Metadata::open(&package).unwrap();
+        let selections = crate::package_cache::select_deployments(
+            &metadata,
+            std::slice::from_ref(&publisher),
+            &[1],
+        )
+        .unwrap();
+        let source = PackageSource::open(&package, std::slice::from_ref(&publisher), selections[0])
+            .unwrap()
+            .union(std::slice::from_ref(&publisher), &selections)
+            .unwrap();
+        let model_key = cache::model_key("owner/offline").unwrap();
+        let expected_envelope = source.verified()[0].envelope_digest();
+        let entry = root
+            .install_package_staged(source, &model_key, "entry-tp1")
+            .unwrap();
+        let options = crate::cli::HubOptions {
+            revision: Some(commit.clone()),
+            model_cache: Some(model_root.clone()),
+            cache_dir: Some(harness.temp.path().join("hub")),
+            tensor_parallel: vec![1],
+            offline: true,
+            ..Default::default()
+        };
+        crate::hub::remember_download(
+            &model_root,
+            "owner/offline",
+            &commit,
+            &commit,
+            "model.safetensors",
+            &options,
+            0,
+            &entry,
+            expected_envelope,
+        )
+        .unwrap();
+        let request = serde_json::to_value(DownloadRequest {
+            source: "owner/offline".into(),
+            options,
+            access_token: None,
+            profiles: vec![publisher],
+        })
+        .unwrap();
+        let mut session = pair_accept_first(&harness);
+        let reply: Value =
+            serde_json::from_slice(&session.request(frame::DOWNLOAD, &request).unwrap()).unwrap();
+        assert_eq!(reply["path"], entry.directory().to_str().unwrap());
     }
 
     #[test]
@@ -2668,20 +2759,40 @@ pub mod tests {
         let cases: &[(&[&str], &str)] = &[
             (
                 &[
-                    "--host", "127.0.0.1", "--port", "8001", "--host", "0.0.0.0", "--port",
-                    "8000", "--host", "0.0.0.0", "--port", "8000",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "8001",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
                 ],
                 "http://127.0.0.1:8000/metrics?format=json",
             ),
             (
                 &[
-                    "--host", "10.1.2.3", "--port", "8001", "--host=::1", "--port=9000",
+                    "--host",
+                    "10.1.2.3",
+                    "--port",
+                    "8001",
+                    "--host=::1",
+                    "--port=9000",
                 ],
                 "http://[::1]:9000/metrics?format=json",
             ),
             (
                 &[
-                    "--host=10.1.2.3", "--port=8001", "--host", "0.0.0.0", "--port", "8000",
+                    "--host=10.1.2.3",
+                    "--port=8001",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
                 ],
                 "http://127.0.0.1:8000/metrics?format=json",
             ),

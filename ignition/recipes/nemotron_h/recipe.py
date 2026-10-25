@@ -19,9 +19,11 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         draft = snapshot_download(REPOSITORY, revision=REVISION, cache_dir=plan.hub_cache,
                                   allow_patterns=("config.json", "model.safetensors"))
         drafting = dict(draft_checkpoint=draft, speculative_widths=plan.speculation.widths,
-            speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity)
+            speculative_fixed_width=plan.speculation.fixed_width, speculative_token_capacity=plan.speculative_token_capacity,
+            speculative_graph_budget=plan.speculation.graph_budget or 64)
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        native_dense_activations=plan.native_dense_activations,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.context,
         stream_overlap=plan.stream_overlap,
         prefill_chunk_size=plan.prefill_chunk, snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
@@ -44,7 +46,7 @@ RECIPE = Recipe(
         revision="c6cc2e8ffa353403213d6b9b18aaf8eb684d705a", architecture="NemotronH_Omni_Reasoning_V3",
         stored_bytes=24_079_678_824, device_bytes=25_063_117_344, draft_bytes=983_438_520),),
     context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, verification_rows=0,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, verification_rows=0,
     max_images=4, image_bytes=32 << 20,
     stream_overlap=True,
     ranks=MappingProxyType({1: RankCosts(107_365_120, 524_288, 4 << 30)}),

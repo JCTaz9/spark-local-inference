@@ -30,21 +30,59 @@ def _operands(rows, columns, step):
     return values
 
 
-def _expected(values, rank, surface):
+def _selected_query(operation):
+    plan = operation.plan
+    return plan.query.alternatives[plan.selection.config.implementation]
+
+
+def _expected(values, rank, query):
+    surface = query["surface"]
+    assert surface in ("OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"), surface
+    transport = query["call"]["transport"] if surface == "OneshotAllReduce.all_reduce" else None
+    if surface == "OneshotAllReduce.all_reduce":
+        assert transport in ("pull", "tp4_push_sentinel", "tp4_push_rsag"), transport
+    if transport in ("tp4_push_sentinel", "tp4_push_rsag"):
+        values = [value.clone() for value in values]
+        for value in values:
+            bits = value.view(torch.int16)
+            bits[bits == 0] = -32768
     cyclic = []
     for first in range(4):
         value = values[first].float()
+        if surface == "PCIeTwoShotBF16.all_reduce":
+            value = torch.zeros_like(value) + value
         for offset in range(1, 4):
             value = value + values[(first + offset) % 4].float()
         cyclic.append(value.bfloat16())
-    if surface == "PCIeTwoShotBF16.all_reduce":
+    if surface == "PCIeTwoShotBF16.all_reduce" or transport == "tp4_push_rsag":
         # Each quarter is summed once by its owner, then copied to every rank.
         elements = values[0].numel()
+        assert elements % 32 == 0
         quarter = elements // 4
-        return torch.cat([cyclic[owner].flatten()[owner * quarter:(owner + 1) * quarter]
-                          for owner in range(4)]).view_as(values[0])
-    assert surface == "OneshotAllReduce.all_reduce"
+        parts = [cyclic[owner].flatten()[owner * quarter:(owner + 1) * quarter].clone()
+                 for owner in range(4)]
+        if transport == "tp4_push_rsag":
+            for owner, part in enumerate(parts):
+                if owner != rank:
+                    bits = part.view(torch.int16)
+                    bits[bits == 0] = -32768
+        return torch.cat(parts).view_as(values[0])
     return cyclic[rank]
+
+
+def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_transport():
+    zeros = [torch.zeros((1, 32), dtype=torch.bfloat16) for _ in range(4)]
+    for transport, bits in (("pull", 0), ("tp4_push_sentinel", -32768), ("tp4_push_rsag", -32768)):
+        query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport))
+        assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
+    negative = [value.neg() for value in zeros]
+    query = dict(surface="PCIeTwoShotBF16.all_reduce", call={})
+    assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
+    for transport in ("unknown", None):
+        with pytest.raises(AssertionError):
+            _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport)))
+    with pytest.raises(AssertionError):
+        _expected(zeros, 0, dict(surface="unknown", call={}))
 
 
 def _rank(rank, rendezvous, directory, widths):
@@ -85,18 +123,7 @@ def _rank(rank, rendezvous, directory, widths):
                         operations[key] = PreparedAllReduce(source[:rows], outputs[key], runtime=runtime,
                             session=session, coordinator=coordinator, name=f"reduce-{width}-{rows}")
                 session.tune(show_progress=False)
-                surfaces = {key: operation.plan.query.surface for key, operation in operations.items()}
-                assert set(surfaces.values()) == {
-                    "OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"}
-                for (width, rows), surface in surfaces.items():
-                    nbytes = rows * width * 2
-                    expected = ("PCIeTwoShotBF16.all_reduce" if 64 << 10 <= nbytes <= 2 << 20
-                                else "OneshotAllReduce.all_reduce")
-                    assert surface == expected, (width, rows, nbytes)
-                if 2560 in widths:
-                    # BF16[12,2560] is 61,440 bytes; 13 rows first exceed 64 KiB.
-                    assert surfaces[2560, 12] == "OneshotAllReduce.all_reduce"
-                    assert surfaces[2560, 13] == "PCIeTwoShotBF16.all_reduce"
+                queries = {key: _selected_query(operation) for key, operation in operations.items()}
                 stream = torch.cuda.Stream(device=device)
                 for epoch in range(2):
                     for (width, rows), operation in operations.items():
@@ -131,7 +158,7 @@ def _rank(rank, rendezvous, directory, widths):
 
                 buffers = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 8), dtype=torch.int64, device=device)}
+                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device)}
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{width}-{rows}": value
                                 for (width, rows), value in outputs.items()})
@@ -148,7 +175,7 @@ def _rank(rank, rendezvous, directory, widths):
                 # Stage a tiny unsigned rank bundle, not a model checkpoint.
                 package = export_model(bundle, images, storage,
                     directory / f"rank-{rank}.json", options={}, bundle_only=True, sources=True)
-                assert package.modules
+                assert package.export_counts["modules"] > 0
                 exported = {(allocation.address, allocation.nbytes) for allocation in package.allocations
                             if allocation.memory == "peer"}
                 assert exported == set(peer.imported.items())
@@ -181,7 +208,7 @@ def _rank(rank, rendezvous, directory, widths):
                                     "segment.all.allocated", "segment.all.freed"):
                             assert before[key] == after[key]
                         assert torch.equal(sources[width].view(torch.uint8), expected_source.view(torch.uint8))
-                        expected = _expected([value[:rows] for value in values], rank, surfaces[width, rows])
+                        expected = _expected([value[:rows] for value in values], rank, queries[width, rows])
                         assert torch.equal(outputs[width, rows].cpu().view(torch.uint8), expected.view(torch.uint8))
                 worker.close()
                 assert worker.drained
@@ -220,6 +247,7 @@ def test_exported_tp4_collectives_replay_after_preparation_exit(tmp_path):
         str(tmp_path)], cwd=root, text=True, capture_output=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "all four preparation ranks exited" in result.stdout
+    print(result.stdout, end="")
     # subprocess.run waits for the Python exporter; the Rust reader independently
     # rejects any still-live recorded preparation PID before initializing CUDA.
     result = subprocess.run([str(target / "debug/test_fixed_runtime_package"), str(tmp_path), "--tp4-collective"],

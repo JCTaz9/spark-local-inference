@@ -142,16 +142,9 @@ def test_malformed_sizes_are_usage_errors(text):
         parse_size(text)
 
 
-def test_shard_size_uses_binary_units_and_flags_override_configuration(tmp_path):
-    assert load(tmp_path, '').shard_size() == 64 << 30
-    config = load(tmp_path, '[publishing]\nshard_size = "2G"\n')
-    assert config.shard_size() == 2 << 30
-    for invalid in ('0', '4096', '65G'):
-        with pytest.raises(UsageError, match='shard size'):
-            config.shard_size(invalid)
-    assert config.shard_size('16M') == 16 << 20
-    with pytest.raises(UsageError, match='shard size'):
-        load(tmp_path, '[publishing]\nshard_size = "-1G"\n')
+def test_shard_size_is_not_a_publishing_setting(tmp_path):
+    with pytest.raises(UsageError, match='unknown key.*shard_size'):
+        load(tmp_path, '[publishing]\nshard_size = "2G"\n')
 
 
 @pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])

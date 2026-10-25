@@ -176,7 +176,6 @@ class PreparedRound:
             DeltaMetadata.allocate(b, device, verification_columns=8), self.metadata.indexed)
         self.validator = PreparedBatch(o.inputs, o.requests, DecoderMetadata.allocate(b, b, blocks, device),
             mode="decode", shard=o.weights.shard, pages=o.pool.memory_capacity[1:], shards=o.shards)
-        self.validator.accept_unsampled = False
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives['runtime'], coordinator=o.collectives['coordinator'],
             session=o.session, name=f"{name}.validation")

@@ -30,8 +30,9 @@ output remains plain startup logs.
 
 Left/right arrows or Tab switch between the throughput overview and scheduler
 details. The scheduler pane groups graph completions over two seconds by graph
-kind, captured batch capacity (`b`), prefill/token capacity (`t`), or speculative
-draft depth (`d`, verification width minus one). It shows call counts, mean and
+kind, captured batch capacity (`b`), prefill/token capacity (`t`), or actual
+speculative proposal depth (`d`), independently of target width and packed rows.
+It shows call counts, mean and
 maximum GPU duration, and each shape's share of observed graph time. Wider
 terminals also show actual requests per call, which can be below the captured
 batch capacity. GPU duration is the maximum participating rank's CUDA event
@@ -58,12 +59,12 @@ handling, so Ctrl-C follows normal server shutdown.
 
 Prefill throughput counts consumed prompt tokens, excluding padding and prefix
 reuse. Generation throughput counts committed output tokens, including EOS and
-tokens withheld by text stops. Drafter steps count batched learned-proposal
-forwards inside completed speculative graphs; verification steps count completed
+tokens withheld by text stops. Drafter steps sum the actual learned-proposal depth D of completed speculative
+programs; verification steps count completed
 speculative graphs. Copy-only proposals contribute no drafter steps. Mean draft
 acceptance length is accepted draft tokens per progressing request round with
 at least one offered draft, excluding the bonus token and width-one rounds.
-DEPTH is allocated draft positions per progressing decode or verification request
+DEPTH is allocated draft positions per progressing generation request
 round, including zero-draft rounds. Packed rounds contribute their allocated
 per-request prefixes; the graph's maximum width and padded batch size do not
 determine this average. Rejected drafts count toward depth.
@@ -225,10 +226,26 @@ subranges into a free host frame, enqueues asynchronous uploads and graph
 execution, records a production event, and queues the completion transfer on
 the copy stream behind that event. Omitted input ranges preserve device state.
 `poll` returns ordered `FrameCompletion` records after transfer completion and
-then permits frame reuse. A third submission receives backpressure; a grammar
-submission requires an empty window and blocks further submissions until its
+then permits frame reuse. Only ordinary decode and complete speculative
+generation can share the two-frame window; other operations drain it. A third
+submission receives backpressure; a grammar submission requires an empty window and blocks further submissions until its
 completion is consumed. The direct executor has no Python calls or per-step
 CUDA allocation.
+
+Tensor-parallel coordination counts preparing steps, enqueued steps, and
+unconsumed all-rank completions against the same two-slot bound. Prepare and
+ready messages carry the submission fence and graph identity; commit follows
+validation by every rank. Rank workers process control messages while CUDA work
+is outstanding. Completion publication and resource retirement remain ordered
+across all ranks.
+
+Speculative descriptors carry actual request/proposal/target geometry B/D/W/P,
+including explicit P for rectangular programs. Exact `QueryLength` inputs select
+host allocation; `SpeculativePrefixLimit` inputs select captured GPU allocation.
+A produced confidence sidecar declares `confidence_width` and uses two FP32
+frames shaped `[2, request_slots, draft_capacity]`. Host dependencies are derived
+per selected program. Planning projects queued expected service and output age
+at submission; observed delivery age changes only when tokens are published.
 
 An executor belongs to one native OS thread. A Rust scheduler can call it
 directly. `execution::ExecutionWorker` adds a synchronous native-thread control
@@ -245,8 +262,8 @@ executor.drained -> whether close confirmed both streams drained
 executor.close()
 ```
 
-`ExecutionCompletion.records` contains four physical-slot records in the ABI's
-eight-field order. `consumed_tokens` and `generated_tokens` are cumulative.
+`ExecutionCompletion.records` contains one 24-field ABI4 record per captured
+physical request slot. `consumed_tokens` and `generated_tokens` are cumulative.
 Submission failure poisons the executor. `close` drains both streams before
 releasing pinned memory or the Python owner; failed drain retains both. Owner
 release happens outside the ownership mutex, permitting a Python finalizer to
@@ -282,7 +299,11 @@ The plan retains its scheduler identity and each participating request's state
 epoch. Admissions of unrelated requests and timing observations preserve its
 validity; mutation or retirement of a selected request invalidates it.
 Prefill selects among loaded capacities up to `prefill_chunk_size`, using graph
-duration, request age, and useful-progress deficit. Logical lengths pad to the
+duration, request age, and useful-progress deficit. Admission budgets cache
+captures from snapshot capacity divided by configured maximum concurrency,
+reserves prompt and terminal endpoints, and selects remaining message checkpoints
+at approximately equal token distances through the uncached suffix. Only selected
+boundaries interrupt prefill. Logical lengths pad to the
 smallest loaded capacity that covers them. The limit must be 64-aligned, at least 64, and within the context capacity. Decode batches use
 power-of-two capacities through the selected concurrency.
 Prefill, decode cohorts, speculative widths, and mandatory stages compete in
@@ -295,7 +316,8 @@ and record use of cache ancestors. Commit validates the plan's epochs and
 resources without rerunning scheduling policy. Completion validation checks
 generations, physical slots, monotonic counters and per-step logical bounds before
 mutating request state.
-Two decode steps can reference a request concurrently; a repeated terminal
+Two ordinary decode or complete speculative steps can reference a request
+concurrently; a repeated terminal
 completion does not emit its sampled token twice. A CUDA submission failure
 requires confirmed stream drain before `release_after_shutdown` releases
 resources associated with the attempted submission.
@@ -312,7 +334,7 @@ lane's logical token limit even when the completion reports physical padding.
 
 `estimated_duration_ns` returns one estimate per captured graph, initially zero
 (unmeasured). A valid completion sets its cost directly; further fresh observations
-update it with an EMA of weight 1/8. After 30 seconds without a valid observation,
+update it with the median of up to nine replay observations. After 30 seconds without a valid observation,
 the cost becomes stale but remains available for selection. The next valid
 observation replaces the stale estimate. Tensor-parallel observations use the
 maximum positive rank interval. Isolated executions also measure host handoff;
@@ -325,15 +347,14 @@ Ordinary valid execution earns refresh credit at `0.002 / 0.998` times its
 measured duration, capped at 5 ms. Full credit permits a stale alternative to
 displace the ordinary winner, ordered by the later of its last valid observation
 and last attempted dispatch.
-Refresh pays for every physical capture, including an enabling proposal and its
-verification captures. Required verification can continue through debt; another
-refresh waits for full credit. Idle discards positive credit and preserves debt.
+Refresh pays for one complete physical program, including its proposal and
+verification work. Another refresh waits for full credit. Idle discards positive credit and preserves debt.
 This bounds aggregate refresh expense, not individual stalls; see
 [funded timing refresh](../docs/scheduling-runtime-design.md#funded-timing-refresh).
 
 Speculative width selection combines this cost with request-local expected
-prefix survival. Combined graphs learn from completed verification; split
-graphs keep proposal-confidence forecasts separate. Ordinary selection uses
+prefix survival. Complete programs learn from terminal verification and keep
+completed confidence forecasts separate from acceptance outcomes. Ordinary selection uses
 historical means, while a separate 1% raw-time budget funds optimistic
 acceptance probes. Observational weight ages without changing unobserved means;
 width-one rounds still measure cost. See
@@ -360,11 +381,10 @@ page sequence while transferring complete pages to the cache. Admission reuse
 counts stay fixed. Duplicate publication never remaps the live request.
 
 `finish` publishes exact terminal consumed state after its successful snapshot
-copy, excluding the final pending sampled token. Terminal snapshots have lifecycle
-priority over further model work: queued submissions drain, any owned probe
-verification completes, and a bounded snapshot cohort includes the oldest ready
-terminal request. This rule also applies when throughput policy gives terminal
-delivery zero utility. A child at T after parent S owns
+copy, excluding the final pending sampled token. Terminal retirement competes by
+its own intrinsic value and waiting-age cost under both scheduler policies.
+A winning feedback operation drains queued work before submission; terminal
+snapshots have no unconditional priority. A child at T after parent S owns
 `floor(T/64)-floor(S/64)` complete pages. Partial payloads restore from the snapshot
 into private pages. Failed copies prevent publication. `cancel` stops scheduling
 immediately and retains slot/page/snapshot ownership through final GPU use.

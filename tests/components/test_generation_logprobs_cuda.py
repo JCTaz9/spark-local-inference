@@ -179,10 +179,13 @@ def test_subtraction_rounding_ties_choose_lowest_ids_even_at_cutoff():
     from ignition.components.completion import CompletionOutputs
     from ignition.components.logprobs import PreparedLogprobs
     device = 'cuda'
-    outputs = CompletionOutputs.allocate((2, 1, 8), device=device)
+    outputs = CompletionOutputs.allocate((2, 1, 24), device=device)
     outputs.requested.fill_(1)
-    outputs.records[0, 0, 0] = 9
-    outputs.records[0, 0, 4] = 3
+    record = outputs.records[0, 0]
+    record[0], record[4], record[5], record[8], record[15] = 9, 3, 1, 1, 1
+    record[12] = -1
+    record[16:].fill_(-1)
+    record[16] = 3
     # Distinct logits become equal FP32 logprobs after normalization.
     logits = torch.arange(4096, device=device, dtype=torch.float32)[None, :] * 1e-12
     slot = torch.tensor([0], dtype=torch.int32, device=device)
@@ -352,7 +355,7 @@ def _tp_logprob_rank(rank, world, sockets):
                 peer.close()
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
-    outputs = CompletionOutputs.allocate((2, 4, 8), device=device)
+    outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
     state = DeviceRequestState.allocate(device, vocab_size=4096)
     state.admit(2, RequestAdmission(9, 42, top_k=1, max_new_tokens=100), [1])
     logits = -torch.arange(4096, dtype=torch.float32, device=device)[None, :]

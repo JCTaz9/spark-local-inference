@@ -45,8 +45,8 @@ alone do not establish a need for a change.
   be used to bypass them.
 - **Reject weakened guarantees.** Preserve complete cache and speculative state,
   inactive-row behavior, asynchronous resource lifetimes, checkpoint precision,
-  model semantics, and model package compatibility. Do not remove validation,
-  suppress errors, silently substitute execution paths, or relax references,
+  model semantics, and the declared model package contract. Do not remove
+  validation, suppress errors, silently substitute execution paths, or relax references,
   workloads, or numerical bounds to obtain passing checks or favorable metrics.
   Numerical bounds must follow the required arithmetic and measured repeatability.
 - **Reject unsupported abstractions and churn.** Do not add frameworks,
@@ -122,8 +122,9 @@ package selection.
 
 For serving-only Rust changes, rebuild Flare and load a compatible package.
 To exercise changes to prepared kernels, capacities, or the package format,
-export a package containing those changes. Previously exported packages must
-remain usable as required by [package compatibility](#model-package-compatibility).
+export a package containing those changes. Packages must satisfy the declared
+[package contract](#model-package-compatibility); an execution ABI or prepared
+contract mismatch requires re-export.
 Launch an exported package with `flare/target/release/flare run PACKAGE` when
 testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
 before CUDA resources are released.
@@ -227,17 +228,18 @@ architectural boundary before committing the change.
 
 ## Model package compatibility
 
+- Model packages require execution ABI 4 and prepared model contract 2. The
+  canonical carrier is payload format 2; signed format-6 logical-resource
+  containers also load when they satisfy the same execution and model contracts.
+  Packages with another execution ABI or prepared contract require re-export
+  with Ignition and fail loading before replay.
 - When replacing internal formats or execution paths, remove superseded loaders,
-  fallback paths, and migration-only tests except those required for model package
-  compatibility. Other backward compatibility requires an explicit requirement.
-- **Preserve model package compatibility.** Every Protocol Buffer change **must**
-  be accompanied by code in Helios that keeps previously exported model packages
-  loadable and usable without re-export. Handle absent fields and Protobuf default
-  values explicitly, preserve the meaning of older metadata, and honor explicit
-  values. Wire-format compatibility alone is insufficient. Include regression
-  tests for older serialized metadata and validate the affected package loading
-  and serving paths. Implement compatibility in shared code across all affected
-  model contracts.
+  fallback paths, and migration-only tests. Backward compatibility requires an
+  explicit maintainer requirement.
+- Version semantic changes to package metadata and execution contracts. Reserve
+  removed Protobuf fields and enum values. Validate declared geometry, explicit
+  values, and required fields across every affected model contract. Tests must
+  cover unsupported-version rejection and the affected loading and serving paths.
 
 ## Configuration
 

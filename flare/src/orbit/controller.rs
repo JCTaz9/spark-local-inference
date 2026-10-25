@@ -267,6 +267,47 @@ pub struct RankEnd {
 }
 
 /// Orbit placement and lifecycle management use the shared paired-agent client.
+/// Build one authenticated download request with public verification profiles.
+/// Controller-local profile paths are parsed here and never sent to the node.
+fn download_request(
+    source: &str,
+    revision: &str,
+    options: &crate::cli::HubOptions,
+    publisher_keys: &[PathBuf],
+    trust_store: Option<&Path>,
+    access_token: Option<String>,
+) -> Result<super::agent::DownloadRequest, Failure> {
+    let mut profiles =
+        crate::trust::publishers(publisher_keys, true, crate::environment::home_directory)
+            .map_err(|error| error.to_string())?;
+    for remembered in
+        crate::trust::trusted_profiles(trust_store).map_err(|error| error.to_string())?
+    {
+        // A fresh explicit profile for the same signer and namespace wins, including
+        // a changed display name, matching trust::resolve_identity_with.
+        if !profiles.iter().any(|profile| {
+            profile.fingerprint() == remembered.fingerprint()
+                && profile.namespace == remembered.namespace
+        }) {
+            profiles.push(remembered);
+        }
+    }
+    Ok(super::agent::DownloadRequest {
+        source: source.into(),
+        // These paths describe the controller. The node must use its own cache
+        // and must not receive a controller token-file path.
+        options: crate::cli::HubOptions {
+            revision: Some(revision.to_owned()),
+            token_file: None,
+            cache_dir: None,
+            model_cache: None,
+            ..options.clone()
+        },
+        access_token,
+        profiles,
+    })
+}
+
 pub struct Controller(crate::agent_client::Client);
 impl std::ops::Deref for Controller {
     type Target = crate::agent_client::Client;
@@ -889,15 +930,14 @@ impl Controller {
         } else {
             crate::hub::token(options).map_err(|e| e.to_string())?
         };
-        let request = super::agent::DownloadRequest {
-            source: source.into(),
-            options: crate::cli::HubOptions {
-                revision: Some(revision.clone()),
-                token_file: None,
-                ..options.clone()
-            },
+        let request = download_request(
+            source,
+            &revision,
+            options,
+            &run_args.serving.publisher_keys,
+            run_args.serving.trust_store.as_deref(),
             access_token,
-        };
+        )?;
         eprintln!(
             "{}: resolving and downloading {source} at revision {revision}",
             node.name
@@ -2320,6 +2360,116 @@ mod tests {
     use super::*;
     use crate::orbit::agent::tests::{harness, pair_accept_first};
     use std::sync::Arc;
+
+    #[test]
+    fn download_requests_carry_public_profiles_not_controller_paths() {
+        use flare_helios::runtime_package::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let temp = tempfile::tempdir().unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let publisher = Publisher {
+            name: "Controller".into(),
+            namespace: "local-development".into(),
+            public_key: key.public_key().as_ref().try_into().unwrap(),
+            development: true,
+        };
+        let profile = temp.path().join("publisher.json");
+        fs::write(
+            &profile,
+            serde_json::to_vec(&vec![publisher.clone()]).unwrap(),
+        )
+        .unwrap();
+        let trusted_key =
+            Ed25519KeyPair::from_pkcs8(
+                Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .unwrap()
+                    .as_ref(),
+            )
+            .unwrap();
+        let trusted = Publisher {
+            name: "Remembered".into(),
+            namespace: "local-development".into(),
+            public_key: trusted_key.public_key().as_ref().try_into().unwrap(),
+            development: true,
+        };
+        let trust_store = temp.path().join("trust.toml");
+        let public_key: String = trusted
+            .public_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        fs::write(
+            &trust_store,
+            format!(
+                "[[trusted]]\nfingerprint = \"{}\"\nnamespace = \"{}\"\npublic_key = \"{}\"\nname = \"{}\"\nidentity = \"profile\"\n",
+                trusted.fingerprint(),
+                trusted.namespace,
+                public_key,
+                trusted.name,
+            ),
+        )
+        .unwrap();
+        let controller_cache = temp.path().join("controller-cache");
+        let controller_hf = temp.path().join("controller-hf");
+        let options = crate::cli::HubOptions {
+            cache_dir: Some(controller_hf.clone()),
+            model_cache: Some(controller_cache.clone()),
+            token_file: Some(temp.path().join("token")),
+            ..Default::default()
+        };
+        let request = download_request(
+            "owner/model",
+            "gb202",
+            &options,
+            std::slice::from_ref(&profile),
+            Some(&trust_store),
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.profiles, vec![publisher.clone(), trusted]);
+        let conflict_store = temp.path().join("conflicting-trust.toml");
+        let conflict_key: String = publisher
+            .public_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        fs::write(
+            &conflict_store,
+            format!(
+                "[[trusted]]\nfingerprint = \"{}\"\nnamespace = \"{}\"\npublic_key = \"{}\"\nname = \"Remembered renamed\"\nidentity = \"profile\"\n",
+                publisher.fingerprint(),
+                publisher.namespace,
+                conflict_key,
+            ),
+        )
+        .unwrap();
+        let conflict = download_request(
+            "owner/model",
+            "gb202",
+            &options,
+            std::slice::from_ref(&profile),
+            Some(&conflict_store),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            conflict.profiles,
+            vec![publisher.clone()],
+            "fresh explicit profile must take precedence over a remembered entry"
+        );
+        assert!(request.options.cache_dir.is_none());
+        assert!(request.options.model_cache.is_none());
+        assert!(request.options.token_file.is_none());
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains(&*profile.to_string_lossy()));
+        assert!(!encoded.contains(&*controller_cache.to_string_lossy()));
+        assert!(!encoded.contains(&*controller_hf.to_string_lossy()));
+        let decoded: super::super::agent::DownloadRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.profiles.len(), 2);
+        assert!(decoded.options.revision.as_deref() == Some("gb202"));
+    }
 
     #[test]
     fn reading_an_executable_requires_an_explicit_path_on_every_controller_platform() {

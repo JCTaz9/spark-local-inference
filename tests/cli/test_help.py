@@ -11,6 +11,28 @@ from ignition.errors import UsageError
 from ignition.recipes import aliases, recipes, resolve
 
 
+@pytest.mark.parametrize('flags', [['--output', 'model'], ['--form', 'packed'], ['--form', 'directory']])
+def test_standalone_destinations_belong_to_convert(flags, capsys):
+    with pytest.raises(SystemExit) as error:
+        _parser().parse_args(['export', 'qwen3.8-flash', *flags])
+    assert error.value.code == 2
+    assert 'unrecognized arguments' in capsys.readouterr().err
+    args = _parser().parse_args(['convert', 'cached-entry', *flags])
+    assert args.package == Path('cached-entry')
+
+
+@pytest.mark.parametrize('command', [
+    ['export', 'qwen3.8-flash'],
+    ['convert', 'package'],
+    ['sign', 'package', '--output', 'signed-package'],
+])
+def test_package_commands_reject_shard_size(command, capsys):
+    with pytest.raises(SystemExit) as error:
+        _parser().parse_args([*command, '--shard-size', '32G'])
+    assert error.value.code == 2
+    assert 'unrecognized arguments: --shard-size 32G' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('flags', [['--history-drafts'], ['--no-history-drafts'], ['--mtp-proposal-source', 'copy']])
 def test_export_rejects_history_preferences_and_copy_only_preparation(flags):
     with pytest.raises(SystemExit) as error:
@@ -20,7 +42,7 @@ def test_export_rejects_history_preferences_and_copy_only_preparation(flags):
 
 @pytest.mark.parametrize("command", ["export", "serve"])
 def test_mla_arithmetic_flag_defaults_and_override(command):
-    arguments = [command, "deepseek-v4.1-flash", *(["--output", "model.safetensors"] if command == "export" else [])]
+    arguments = [command, "deepseek-v4.1-flash"]
     default = _parser().parse_args(arguments)
     explicit = _parser().parse_args([*arguments, "--mla-compute-mode", "bf16"])
     assert default.mla_compute_mode is None
@@ -34,7 +56,7 @@ def test_mla_arithmetic_flag_defaults_and_override(command):
 def test_independent_draft_precision_flags_require_learned_proposals(model, flags):
     from ignition.cli.preparation import speculation
 
-    args = _parser().parse_args(["export", model, "--output", "model.safetensors", *flags])
+    args = _parser().parse_args(["export", model, *flags])
     result = speculation(args, resolve(model))
     assert bool(result.draft_head_quantization) == ("--draft-head-quantization" in flags)
     assert bool(result.markov_head_quantization) == ("--markov-head-quantization" in flags)
@@ -53,7 +75,7 @@ def test_mxfp8_draft_precision_reaches_deepseek41_plan(policy):
     from ignition.cli.preparation import speculation
     from ignition.recipes.deepseek41.recipe import select_attention_projection_policy
 
-    args = _parser().parse_args(["export", "deepseek-v4.1-flash", "--output", "model.safetensors",
+    args = _parser().parse_args(["export", "deepseek-v4.1-flash",
                                 "--draft-head-quantization", "mxfp8", "--attention-projection-policy", policy])
     model = select_attention_projection_policy(resolve(args.model), args.attention_projection_policy)
     selected = speculation(args, model)
@@ -193,7 +215,7 @@ def test_export_command_accepts_bare_and_explicit_compression(flag):
     args = _parser().parse_args([
         "export", "step5-preview-nvfp4", *flag, "--prefill-chunk-size", "4096",
         "--mtp-draft-tokens", "3", "--no-mtp-adaptive-verification",
-        "--speculative-token-capacity", "16", "--max-concurrency", "16", "--output", "model.safetensors"])
+        "--speculative-token-capacity", "16", "--max-concurrency", "16"])
     assert args.expert_scale_compression == "csf"
     assert (args.prefill_chunk_size, args.mtp_draft_tokens, args.speculative_token_capacity,
             args.max_concurrency) == (4096, 3, 16, 16)
@@ -202,7 +224,7 @@ def test_export_command_accepts_bare_and_explicit_compression(flag):
 
 def test_invalid_compression_is_rejected_with_the_supported_encoding(capsys):
     with pytest.raises(SystemExit) as error:
-        main(["export", "step5-preview-nvfp4", "--expert-scale-compression", "zip", "--output", "model"])
+        main(["export", "step5-preview-nvfp4", "--expert-scale-compression", "zip"])
     assert error.value.code == 2
     assert "invalid choice: 'zip' (choose from csf, native)" in capsys.readouterr().err
 

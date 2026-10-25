@@ -205,7 +205,7 @@ pub fn metadata() -> PreparedContract {
         }
     }
     PreparedContract {
-        version: 1,
+        version: 2,
         vocabulary: 248320,
         input_vocabulary: 248320,
         vision: VisionCapabilities::disabled(),
@@ -346,7 +346,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Speculative => GraphKind::Speculative,
                 _ => unreachable!(),
             };
-            GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
+            GraphDescriptor { confidence_width: 0, draft_tokens: if kind == GraphKind::Speculative { fields[2].parse::<usize>().unwrap() - 1 } else { 0 }, packed_token_capacity: if kind == GraphKind::Speculative { fields[1].parse::<usize>().unwrap() * fields[2].parse::<usize>().unwrap() } else { 0 },
                 name: g.graph.clone(),
                 kind,
                 sampling_mode: SamplingMode::General,
@@ -372,7 +372,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         })
         .collect();
     ExecutionManifest {
-        abi_version: 3,
+        abi_version: 4,
         context: 1,
         device: 0,
         max_active: slots,

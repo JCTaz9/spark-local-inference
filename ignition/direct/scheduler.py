@@ -71,39 +71,31 @@ class Layout:
     fixed_width: int | None = None
     state_rows_per_request: int | None = None
     draft_pages: int = 0
-    record_fields: int = 8
-    paired_graphs: frozenset[str] = frozenset()
+    record_fields: int = 24
+    confidence_widths: dict = field(default_factory=dict)
     completion_cursors: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if not 1 <= self.max_active <= self.capacity or self.pages <= 0 or self.page_tokens <= 0:
             raise ValueError("direct execution requires positive pages and slots within request capacity")
-        if self.widths and self.record_fields != 24:
-            raise ValueError("speculative completions require token-vector records")
+        if self.record_fields != 24:
+            raise ValueError("completions require token-vector records")
         object.__setattr__(self, "graphs", MappingProxyType(dict(self.graphs)))
 
     @classmethod
     def of(cls, model):
         """Read a prepared model's serving configuration and graph catalog."""
         config, buffers = model.server_config, model.buffers
-        speculative = any(signature.kind in ("speculative", "verification", "packed_speculative")
+        speculative = any(signature.kind in ("speculative",)
                           for signature in model.signatures.values())
         graphs = {}
         for name, signature in model.signatures.items():
-            if (signature.kind in ("init", "restore", "snapshot", "prefill", "decode", "resume", "speculative", "packed_speculative")
+            if (signature.kind in ("init", "restore", "snapshot", "prefill", "decode", "resume", "speculative")
                     and signature.speculation_enabled in (None, speculative)):
                 key = (signature.kind, signature.batch_capacity, signature.token_capacity)
-                if signature.kind == "packed_speculative":
+                if signature.kind == "speculative":
                     key += (signature.packed_token_capacity, signature.draft_tokens)
                 graphs[key] = name
-        paired = {name for name, signature in model.signatures.items()
-                  if signature.kind == "verification" and signature.token_capacity > 1}
-        for name in paired:
-            signature = model.signatures[name]
-            key = ("speculative", signature.batch_capacity, signature.token_capacity)
-            if signature.packed_token_capacity:
-                key += (signature.packed_token_capacity, 0)
-            graphs[key] = name
         return cls(capacity=buffers["row_slot_ids"].numel(), max_active=model.max_active,
                    context=config["max_sequence_tokens"], page_tokens=config["model_contract"]["cache"]["page_tokens"],
                    table_width=buffers["page_tables"].shape[1], pages=config["pages"],
@@ -111,7 +103,7 @@ class Layout:
                    vocabulary=config["model_contract"]["vocabulary"],
                    eos=tuple(config["frontend"]["eos_token_ids"]), graphs=graphs,
                    widths=tuple(config.get("speculative_widths") or sorted({s.token_capacity
-                       for s in model.signatures.values() if s.kind in ("speculative", "verification", "packed_speculative")})) if speculative else (),
+                       for s in model.signatures.values() if s.kind in ("speculative",)})) if speculative else (),
                    fixed_width=config.get("speculative_fixed_width") if speculative else None,
                    bindings={g["graph"]: g["inputs"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()},
                    buffer_specs={name: (np.dtype(str(tensor.dtype).removeprefix("torch.")), tuple(tensor.shape))
@@ -119,7 +111,9 @@ class Layout:
                    page_views={v["buffer"]: v["page_offset"] for v in config["model_contract"]["cache"]["page_tables"]},
                    state_rows_per_request=max(g["state_rows_per_request"] for g in config["model_contract"]["graphs"] if g["graph"] in graphs.values()),
                    draft_pages=max((v["page_offset"] for v in config["model_contract"]["cache"]["page_tables"]), default=0),
-                   record_fields=buffers["completion_records"].shape[-1], paired_graphs=frozenset(paired),
+                   record_fields=buffers["completion_records"].shape[-1],
+                   confidence_widths={name: signature.confidence_width for name, signature in model.signatures.items()
+                                      if signature.confidence_width},
                    completion_cursors={g["graph"]: None if g["draft_cursor"] is None else g["draft_cursor"]["lag_tokens"]
                        for g in config["model_contract"]["graphs"] if "draft_cursor" in g and g["graph"] in graphs.values()})
 
@@ -498,7 +492,7 @@ class Scheduler:
         if rates is None:
             rates = self.policy.rates(active)[0]
         step.participants = self.policy.participants(active, rates)
-        self.sequence += 2 if step.graph in self.layout.paired_graphs else 1
+        self.sequence += 1
         step.sequence = self.sequence
         for lane in step.lanes:
             lane.request.last_use = self.sequence
@@ -522,14 +516,15 @@ class Scheduler:
             # Resume samples from the saved hidden state and consumes nothing.
             return self._step("resume", len(resuming), [Lane(r, r.consumed, 0) for r in resuming])
         decoding, prefilling = self._phase("decode"), self._phase("prefill")
-        if decoding and (not prefilling or self.last_kind not in ("decode", "speculative", "packed_speculative")):
+        if decoding and (not prefilling or self.last_kind not in ("decode", "speculative")):
             rates, expected = self.policy.rates(self.active)
             chosen = self.policy.decode_round(decoding, self.active, rates, expected)
             if chosen is not None:
                 kind = chosen.kind
                 limit = min(chosen.width, chosen.draft_tokens + 1) if chosen.draft_tokens else chosen.width
                 tokens = [self._round_tokens(r, limit) for r in chosen.requests]
-                if chosen.packed_tokens and kind != "packed_speculative":
+                if (chosen.packed_tokens and self.layout.fixed_width is None
+                        and self.layout.graphs[chosen.shape] not in self.layout.confidence_widths):
                     tokens = self.policy.packed_lengths(chosen.requests, limit, chosen.packed_tokens)
                 lanes = tuple(Lane(r, r.consumed, n) for r, n in zip(chosen.requests, tokens))
                 step = Step(kind, self.layout.graphs[chosen.shape], chosen.batch, chosen.width, lanes, 0,
@@ -565,11 +560,11 @@ class Scheduler:
         for slot, record in enumerate(records):
             if record[5] != INACTIVE and slot not in lanes:
                 raise CompletionError(f"slot {slot} reported status {record[5]} outside step {step.sequence}")
-        if step.kind == "packed_speculative":
+        if step.graph in layout.confidence_widths:
             self._validate_packed_completion(step, records, confidence)
         self.policy.costs.observe(step.shape, graph_ns)
         self.steps[step.kind] += 1
-        if step.kind in ("speculative", "packed_speculative"):
+        if step.kind in ("speculative",):
             self.rounds[(step.batch, step.width)] += 1
         self.last_kind = step.kind
         retired, useful, published = [], {}, []
@@ -604,21 +599,18 @@ class Scheduler:
                     request.phase = "prefill"
                 continue
             emitted = int(record[3]) - len(request.generated)
-            width = lane.tokens if step.kind in ("speculative", "packed_speculative") else 1
+            width = lane.tokens if step.kind in ("speculative",) else 1
             consumed = int(record[2])
             if (not 0 <= emitted <= width or consumed < request.consumed or consumed > lane.start + lane.tokens
-                    or (step.kind in ("speculative", "packed_speculative") and consumed - request.consumed != emitted)
-                    or (step.kind not in ("speculative", "packed_speculative") and status == RUNNING and consumed != lane.start + lane.tokens)):
+                    or (step.kind in ("speculative",) and consumed - request.consumed != emitted)
+                    or (step.kind not in ("speculative",) and status == RUNNING and consumed != lane.start + lane.tokens)):
                 raise CompletionError(f"{step.graph} progress disagrees for request {request.ident}:"
                                       f" {record[:8].tolist()}")
-            if layout.record_fields == 24:
-                if int(record[8]) != emitted:
-                    raise CompletionError(f"{step.graph} token vector disagrees for request {request.ident}")
-                tokens = [int(token) for token in record[16:16 + emitted]]
-            else:
-                tokens = [int(record[4])] if emitted else []
-            if step.kind in ("speculative", "packed_speculative"):
-                if step.kind == "packed_speculative":
+            if int(record[8]) != emitted:
+                raise CompletionError(f"{step.graph} token vector disagrees for request {request.ident}")
+            tokens = [int(token) for token in record[16:16 + emitted]]
+            if step.kind in ("speculative",):
+                if step.graph in layout.confidence_widths:
                     request.acceptance.confidence(confidence[row][:step.draft_tokens])
                 offered = min(int(record[9]), lane.tokens - 1)
                 accepted = min(int(record[10]), offered)

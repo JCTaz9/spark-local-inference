@@ -119,7 +119,7 @@ class PreparedAttention(torch.nn.Module):
                 key, value = scratch.window_key, scratch.window_value
                 rows = metadata.lengths.numel()
                 if mode == "verify":
-                    width = scratch.key.shape[0] // rows
+                    width = metadata.max_query_tokens
                     pages = (geometry.window + width + PAGE_TOKENS - 1) // PAGE_TOKENS
                     key, value = key[:rows * pages], value[:rows * pages]
                     self.retained_key, self.retained_value = torch.zeros_like(scratch.key), torch.zeros_like(scratch.value)
@@ -139,7 +139,7 @@ class PreparedAttention(torch.nn.Module):
                                                   session=session, name=name + ".cache_write")
         self.attention = PreparedPagedAttention(scratch.query, key, value, self.pages, self.lengths,
             metadata.query_start_loc, scratch.attended, sink=weights.sink, mode=mode, window=window,
-            width=1 if mode == "prefill" else scratch.query.shape[0] // metadata.lengths.numel(),
+            width=1 if mode == "prefill" else metadata.max_query_tokens,
             session=session, workspace=workspace, name=name + ".attention")
 
     def _rotary(self, values, cos, sin):

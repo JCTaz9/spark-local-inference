@@ -60,10 +60,15 @@ def test_native_export_terminal_progress(tmp_path, rank):
     assert not any("\u2800" <= character <= "\u28ff" for character in plain)
     labels = ("Clear disposable storage", "Inspect CUDA graph functions", "Serialize CUDA graphs",
               "Capture compiled modules and globals", "Scan and copy reachable storage",
-              "Export frontend assets", "Hash and publish payload blobs",
+              "Materialize weight payloads", "Export frontend assets", "Assemble package payloads",
+              "Verify frontend payloads", "Compress and publish rank 0 executables",
+              "Verify and publish rank 0 data", "Commit package", "Clear export staging",
               "Sign and publish package metadata")
     if rank == 0:
-        assert plain.count("Export native package.") == 2, plain
+        assert plain.count("Export native package.") == 1, plain
+        assert "[ STARTED  ] Export native package." not in plain, plain
+        assert "[    OK    ] Export native package." in plain, plain
+        assert "[  FAILED  ]" not in plain, plain
         for label in labels:
             assert label in plain, plain
     else:

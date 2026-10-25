@@ -18,7 +18,7 @@ from ignition.preparation.execution import GraphSignature, PreparedExecution
 from ignition.preparation.module_images import ModuleImages
 from ignition.preparation.package_storage import PackageStorage
 from ignition.preparation.runtime_package import export_model
-from ignition.preparation.package_file import read_index
+from ignition.preparation.package_file import combine, read_sources
 
 
 @triton.jit(do_not_specialize=["scalar"])
@@ -48,6 +48,10 @@ def allocation_reference(allocations, tensor):
     return {"allocation": allocation.name, "offset": address - allocation.address}
 
 
+TRANSFORM_SYMBOL = "transform_" + "template_parameter_" * 32
+BIAS_SYMBOL = "bias_" + "template_parameter_" * 32
+
+
 def global_kernel(root, storage, source):
     code = root / "globals.cu"
     code.write_text('''
@@ -63,24 +67,24 @@ __global__ void transform(float *output, Shape shape) {
 }
 __global__ void no_arguments() {}
 }
-''')
+'''.replace('transform', TRANSFORM_SYMBOL).replace('bias', BIAS_SYMBOL))
     cubin = root / "globals.cubin"
     architecture = "sm_" + "".join(map(str, torch.cuda.get_device_capability()))
     subprocess.run(["nvcc", "--cubin", f"-arch={architecture}", str(code), "-o", str(cubin)], check=True)
     cuda = storage.cuda
     module, function, empty = C.c_void_p(), C.c_void_p(), C.c_void_p()
     cuda.call("cuModuleLoad", C.byref(module), C.c_char_p(str(cubin).encode()))
-    for name, value in (("bias", C.c_float(2)), ("scale", C.c_float(3)), ("base", C.c_uint64(source.data_ptr()))):
+    for name, value in ((BIAS_SYMBOL, C.c_float(2)), ("scale", C.c_float(3)), ("base", C.c_uint64(source.data_ptr()))):
         address, size = C.c_uint64(), C.c_size_t()
         cuda.call("cuModuleGetGlobal_v2", C.byref(address), C.byref(size), module, C.c_char_p(name.encode()))
         assert size.value == C.sizeof(value)
         cuda.call("cuMemcpyHtoD_v2", address, C.byref(value), size)
-    cuda.call("cuModuleGetFunction", C.byref(function), module, C.c_char_p(b"transform"))
+    cuda.call("cuModuleGetFunction", C.byref(function), module, C.c_char_p(TRANSFORM_SYMBOL.encode()))
     cuda.call("cuModuleGetFunction", C.byref(empty), module, C.c_char_p(b"no_arguments"))
     return module, function, empty
 
 
-def prepare(root, shard_size=64 << 30):
+def prepare(root, shard_size=64 << 30, legacy=False):
     with ModuleImages() as images:
         torch.cuda.set_device(0)
         with PackageStorage() as storage:
@@ -108,8 +112,13 @@ def prepare(root, shard_size=64 << 30):
             ready.record()
             buffers = {"frame_index": torch.zeros(1, device="cuda", dtype=torch.int32),
                        "submission_sequence": torch.zeros(1, device="cuda", dtype=torch.int64),
-                       "completion_records": torch.zeros((2, 1, 8), device="cuda", dtype=torch.int64),
+                       "completion_records": torch.zeros((2, 1, 24), device="cuda", dtype=torch.int64),
                        "source": source, "output": output}
+            records = buffers["completion_records"]
+            records[..., 4] = -1
+            records[..., 12:14] = -1
+            records[..., 15] = 1
+            records[..., 16:] = -1
             def run():
                 ready.wait()
                 scratch = transient[:source.nbytes].view(source.dtype)
@@ -156,7 +165,8 @@ def prepare(root, shard_size=64 << 30):
             assert any(start <= freed_address < end for start, end in storage.unused_ranges())
             graph_segments = storage.graph_pool.snapshot(include_traces=False)
             assert graph_segments
-    package = export_model(prepared, images, storage, root / "package", options={}, publisher=publisher(), shard_size=shard_size)
+    package = export_model(prepared, images, storage, root / "rank.json", options={},
+                           sources=True)
     assert not any(a.address <= unused_address < a.address + a.nbytes for a in package.allocations)
     assert not any(a.address <= freed_address < a.address + a.nbytes for a in package.allocations)
     assert any(a.address == segment["address"] for a in package.allocations for segment in graph_segments)
@@ -165,10 +175,15 @@ def prepare(root, shard_size=64 << 30):
     assert any(a.name.startswith("external-") and a.address <= external.value < a.address + a.nbytes
                for a in package.allocations)
     zero_reference = allocation_reference(package.allocations, transient)
-    document = read_index(root / "package")[0].ranks[0]
+    document = read_sources(root / "rank.json")[0].ranks[0]
     allocation = next(a for a in document.allocations if a.name == zero_reference["allocation"])
     start, end = zero_reference["offset"], zero_reference["offset"] + transient.nbytes
     assert all(span.offset + span.nbytes <= start or span.offset >= end for span in allocation.data_spans)
+    if legacy:
+        from signing import publish_captured_legacy
+        publish_captured_legacy(root / "package", root / "rank.json", shard_size=shard_size)
+    else:
+        combine(root / "package", [root / "rank.json"], [], publisher=publisher())
     (root / "expected.json").write_text(json.dumps({
         "reference": allocation_reference(package.allocations, output), "bytes": list(expected),
         "addresses": {allocation.name: allocation.address for allocation in package.allocations},
@@ -186,8 +201,9 @@ if __name__ == "__main__":
     parser.add_argument("directory", type=Path)
     parser.add_argument("executable", nargs="?")
     parser.add_argument("--shard-size", type=int, default=64 << 30)
+    parser.add_argument("--legacy", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size)
+    prepare(args.directory, args.shard_size, args.legacy)
     if args.executable:
         os.execv(args.executable, [args.executable, str(args.directory)])

@@ -53,6 +53,51 @@ The additional `flare` object reports prepared and selected serving metadata:
 Generation requests always use the loaded model, regardless of the request's
 `model` string. Returned generation objects identify the loaded model.
 
+## Ollama model discovery
+
+`GET /api/tags` lists the loaded model using Ollama's discovery response format.
+Its `name` and `model` match the identifier in `/v1/models`. `POST /api/show`
+accepts `{"model": "NAME"}` for that identifier, the checkpoint identifier, or any
+configured alias. An optional boolean `verbose` is accepted; both modes return
+the same metadata. Missing, empty, or incorrectly typed names return HTTP 400;
+unknown names return HTTP 404. Discovery errors use `{"error": "message"}`.
+Both routes require the configured bearer key, when enabled. `/api/show` accepts
+uncompressed JSON within the HTTP body-size limit. Authentication errors retain
+the OpenAI error format.
+
+`/api/show` reports `completion`, plus `vision` when vision graphs are prepared,
+`tools` when a tool parser is declared, and `thinking` when a reasoning parser is
+declared. `model_info` contains `general.name`, `flare.context_length` (the
+effective prompt-plus-output limit), and `flare.vocab_size`. These values come
+from the loaded contract and serving limits, without model-name inference.
+
+`details.format` is `flare`. Unavailable family, parameter-count, and quantization
+labels are empty strings; `families` is empty. The listing reports unknown artifact
+size as zero and unknown modification time as `0001-01-01T00:00:00Z`. Its `digest`
+is a SHA-256 cache key over the prepared model identity and discovery details;
+it changes when the model or advertised metadata changes. It is not an Ollama
+manifest digest. Templates and tensor inventories are not exposed.
+
+OpenCode v2 can discover Flare through its built-in Ollama provider. Merge into
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "settings": {"baseURL": "http://127.0.0.1:8000/v1"}
+    }
+  }
+}
+```
+
+Add `settings.apiKey` when authentication is enabled. OpenCode polls the discovery
+endpoints and uses `/v1/chat/completions` for generation; choose a discovered model
+with `/models`. Its Ollama integration reads context, tool, and vision metadata;
+reasoning controls may still require client configuration. Flare implements
+Ollama discovery only: `/api/chat`, `/api/generate`, and model-management routes
+are not supported.
+
 ## Generation log probabilities
 
 Logprobs describe the raw next-token distribution over the complete vocabulary:
@@ -179,7 +224,7 @@ Anthropic routes also accept `x-api-key: KEY`; supplying both headers requires
 both to match. `/health` and `/metrics` are unauthenticated. Flare reads its
 serving key from `--api-key-file`, independently of client configuration.
 
-Request bodies support `identity`, `gzip`, zlib `deflate`, `br`, and `zstd` content
+Generation request bodies support `identity`, `gzip`, zlib `deflate`, `br`, and `zstd` content
 encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
 (32 MiB by default). Decompression and frontend processing share the bounded
 frontend worker pool. Invalid requests receive protocol-specific JSON errors;

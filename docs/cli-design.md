@@ -55,8 +55,8 @@ preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
 
 ```
-ignition export  [MODEL] [--output FILE] [flags]  prepare a native model package
-ignition convert FILE [--output FILE] [flags]   convert a package to shared blobs
+ignition export  [MODEL] [flags]                prepare a model in the shared cache
+ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
 Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
@@ -82,9 +82,10 @@ then hands graph handles, metadata, and retained resource owners to Heliopause.
 The native exporter writes compiled CUDA modules, allocation contents, graph
 descriptions, and frontend assets to content-addressed payload blobs with a
 metadata-only `.safetensors` primary. Native stderr phases report scanning,
-hashing, copying, cache reuse, encryption, and publication progress. Every
-destination must be unused. Ignition exits without opening a listener after
-publication. Launch the exported package
+hashing, copying, cache reuse, compression, and publication progress. Export
+publishes a directory entry in the shared model cache and selects it as the
+model's default. Ignition exits without opening a listener after publication.
+Launch the exported package
 with `flare run PACKAGE`. Qwen, GLM, and DeepSeek provide native package storage support.
 Tensor-parallel packages contain one resource bundle per selected GPU and load
 in one process with one execution thread per rank. API keys are excluded from
@@ -100,7 +101,7 @@ flare/target/release/flare run PACKAGE --gpus 0 --host 127.0.0.1 --port 8000
 ```
 flare run [PACKAGE] [flags]               serve locally, join a rank, or launch peer agents
 flare download REPOSITORY [flags]         download a prepared package
-flare inspect PACKAGE [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
+flare inspect PACKAGE|MODEL[@VERSION] [--tensor-parallel N] [--memory-map] [--graphs] [--frontend] [--all] [--json | --plain]
 flare agent [--listen IP:PORT]            run this host's rank agent
 flare agent install [--join-code CODE | --accept-first] [--listen IP:PORT]
 flare agent pair HOST... [--code CODE]    pair for --hosts or Orbit launches
@@ -136,8 +137,10 @@ address toward its first peer; an explicit `--rendezvous` overrides it.
 
 Serving package distribution uses 1..64 streams per peer, selected by rank
 zero's `--transfer-streams` (default 8). Direct and switched fabrics route to
-the peer; `--roce-ring` uses intermediate ranks. `--package-cache` sets the
-receiving rank's cache root (default `~/.cache/flare`). Rank zero's
+the peer; `--roce-ring` uses intermediate ranks. `--model-cache` selects the
+receiving rank's prepared-model cache; `--package-cache` is the compatible
+fallback when `--model-cache` is absent. The default is `paths.package_cache`,
+otherwise `~/.cache/flare/packages`. Rank zero's
 `--stage-only` distributes and verifies packages without GPU loading, and exits
 all ranks. Manual ranks need no agents, route signatures, or routing keys.
 All launch modes use the same native distribution and serving bootstrap.
@@ -146,8 +149,8 @@ All launch modes use the same native distribution and serving bootstrap.
 defaulting to `~/.config/flare/orbit.toml` and
 `~/.config/flare/orbit/controller.key`. `flare orbit run` takes the serving
 flags of `flare run` and applies them to every rank; `--host`, `--port`,
-`--served-model-name`, `--scheduler-policy`, and `--api-key-file` apply to rank
-zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
+`--served-model-name`, `--scheduler-policy`, `--scheduler-terminal-value`,
+`--scheduler-terminal-age-price`, and `--api-key-file` apply to rank zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
 not upload it. Package inputs are Hugging Face repositories
 `ORG/NAME[@REVISION]`, controller-local files, or `NODE:/absolute/path` on a
 paired node. Orbit downloads repository packages on a candidate node and
@@ -175,9 +178,9 @@ and `--mtp-draft-tokens N` select supported reductions at load time;
 verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
-record no history preference. Existing packages retain their recorded defaults
-unless explicitly overridden, including copy-only packages whose prepared
-graphs remain loadable. Omitted capacity flags use package defaults. Only selected
+record no history preference. Package defaults fill omitted settings; explicit
+startup settings win. Serving requires execution ABI 4 and prepared model
+contract 2; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
@@ -185,8 +188,8 @@ storage according to those selections and available GPU memory.
 
 ### 3.1 Ignition command-line flags
 
-`export` and `serve` accept the preparation flags below. `export` also accepts
-`--output FILE` and defaults to a local snapshot. Listener flags apply only to
+`export` and `serve` accept the preparation flags below. `export` publishes a
+directory entry in the shared model cache. Listener flags apply only to
 `serve`; native package serving uses `flare run` flags. Development `serve` also
 accepts the runtime `--history-drafts` / `--no-history-drafts` options for native
 serving. `export` accepts neither option, and `--direct` rejects history drafting.
@@ -200,9 +203,9 @@ serving. `export` accepts neither option, and `--direct` rejects history draftin
 | `--port N` | Listening port. `serve` only. | `server.port`, else `8000` |
 | `--verbose` | Per-phase detail on stderr | off |
 | `--config PATH` | Configuration file | `~/.config/flare/config.toml` |
-| `--shard-size SIZE` | Hard payload-file limit for export/sign/convert, at most 64 GiB | `[publishing] shard_size`, else `64G` |
 | `--no-weights` | Export only when exact stored-data blobs are cached | Off |
-| `--repo-id NAMESPACE/REPOSITORY` | Export repository namespace for the default local snapshot path | Recipe `export_repository` |
+| `--repo-id NAMESPACE/REPOSITORY` | Hugging Face target recorded for the exported entry | Recipe `export_repository` |
+| `--staging PATH` | Export workspace | `paths.export_staging` |
 | `--official-source URL` | Published repository URL under the configured publisher namespace | `[publishing] official_source` |
 
 Preparation flags are grouped by capacity/compression, speculative decoding,
@@ -215,16 +218,17 @@ explicit flags take precedence.
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing packages retain their captured catalog. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
-| `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Retained and packed proposal producers execute the full configured block; verification adapts using measured cost and historical acceptance or native proposal confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
+| `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for DeepSeek V4.1 |
-| `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. Positive-depth DeepSeek V4.1 DSpark requires adaptive verification. | Adaptive |
+| `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. GPU confidence allocation requires adaptive selection; host-allocated ragged programs support fixed selection. | Adaptive |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run shared experts, projection chains, and query chains serially on the main stream, and retain complete lagged mHC boundaries, to diagnose scheduling-dependent faults. Arithmetic precision is unchanged. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|low\|medium\|high\|max` | Kernel search effort. Off uses heuristics; low applies broad exclusions; medium balances search cost; high retains only conservative exclusions; max enumerates every declared legal candidate. Overrides `[preparation] autotune_effort`. | Medium |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
+| `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
 | `--online-mxfp8` | Store the recipe's eligible BF16 projections as MXFP8 while loading (Kimi K3: KDA projections, MLA latent/gate, query and output projections, shared experts, MoE latent down/up projections, and DSpark draft context, outputs and MLPs), trading checkpoint precision for decode bandwidth. MLA's batched key/value projections retain BF16. Recipes that name no such projections reject it. | Checkpoint precision |
 | `--language-model-only` | Prepare no vision encoder and serve text only, as vLLM's flag of the same name; requests with images are rejected and the encoder's weights, scratch, and graphs become KV pages. Recipes without a separable encoder reject it. | The recipe's image support |
 
@@ -255,14 +259,15 @@ graph budget controls catalog density between each batch's smallest wider round
 and its maximum physical extent. Width-one and ordinary graphs do not consume
 that budget. Budgets below the required endpoint count fail during planning;
 budgets above the number of distinct valid capacities capture every capacity.
-For eight requests with five drafts each, this example instead limits physical
-target capacity to 24 rows while retaining six-token per-request prefixes:
+In export/conversion examples, `CACHE_ENTRY` is the directory path printed by
+`ignition export`. For eight requests with five drafts each, this example limits
+physical target capacity to 24 rows while retaining six-token per-request prefixes:
 
 ```sh
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 8 --mtp-draft-tokens 5 \
-  --speculative-token-capacity 24 --prefill-chunk-size 4096 \
-  --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors --verbose
+  --speculative-token-capacity 24 --prefill-chunk-size 4096 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24.safetensors
 ```
 
 Packed packages require adaptive execution at their captured draft depth, or
@@ -291,10 +296,12 @@ batches 1, 2, and 4 at eight rows each; batches
 captured combined capacity at or below eight instead. At least one combined
 round must remain, and an uncaptured exact capacity fails selection.
 
-Catalogs containing separate proposal and verification graphs require the
-budget to cover the selected padded batch capacity. A maximum budget must cover
-the captured per-request verification width for either catalog. Missing required
-graphs fail before GPU initialization.
+Every speculative catalog contains complete generation programs identified by
+B/D/W/P: request capacity, actual proposal draws, per-request target capacity,
+and explicit aggregate target rows. No standalone proposal or verification
+operation is loadable. Exact host lengths support fixed ragged selection; GPU
+confidence allocation requires adaptive selection. Missing required capacities
+fail before GPU initialization.
 
 DeepSeek V4.1 defaults to BF16 MLA arithmetic. `--mla-compute-mode auto`
 lets b12x choose arithmetic. Packed KV storage remains unchanged, and compatible
@@ -305,8 +312,8 @@ FlashInfer dependency supplies the required preparation API. For example:
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 8 --mtp-draft-tokens 5 \
   --speculative-token-capacity 24 --prefill-chunk-size 4096 \
-  --mla-compute-mode bf16 \
-  --output /data/flare-runtime/deepseek41-tp4-c8-packed24-bf16.safetensors --verbose
+  --mla-compute-mode bf16 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek41-tp4-c8-packed24-bf16.safetensors
 ```
 
 The arithmetic choice applies to target, prefill, and draft attention and is
@@ -432,8 +439,8 @@ default. This command uses the recipe's concurrency 32, seven draft tokens,
 4096-token prefill chunk, and 128 physical target rows:
 
 ```sh
-.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
-  --output /data/flare-runtime/ds41-tp4-c32-d7-p128.safetensors
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/ds41-tp4-c32-d7-p128.safetensors
 ```
 
 The default catalog contains 64 packed rounds with logical width eight and six
@@ -450,10 +457,21 @@ throughput with output cadence. For throughput-oriented serving, use
 `flare run model.safetensors --gpus 0,1,2,3 --scheduler-policy throughput`.
 This preference retains token-service fairness and can produce longer gaps
 between larger output bursts. It uses the package's existing graphs.
+Both policies retain terminal-retirement value and urgency. The independent
+`--scheduler-terminal-value VALUE` (default 256 prompt-token units) and
+`--scheduler-terminal-age-price PRICE` (default 1 value/ms²) override those
+coefficients after policy selection. Values must be finite and nonnegative;
+zero disables that term. Terminal age starts when termination is observed and
+includes queued-work drainage. These are scheduling preferences, not deadlines.
+The controls use existing snapshot graphs and require no package re-export.
 
-`flare run PACKAGE` loads an exported file without the Ignition configuration
-reader. `PACKAGE` can also be a Hugging Face repository ID with an optional
-`@revision`; Flare downloads its prepared package before loading it. A
+`flare run PACKAGE` loads an exported file and reads host defaults from
+`~/.config/flare/config.toml` using its Rust configuration reader. `--config PATH`
+selects another file. Explicit flags override configuration values. `PACKAGE` accepts a
+local path or `MODEL[@VERSION]`. A model name resolves its selected version in
+the Flare cache before any repository lookup. An unknown name can be a Hugging
+Face repository ID with an optional `@revision`; Flare downloads its prepared
+package before loading it. A
 [serving container](container.md) packages Flare and Helios without
 Python or the CUDA toolkit. `flare --help` lists commands; `flare run --help`,
 `flare run -h`, and `flare help run` describe every serving option, its defaults,
@@ -471,17 +489,17 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--trust-store PATH` | Persistent key/namespace acceptance file | `~/.config/flare/trust.toml` |
 | `--verify-weights` | Verify the stored allocation and table ranges of the ranks served before loading model GPU resources | off |
 | `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | First N visible GPUs for the package's N local ranks; one GPU per host for multi-host packages |
-| `--host ADDR` | Listener IP address, IPv4 or IPv6 | `127.0.0.1` |
-| `--port N` | Listener port | `8000` |
+| `--host ADDR` | Listener IP address, IPv4 or IPv6 | `[server] host`, otherwise `127.0.0.1` |
+| `--port N` | Listener port | `[server] port`, otherwise `8000` |
 | `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
-| `--api-key-file PATH` | File containing the serving API key | No authentication |
-| `--max-concurrency N` | Reduce concurrency within captured batch capacities | Package default |
+| `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
+| `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise package default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
-| `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`), or fraction of total memory (`0.8`) | Package serving reserve |
+| `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
-| `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; existing packages retain recorded defaults unless overridden |
-| `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on split-proposal prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
+| `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; package defaults apply unless overridden |
+| `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on completed prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
@@ -489,7 +507,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Disabled |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
-probability `p` as `sqrt(p)` when choosing split-proposal verification widths
+probability `p` as `sqrt(p)` when choosing complete speculative programs
 and packed budgets. `1.0` uses the probabilities directly; values above `1.0`
 favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses existing package graphs and does not enable
@@ -540,10 +558,11 @@ the package or change its identity. `flare run` accepts numeric IPv4 and IPv6 ad
 The combined `--bind` flag has been removed.
 
 Selected concurrency and draft depth cannot exceed prepared capacity.
-Concurrency three requires the batch-four bucket. Fixed verification loads
-width `N+1` where the token envelope permits it, plus width-one execution at every
-batch; adaptive verification loads the permitted
-widths. Missing variants fail before GPU allocation. Continuation rows and
+Concurrency three requires the batch-four bucket. Fixed host allocation selects
+a supported captured width and retains width-one execution at every bucket.
+Adaptive selection retains the permitted complete B/D/W/P programs. Actual D
+cannot be inferred from W; an uncaptured draft-depth reduction fails explicitly.
+GPU confidence allocation requires adaptive selection. Missing variants fail before GPU allocation. Continuation rows and
 KV pages receive physical backing after graph upload, within fixed virtual
 extents. Reducing execution state can leave more memory for KV pages.
 
@@ -579,7 +598,8 @@ fractions, nonfinite values, and overflowing sizes are rejected. Both
 `--memory-limit -30g` and `--memory-limit=-30g` work.
 
 An explicit memory flag replaces the package's serving reserve; the two are
-never subtracted together. Omission preserves the exported `[memory] reserve`.
+never subtracted together. Without a flag, an explicitly configured `[memory] reserve`
+replaces the exported reserve; an absent setting preserves the package value.
 Integrated GPUs also count resident host tables, embedding row caches, and
 future prefix-cache host pools in the same physical budget. Shared host memory
 is charged once per host. The existing driver margin, host allowance, and
@@ -643,20 +663,18 @@ Both commands accept these download options:
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--revision REVISION` | Explicit Hub branch, tag, or commit | Detected `gb10` or `gb202` |
+| `--revision REVISION` | Explicit Hub branch, tag, or commit | Recorded model origin, otherwise detected `gb10` or `gb202` |
 | `--filename FILE` | Repository-relative prepared package filename | Sole primary `.safetensors` file |
-| `--cache-dir PATH` | Hugging Face hub cache directory | `~/.cache/huggingface/hub` from the OS user account |
+| `--cache-dir PATH` | Parent for temporary prepared-package transport staging | Flare model cache |
 | `--token-file PATH` | File containing a Hub token for gated or private repositories | No authentication |
-| `--offline` | Resolve only from cached refs and snapshots and skip the publisher identity check; make no network requests. Accepted with a local package path | Off |
+| `--offline` | Resolve prepared packages only from the Flare model cache and skip the remote publisher identity check; make no network requests. Accepted with a local package path | Off |
+| `--model-cache PATH` | Flare prepared-model cache directory | `paths.package_cache`, otherwise `~/.cache/flare/packages` |
 
-The native client uses Hugging Face's `refs`, `snapshots`, and `blobs` cache
-layout. It loads regular snapshot files directly. Multi-file snapshots containing
-symlinks, including those created by Python's Hub client, use regular hardlinks in
-the cache's `flare-packages` directory. These links share the cached file's bytes
-and preserve companion paths when the primary path is canonicalized. Filesystems
-without hardlink support report an error instead of copying payloads. Local
-package companions may also be symbolic links to regular files on other storage
-devices; the loader validates and retains the opened targets.
+Online acquisition uses Hugging Face's `refs`, `snapshots`, and `blobs` as a
+transport cache, then installs the selected prepared deployments in the Flare
+model cache. Snapshot symlinks are resolved through temporary acquisition trees
+under the Flare cache, using hardlinks or cross-filesystem copies. The returned
+package is a leased Flare cache entry.
 
 When a file is absent from a snapshot, Flare checks its Hub ETag and size against
 the repository's blob cache. An existing blob is hardlinked into the snapshot
@@ -667,57 +685,105 @@ downloads use resumable HTTP transfers through `hf-hub`, without Xet chunk
 reconstruction. A cached blob with an unexpected size or file type reports an
 error. Package signature verification still occurs when serving.
 
-Offline automatic filename selection considers the files present in that cached
-snapshot; use `--filename` to select one explicitly. Cache paths, endpoint, and
+`flare run MODEL` leases the selected local default first. Locally exported
+versions have no download origin and do not trigger repository lookup. A
+version downloaded from Hugging Face retains its acquisition repository,
+revision, filename, and TP selection independently of moving source references.
+For an unqualified model name, Flare checks that recorded repository and revision
+for updates, even when the repository differs from the signed model identity.
+An unchanged commit requires no package transfer. A changed commit is acquired
+and verified before the model default switches. An update naming a different
+model is rejected. Failed checks or acquisitions leave the default unchanged;
+`--offline` skips the check. Explicit `MODEL@VERSION` and package paths stay
+pinned. `--revision` and `--filename` can override an unqualified HF-origin
+model's source, but cannot override an explicit local version. A missing version
+or default of a known local model is an error, not a repository lookup.
+
+Successful downloads record repository, requested revision, resolved commit,
+filename, TP selection, and the SHA-256 of the exact signed envelope authenticated
+during acquisition in the Flare cache. Offline resolution uses those references
+and verifies the selected entry's signatures and stored payloads. It never reads
+or imports HF snapshots. Source records written before envelope binding remain
+readable but are unbound; offline resolution rejects them with instructions to
+refresh the source online or load a cached entry by explicit path. A bound record
+whose entry envelope differs is rejected before the default changes. Automatic
+filename resolution requires a preceding download that selected its filename
+automatically; an explicit `--filename` resolves the corresponding recorded
+package. Missing or evicted entries and unavailable TP deployments fail without
+network access.
+A branch resolves its last successfully acquired commit; requesting another TP
+size cannot silently select an older commit. Cache paths, endpoint, and
 authentication are configured explicitly; native commands do not interpret
 `HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, or `HF_ENDPOINT`.
 
 ### Package snapshots
 
-`ignition export MODEL` writes a unique local snapshot without requiring
-`--output`. A recipe's `export_repository` supplies its Hugging Face target;
-`--repo-id NAMESPACE/REPOSITORY` overrides it. Recipes without a target use their
-local recipe name as the cache namespace. For Qwen Flash:
+`ignition export MODEL` publishes a prepared directory entry in the shared model
+cache and prints its path. A recipe's `export_repository` supplies its Hugging
+Face target; `--repo-id NAMESPACE/REPOSITORY` overrides it. For Qwen Flash:
 
 ```sh
 ignition export qwen3.8-flash
 ignition export qwen3.8-flash --no-weights
 ```
 
-With the default package cache, the layout is:
+The cache holds the directory canonical form of each entry:
 
 ```text
 ~/.cache/flare/packages/
-  blobs/<sha256>.safetensors
-  models--qwen38/
-    snapshots/<snapshot-id>/
-      model.safetensors
-      <sha256>.safetensors
+  blobs/<payload-id>.safetensors          # immutable payload objects
+  blobs/legacy/<container-digest>.safetensors
+  models/<model-key>/<version>/
+    model.safetensors
+    weights/layer-000.safetensors         # hardlink to a payload object
+    deployments/<deployment>/rank-<n>/graphs.safetensors
+  refs/<model-key>                        # selected default entry
+  staging/                                # unpublished work
+  locks/                                  # stable lock inodes
 ```
 
-Each payload filename hashes the complete file. Snapshot payloads are read-only
-hardlinks to `blobs/`, so identical bytes occupy disk space once. Every primary
-contains only the signed model envelope and the storage layout. All model payloads,
-including graphs and kernels, follow in separate files no larger than 64 GB
-(64,000,000,000 bytes). Size suffixes are binary; packing also applies this
-publication cap when the configured limit is `64G`.
-`--output FILE` selects another primary location on the cache's filesystem;
-a different filesystem requires a package cache on that filesystem. Configure
-`paths.package_cache` accordingly.
+Payload object names hash the exact stored payload bytes, so entries and revisions
+share one copy of each object through hard links. Entry companions keep readable
+semantic names (`weights/…`, `deployments/…`) and are hard links to those objects,
+never copies. The primary carries the signed manifest, the unsigned physical
+locations, and any embedded frontend assets (such as the tokenizer and chat
+template). Weight, executable, and state payloads live in companions.
 
-Weight resources are packed into shards by rank and logical file, separately
-from executable and supporting resources. `--no-weights` requires both the
-captured allocations and the resulting stored-data shards to be cached.
-A missing or changed payload fails export before publishing
-the primary. This includes initialized persistent buffers as well as weights.
+Export always writes the directory canonical form in the cache.
+`ignition convert CACHE_ENTRY --form packed --output FILE` writes a standalone
+single-file package; `ignition convert CACHE_ENTRY --output DIR` writes a
+standalone directory. `CACHE_ENTRY` is the path printed by export. Both forms use
+the same metadata, payloads, signatures, and location records. Converting between them
+needs no signing key or GPU. `--output` refuses an existing destination. A
+destination on another filesystem is assembled by copying bytes, so those files
+share no storage with the cache; a destination on the cache's filesystem shares
+inodes where it can. Payload-format packages keep the semantic payload boundaries their export declared. No
+command or configuration setting selects a size-sharding threshold.
+
+Weight payloads are declared per semantic layer and stored as their own payload
+objects; tuning-dependent layouts and residual initialization bytes form separate
+payloads. Executable and state payloads are stored separately from weight
+payloads. Whether a graph or capacity change leaves weight object identities
+unchanged is an export-acceptance property for the supported recipes, not a format
+guarantee.
+
+For payload packages, `--no-weights` requires every stable and tuned weight
+payload object the export names to be cached; a missing or changed weight payload
+fails export before publishing the primary. Declared direct capture records no
+allocation payload objects, so it needs no captured-allocation cache. Initial-state
+payloads (residual state, module globals) and executable resources are not
+weights: a graph or capacity change may produce new state and compressed executable
+frames, which such an export writes normally.
 The flag avoids temporary allocation files and duplicate weight writes. It still
 loads and prepares the checkpoint and reads captured storage to establish exact
-content identity. Changed graph captures and encrypted executable resources may
-produce additional blobs. Regular exports also reuse matching cached blobs.
+content identity. Changed graph captures and compressed executable resources may
+produce additional blobs. Regular exports also reuse matching cached payloads.
 
-Multi-host preparation keeps a blob cache on each host. Peers send manifests;
-rank zero requests only files absent from its own cache. Native serving distributes
-only the payload blobs needed by each rank and reuses blobs across snapshots.
+Multi-host preparation keeps the shared model cache on each host. Peers send
+manifests; the coordinator requests only objects absent from its own cache and
+holds leases on received objects until combining finishes. Native serving
+distributes only the payload blobs needed by each rank and reuses blobs across
+entries.
 
 Convert an existing package without a GPU or private signing key:
 
@@ -726,25 +792,25 @@ ignition convert /models/existing.safetensors \
   --publisher-keys /keys/publisher.json
 ```
 
-Conversion accepts monolithic, numbered-shard, and snapshot packages, verifies
-signed resources and stored data, and preserves the exact signed envelope. Supply
-the public publisher profile for a production package; the local development
-profile is loaded automatically. `--output FILE` selects a destination. Conversion
-leaves its source intact and needs space for payload bytes absent from the cache.
-It reads the complete package to verify its contents. Identical conversions reuse
-blobs without rewriting them. A resource larger than the selected limit is
-rejected because native resources must remain contiguous.
+Conversion accepts payload-format packages and preserves their exact signed
+bodies and payload bytes. Supply the public publisher profile for a production
+package; the local development profile is loaded automatically. `--output`
+selects a destination and `--form` selects packed or directory form. Conversion
+leaves its source intact. Conversion rejects logical-resource containers;
+export them again with Ignition to obtain a payload package. Serving accepts
+payload format 2 and signed format-6 logical-resource containers, both requiring
+execution ABI 4 and prepared model contract 2. Other execution ABI or prepared
+contract versions require re-export.
 
-The printed snapshot directory is self-contained. Upload that directory to the
-recipe's repository using the Hugging Face upload client; hardlinks appear as
-ordinary files. Export and conversion do not upload or change publisher trust.
-Keep every referenced payload beside its primary when copying a snapshot. Removing
-a snapshot removes its hardlinks; cached blobs remain available for other exports.
-There is no automatic blob garbage collection.
+The printed cache entry is self-contained and can be uploaded to the recipe's
+repository with the Hugging Face upload client as either canonical form. Export
+and conversion do not upload or change publisher trust. Removing an entry removes
+its hard links; shared payload objects remain available for other entries, and
+`flare models gc` reclaims objects nothing references.
 
 ### Signing and local development
 
-Final exports always carry signatures and encrypted executable resources.
+Final exports always carry signatures and zstd-compressed executable resources.
 Configure published exports with all three values:
 
 ```toml
@@ -758,14 +824,11 @@ The key must be an owner-only Ed25519 PKCS#8 PEM file. Encrypted keys prompt
 for their passphrase in an interactive terminal; unencrypted keys are also
 accepted. Runtime publisher profiles contain only the verification key.
 `--official-source` overrides the configured repository URL. Setting any signing
-identity field requires all three identity fields. `[publishing] shard_size` may
-be configured independently and does not select a production identity.
+identity field requires all three identity fields.
 
-`shard_size = "64G"` is the hard payload-file limit; export/sign/convert
-accept `--shard-size SIZE` up to 64 GiB, including each file's header. Zero and
-limits at or below 4096 bytes are invalid. A resource larger than the limit fails
-export. The primary contains metadata only; all resources reside in immutable
-content-addressed blobs. See [package snapshots](#package-snapshots).
+Payload-format packages keep their semantic payload boundaries in either
+canonical form. Export, conversion, and signing write only this format.
+See [package snapshots](#package-snapshots).
 
 `ignition keygen` creates an encrypted production key and public profile.
 `ignition key-password` changes the key's passphrase while preserving its identity.
@@ -811,8 +874,8 @@ signed official source prints a warning naming both on every load.
 The disclosure names the model license the exporter recorded from the
 checkpoint's model card, with a link to the license text in the repository.
 Typing the publisher namespace agrees to the terms at that link and trusts the
-signing key; the typed string is the key material Helios derives executable
-decryption keys from, so acceptance is what decrypts the package's kernels.
+signing key. The typed string must exactly equal the signed publisher namespace;
+it records trust and license acceptance and is not executable key material.
 
 To load a locally exported development package using the default public profile:
 
@@ -836,7 +899,32 @@ the `publisher.json` beside the signing key to `flare run --publisher-keys PATH`
 
 `~/.config/flare/config.toml`. All keys optional. Written on first export with
 the resolved values present as comments.
-`[server]` configures `ignition serve`; pass native serving options to `flare run`.
+Ignition and native Flare read this file; `--config PATH` selects another file.
+An absent default file supplies no overrides; an explicitly selected missing
+file or an invalid runtime setting is an error. Help does not read the file.
+
+Native `flare run` applies `[server] host`, `port`, and `api_key`, `[memory] reserve`,
+`[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
+settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
+use `[paths] package_cache`. Flags override these defaults, including explicit
+zero limits and values equal to the built-in defaults. An empty `--api-key-file`
+disables configured authentication; API keys are never forwarded as arguments.
+
+Model overrides match the signed canonical model ID and serving aliases, independently
+of the package filename and `--served-model-name`. Conflicting concurrency values
+for matching names are rejected unless `--max-concurrency` supplies the value.
+Configured concurrency must fit the package's prepared capacities.
+
+`[publishing]`, `[preparation]`, `defaults.model`, image concurrency, speculative
+graph preparation settings, and the checkpoint, kernel, staging, and toolkit paths
+remain preparation settings. `flare run` requires a package; it does not interpret
+an Ignition recipe alias as a prepared package. `paths.hub_cache` does not select
+prepared-package transport staging or the model cache.
+
+Each Orbit node reads its own host configuration when its rank starts; saved group
+options and explicit flags take precedence. `--config` on the controller selects
+its local file, not a file on remote nodes. Every rank must use compatible serving
+settings. `flare run --hosts` forwards resolved runtime options to its peer ranks.
 
 ```toml
 [server]
@@ -855,6 +943,11 @@ max_concurrency = 4
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
 
+[prefix_cache]
+memory = ""                      # Host retention budget; empty: disabled.
+disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
+disk_transport = ""              # Empty: staged; also accepts direct.
+
 [models."qwen3.8-flash"]          # Per-model overrides of [defaults].
 max_concurrency = 2
 
@@ -862,6 +955,7 @@ max_concurrency = 2
 hub_cache = "~/.cache/huggingface/hub"
 kernel_cache = "~/.cache/flare/kernels"
 package_cache = "~/.cache/flare/packages"
+prefix_cache = ""                # Host checkpoint directory; empty: disk retention disabled.
 export_staging = ""               # Rank files an export assembles from; empty: beside the package.
 cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native builds.
 ```
@@ -890,8 +984,9 @@ Seed remains request-controlled.
 
 `memory.reserve` exists for one case: a process that starts after Flare and
 needs GPU memory. Processes already running when Flare starts need no
-setting, because supply is free memory rather than card size. It lives in the configuration file and is exported as the package's serving
-reserve.
+setting, because supply is free memory rather than card size. Preparation records
+it as the package's serving reserve. Native serving uses an explicit host configuration
+value in preference to that recorded reserve.
 
 The GPU prefix cache is derived. It holds model states at instruction,
 prompt, and answer boundaries so that later requests repeating a prefix skip
@@ -917,7 +1012,7 @@ Configuration assigns each decision to one owner:
 | Context limit | Checkpoint maximum; admission still requires sufficient shared cache capacity |
 | KV pages and GPU prefix-cache rows | Derived from available memory, graph cost, and concurrency |
 | KV history ceiling | Runtime `--kv-cache-limit` |
-| Serving memory budget | Runtime `--memory-limit`, otherwise exported `[memory] reserve` |
+| Serving memory budget | Runtime `--memory-limit`, then configured `[memory] reserve`, then the package reserve |
 | Preparation headroom | 1 GiB for compiled warmup and capture |
 | Serving driver margin | 64 MiB after graph upload |
 | Prefill chunk | Recipe default, overridden by `--prefill-chunk-size` |
@@ -930,7 +1025,7 @@ Configuration assigns each decision to one owner:
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
 | Served names | Recipe alias and repository ID, exposed through `/v1/models` |
-| API key | Ignition configuration or native `--api-key-file`; excluded from packages |
+| API key | `[server] api_key`, overridden by native `--api-key-file`; excluded from packages |
 | Sampling distribution controls | Recipe defaults and optional model-author ranges; request values clamp to ranges, or to defaults when no range exists |
 | Seed, output limit, and stops | Request fields, with declared defaults for missing values |
 
@@ -970,12 +1065,16 @@ decoded-source windows are accounted for separately at startup.
 ### 5.1 `ignition export`
 
 Resolve `MODEL`, discover GPUs through NVML, and derive the preparation plan.
-Download missing checkpoint weights, then prepare and write a runtime package
-in a unique local snapshot under the recipe's export repository.
-`--output FILE` selects another destination, appending `.safetensors` if needed;
-the destination must not exist. `--no-weights` requires exact cached stored-data
-blobs. Export closes the prepared model and exits without starting a listener.
-Preparation failures leave no published package.
+Download missing checkpoint weights, then prepare and publish an entry in the
+shared model cache under `paths.package_cache`.
+Export accepts no output path or form selection. Use `ignition convert` on the
+printed cache entry path to create a standalone packed file or directory.
+For multi-host export, the coordinator stages rank resources through Heliopause
+and publishes the complete entry in its shared model cache.
+`--staging PATH` selects the export workspace. `--no-weights` requires exact
+cached weight payloads; initial state and executable resources may be produced
+fresh. Export closes the prepared model and exits without starting a listener.
+Preparation failures publish no entry.
 
 SIGINT and SIGTERM end preparation immediately. Preparation exit codes are
 0 for success, 2 for usage, 3 for fetch, 4 for capacity, and 5 for preparation.
@@ -991,8 +1090,13 @@ Terminal bars use cyan completed segments, dark gray remaining segments, and
 half-cell boundaries. Stages without a known total animate a cyan-to-gray
 gradient across all ten cells.
 The `Verify package` stage times signed metadata authentication before model
-loading. `--verify-weights` adds a timed `Verify stored data` stage after publisher
-acceptance. Executable resources are verified as part of kernel and graph
+loading. After publisher acceptance, payload packages show `Verify stored data`
+for the mandatory frontend and module-global checks. `--verify-weights` includes
+allocation initializer payloads and shared or rank-sharded embedding-table planes
+in that scan. Ordinary loading validates signed table descriptors and file
+bounds without scanning table contents.
+Distinct payloads are hashed by up to eight workers with bounded buffers and
+byte progress. Executable resources are verified as part of kernel and graph
 preparation.
 Memory loading advances by bytes; kernel and execution preparation
 advance by resource counts. Stages with no known total show a cycling bar.
@@ -1004,6 +1108,13 @@ Shutdown restores the terminal after draining active execution.
 
 ### 5.3 `flare inspect`
 
+`flare inspect` and `flare models inspect` share the same arguments and inspection
+implementation. The target accepts a local package path, `MODEL@VERSION`, or a
+model identity selecting its default version. Model selection uses `--model-cache`
+or configured model storage and holds a lease until inspection finishes. Existing
+paths take precedence over model selectors, including paths containing `@`;
+absolute paths and paths prefixed with `./` or `../` are always treated as paths.
+
 Print a compact model summary: identity and publisher verification, architecture,
 served names, context and execution capacities, cache history kinds, speculation,
 sampling defaults and request ranges, and per-rank fixed memory and graph counts.
@@ -1012,9 +1123,16 @@ The command verifies the signed index using embedded publisher profiles, profile
 provided with `--publisher-keys` (development packages default to
 `~/.config/flare/development-publisher.json`), and remembered trust-store keys.
 It opens referenced companion files to check their layout, but reads no stored
-weights, decrypts no executables, initializes no GPU, and requests no license
+weights, decodes no executables, initializes no GPU, and requests no license
 acceptance. Verification uses no network access. `--rank N` selects one rank of a
 multi-host package, including a copy holding only that rank's payloads.
+
+A payload package may contain several tensor-parallel deployments.
+`--tensor-parallel N` selects one by its authenticated prepared size. With no
+selector, a single-deployment package remains the default and a package with
+several deployments fails with the available sizes. An absent size lists the
+available sizes; a duplicated size fails rather than choosing one. `--rank`
+selects a rank within the chosen deployment.
 
 Detail flags are additive:
 
@@ -1047,9 +1165,12 @@ from physical backing, which serving selects at load time.
 
 `--unverified` reads only the bounded primary-file metadata, without requiring a
 publisher key, verifying signatures, or opening companion files. Output explicitly
-labels this mode unverified. It accepts the same section flags, JSON output, and
-rank selection. `--publisher-keys` and `--trust-store` cannot be combined with it.
-Inspection supports model index versions 4 and 5 without re-export.
+labels this mode unverified. It accepts the same section flags, JSON output, rank
+selection, and tensor-parallel selection. The latter filters the decoded catalog
+to the selected deployment and reports `selected_tensor_parallel` and the filtered
+`rank_count`; a missing or duplicated size is an error. `--publisher-keys` and
+`--trust-store` cannot be combined with it. Inspection accepts payload format version 2, including compressed executable
+resources, and old-layout internal `ProtectedIndex` envelope 6.
 
 ## 6. Capacity errors
 
@@ -1219,3 +1340,64 @@ Cross-node tensor parallelism across supported hosts is in scope. The
 `flare orbit` commands and `flare agent` own host discovery, pairing, package
 distribution, and rank process management. `flare run` executes its assigned
 rank. See [Orbit](orbit.md) and [multi-host serving](multi-host.md).
+
+## Local model management
+
+`flare models` manages the prepared-model cache selected by the global
+`--model-cache PATH` flag, which resolves exactly as `HubOptions.model_cache`
+does: an explicit path wins, then `paths.package_cache` from
+`~/.config/flare/config.toml`, then `~/.cache/flare/packages`.
+
+```sh
+flare models list [MODEL] [--json]
+flare models inspect PACKAGE|MODEL[@VERSION] [inspection flags]
+flare models download REPOSITORY [download flags]
+flare models select MODEL@VERSION
+flare models remove MODEL@VERSION [--clear-default]
+flare models gc [--json]
+```
+
+`flare models download` is an alias for `flare download`, with identical flags,
+configuration precedence, acquisition behavior, and package-path output.
+
+Entries are immutable directory-form packages. `select` writes the model's
+default ref atomically and refuses an entry that is not published. `remove`
+refuses an entry that any process leases and refuses the selected default unless
+`--clear-default` is given; it never replaces the default with another entry
+silently. `gc` runs the cache's collection pass: it removes abandoned staging
+trees, unreferenced payload objects, and unreferenced legacy containers. It does
+not evict published entries, selected refs, or leased objects. A failed export
+leaves only an abandoned staging tree, which `gc` reclaims; an entry that was
+already published under `models/` is removed only by `models remove`. There is no
+automatic reclamation of published entries.
+
+Human-readable output groups versions by model, marks the selected default and
+entries in use, and formats storage sizes in binary units and capacities with
+digit separators. `--plain` disables terminal styling for every `models`
+subcommand; redirected output is unstyled. `--json` retains exact byte counts
+and structured fields. `inspect` uses the package inspection presentation.
+
+`list` reports each model, its versions, the selected default, per-deployment
+tensor-parallel size and serving capacities, and distinct storage figures:
+
+- `logical_bytes` is the sum of unique payload lengths named by the signed
+  manifests. It is not disk usage and is never reclaimable by deleting the cache.
+- `disk_logical_bytes` sums apparent file sizes of unique inodes in the entry
+  tree, so hard links are not double-counted.
+- `disk_physical_bytes` sums allocated blocks (`st_blocks * 512`) of those same
+  inodes, which is what the filesystem actually holds.
+- `shared_logical_bytes` and `shared_physical_bytes` count inodes with more than
+  one link. The filesystem cannot distinguish cache-internal sharing from
+  external hard links, so both are reported as shared rather than reclaimable.
+- `reclaimable_bytes` is reported only when it can be attributed: the entry is
+  not the selected default, nothing leases it, and its single-linked inodes can
+  be freed by removing the entry. Otherwise it is `null` with a
+  `reclaimable_note` explaining why. `--json` preserves the same fields.
+
+`list` metadata is explicitly unverified: it decodes the manifest to report
+identity, deployments, and capacities without claiming authentication.
+`inspect` resolves `MODEL[@VERSION]` to the selected version while holding its
+lease and then runs the normal package inspection path, so
+`--json`, `--unverified`, `--publisher-keys`, `--trust-store`, `--rank`,
+`--tensor-parallel`, and the section flags keep their established semantics. It does not gain a separate
+verification path.

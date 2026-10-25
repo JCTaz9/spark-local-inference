@@ -20,6 +20,7 @@ import fcntl
 import json
 import os
 import pickle
+import contextlib
 import secrets
 import select
 import socket
@@ -428,10 +429,12 @@ class HostRankGroup:
     def manifest(self):
         return self.model.manifest()
 
-    def export(self, path, *, options, export_id, images, storage, publisher, progress=None, shard_size=64 << 30):
+    def export(self, path, *, options, export_id, images, storage, publisher, progress=None,
+               form='directory', staging=None):
         """Combine rank manifests, receiving only content absent from the coordinator cache."""
         import flare_heliopause
-        from .package_snapshot import _OPTIONS, ExportOptions, export_options
+        from ignition.progress import phase
+        from .package_snapshot import _OPTIONS, export_options
         from .package_file import combine
         from .runtime_package import export_model
         from .memory_inventory import print_inventory
@@ -442,11 +445,17 @@ class HostRankGroup:
             raise ValueError("final model publication requires a signing publisher")
         if self.checkpoint_fabric is None:
             raise RuntimeError("multi-host export requires established checkpoint fabric channels")
-        settings = _OPTIONS.get() or ExportOptions(Path(path).parent / ".flare-cache")
-        native_stage = flare_heliopause.NativeExportStage(Path(path))
+        # Export always needs the configured package cache; fail before creating a
+        # workspace or commanding peers rather than degrading to an unusable path.
+        settings = _OPTIONS.get()
+        if settings is None:
+            raise RuntimeError("export requires the configured package cache")
+        cache_only = path is None
+        native_stage = flare_heliopause.NativeExportStage(
+            None if cache_only else Path(path), staging, settings.cache)
         try:
-            stage = Path(native_stage.path)
-            roots = [stage / f"rank-{rank}.json" for rank in range(self.rendezvous.world)]
+            roots = [Path(native_stage.rank_path(rank))
+                     for rank in range(self.rendezvous.world)]
             for control in self.controls:
                 send_object(control, ("export", options))
             with export_options(settings.cache, no_weights=settings.no_weights):
@@ -461,7 +470,7 @@ class HostRankGroup:
                 try:
                     received = json.loads(flare_heliopause.export_receive_ranks(
                         json.dumps(requests), settings.cache, settings.no_weights,
-                        (self.controls, channels, self.checkpoint_fabric)))
+                        (self.controls, channels, self.checkpoint_fabric), native_stage))
                     for rank_channels, result in zip(channels, received, strict=True):
                         _restore_export_channels(rank_channels, result["channels"])
                 finally:
@@ -473,14 +482,23 @@ class HostRankGroup:
                         progress(f"received rank {rank} export: {report['payload_bytes'] / (1 << 30):.2f} GiB "
                                  f"via {report['transport']} ({report['streams']} streams, "
                                  f"{report['payload_seconds']:.2f}s, {report['payload_gbps']:.2f} Gbit/s)")
-                self.close()
-                for region in storage.host_regions:
-                    region.close()
-                combine(path, roots, [], publisher=publisher, shard_size=shard_size,
-                        cluster=(self.rendezvous.world, export_id))
+                # Rank zero's cache objects must outlive the prepared model: retain
+                # them before closing it and before peers close.
+                with phase(progress, "Release preparation resources"):
+                    native_stage.retain_sources([roots[0]])
+                    self.close()
+                    for region in storage.host_regions:
+                        region.close()
+                # The stage retains the received and local cache-object leases, so
+                # `combine` still sees them after peer processes exit.
+                result = combine(None if cache_only else path, roots, [], publisher=publisher,
+                                 cluster=(self.rendezvous.world, export_id), form=form,
+                                 cache_only=cache_only)
             print_inventory(inventories, console=getattr(progress, "console", None))
         finally:
-            native_stage.close()
+            with phase(progress, "Clear export staging"):
+                native_stage.close()
+        return result
 
     def start_server(self, *, bind="127.0.0.1:8000", template_defaults=None, options=None):
         if self._started or self._closed:
@@ -646,12 +664,13 @@ def serve_peer(control, executor, rank, world, *, hub_cache, progress=None, expo
 
             _, options = command
             native_stage = flare_heliopause.NativeExportStage(
-                Path(export_staging or ".") / f"rank-{rank}-{secrets.token_hex(8)}.json", export_staging)
+                None, export_staging, package_cache)
             try:
-                path = Path(native_stage.path) / f"rank-{rank}.json"
+                path = Path(native_stage.rank_path(rank))
                 if progress is not None:
                     progress(f"exporting rank {rank}")
-                with export_options(package_cache or Path.home() / ".cache/flare/packages"):
+                context = export_options(package_cache) if package_cache is not None else contextlib.nullcontext()
+                with context:
                     package = export_model(model, recorder, storage, path, options=options,
                                            bundle_only=True, sources=True)
                 send_export_sources(control, package, package.memory_inventory,

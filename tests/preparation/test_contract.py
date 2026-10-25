@@ -26,11 +26,16 @@ def test_recipe_declares_sources_storage_cursors_and_frontend(recipe, page, lag,
     contract = module.prepare(signatures, {"page_tables": None, "draft_page_tables": None}, pool,
         page_tokens=page, draft_lag=lag, rows=rows)
     encoded = ParseDict(contract, p.ModelContract())
-    assert encoded.version == 1 and encoded.input_vocabulary >= encoded.vocabulary
+    assert encoded.version == 2 and encoded.input_vocabulary >= encoded.vocabulary
     assert "schema" not in contract
+    for operation in (p.INIT, p.RESTORE):
+        producer = next(graph for graph in encoded.graphs if graph.kind == operation)
+        assert not producer.HasField("pending_token")
+        assert any(state.view.buffer == "request_pending_token" and state.access == p.WRITE
+                   for state in producer.state)
     decode = next(g for g in encoded.graphs if g.kind == p.DECODE)
-    assert decode.HasField("pending_token") == (recipe == "qwen38")
-    assert any(b.source == p.PENDING_TOKEN for b in decode.inputs) == (recipe != "qwen38")
+    assert decode.HasField("pending_token")
+    assert all(b.source != p.PENDING_TOKEN for b in decode.inputs)
     speculative = next(g for g in encoded.graphs if g.kind == p.SPECULATIVE)
     assert speculative.draft_cursor.lag_tokens == lag
     assert speculative.state_rows_per_request == (4 if rows is None else rows)
@@ -87,36 +92,14 @@ def test_history_plane_registers_actual_row_geometry():
     assert region["storage"] == dict(buffer="keys", offset=0, stride=1536, nbytes=1536)
 
 
-@pytest.mark.parametrize("capacity", [1, 2, 4, 64])
-def test_retained_proposal_views_cover_individual_request_rows(capacity):
-    import torch
-    from ignition.components.split_draft import PreparedProposalStorage
-    from ignition.recipes.deepseek41.contract import prepare
-
-    requests = SimpleNamespace(capacity=capacity, generation=torch.zeros(capacity, dtype=torch.int64), vocab_size=17)
-    storage = PreparedProposalStorage(SimpleNamespace(requests=requests), 7)
-    buffers = dict(storage.buffers(), proposal_confidence=torch.empty((capacity, 7)))
-    pool = SimpleNamespace(pages={}, layout=SimpleNamespace(row_bytes=32,
-        region=lambda name: SimpleNamespace(offset=24, nbytes=8)))
-    signatures = {kind: GraphSignature(kind, capacity, 8 if kind == "proposal" else 1,
-        tuple(c.text_inputs(kind)), speculation_enabled=True) for kind in ("proposal", "verification")}
-    value = ParseDict(prepare(signatures, buffers, pool, page_tokens=128, draft_lag=0, rows=None), p.ModelContract())
-    for graph in value.graphs:
-        views = [s.view for s in graph.state if s.view.buffer.startswith("proposal_")]
-        assert len(views) == len(buffers)
-        for view in views:
-            tensor = buffers[view.buffer]
-            assert view.stride == tensor[0].numel() * tensor.element_size()
-            assert (capacity - 1) * view.stride + view.offset + view.nbytes == tensor.nbytes
-
 
 def test_unknown_packing_fields_do_not_acquire_sources_from_model_identity():
     pool = SimpleNamespace(layout=SimpleNamespace(row_bytes=32, region=lambda _: SimpleNamespace(offset=0, nbytes=8)))
     module = importlib.import_module("ignition.recipes.glm53.contract")
     value = module.prepare({"decode": GraphSignature("decode", 1, 1, ("token_ids", "unused_scratch"))},
         {}, pool, page_tokens=256, draft_lag=None)
-    assert [v["buffer"] for v in value["graphs"][0]["inputs"]] == ["token_ids"]
-    assert value["graphs"][0]["pending_token"] is None
+    assert value["graphs"][0]["inputs"] == []
+    assert value["graphs"][0]["pending_token"]["buffer"] == "request_pending_token"
 
 
 def test_dense_qwen_preserves_device_decode_and_page_storage_in_typed_contract():

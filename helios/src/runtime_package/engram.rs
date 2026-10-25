@@ -76,9 +76,9 @@ fn validate_shards(table: &wire::EngramTable, world: usize) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn decode(
+pub(super) fn decode<F: super::payload::Files>(
     value: wire::Engram,
-    archive: &super::archive::Archive,
+    archive: &F,
     packages: &[Package],
     rank: usize,
     world: usize,

@@ -31,6 +31,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.speculation import SpeculativeRngState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
@@ -75,6 +76,7 @@ def chat_template_asset(hidden_size: int):
 class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     tuning_replica: TuningReplica | None = None
     device: int = 0
     devices: tuple[int, ...] | None = None
@@ -218,7 +220,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if drafting else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage
         collective = prefill_collective = vocabulary_collective = None
@@ -272,7 +274,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers,
+            compile_workers=config.compile_workers, native_dense_activations=config.native_dense_activations,
             tuning_replica=config.tuning_replica,
             device=device,
             checkpoint=identity,
@@ -597,7 +599,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             seen_ids.add(id(res))
             close_resources.append(res)
     return PreparedModel(
-        rebuild_weights={"weights": weights},
+        rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'ple', 'draft'),
+            aliases=(('weights.head', 'weights.embedding'),) if weights.head is weights.embedding else ()),
         device=device_id,
         graphs=graphs,
         buffers=buffers,

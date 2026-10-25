@@ -39,7 +39,7 @@ class CapturedSampler:
         self.slots = torch.arange(rows, device="cuda", dtype=torch.int32)
         self.epochs = torch.ones(rows, device="cuda", dtype=torch.int64)
         self.live = torch.zeros(1, device="cuda", dtype=torch.int32)
-        self.records = torch.full((2, 4, 8), -99, device="cuda", dtype=torch.int64)
+        self.records = torch.full((2, 4, 24), -99, device="cuda", dtype=torch.int64)
         self.frame = torch.zeros(1, device="cuda", dtype=torch.int32)
         self.sequence = torch.ones(1, device="cuda", dtype=torch.int64)
         self.enabled = torch.ones(rows, device="cuda", dtype=torch.int32)
@@ -168,7 +168,7 @@ def test_native_flashinfer_cutoff_ties_and_device_parameter_changes(compile_forw
             torch.testing.assert_close(probabilities.sum(), torch.tensor(1.), rtol=0, atol=2e-6)
             token = records[2, 4].item()
             assert token in support
-            assert records[2].tolist() == [1, 101 + iteration, 0, 1, token, RUNNING, 0, 0]
+            assert records[2][..., :8].tolist() == [1, 101 + iteration, 0, 1, token, RUNNING, 0, 0]
             assert owner.state.rng_counter[2].item() == 2**32 + iteration + 1
             counts = owner.state.histogram.cpu()
             assert counts.sum() == 1 and counts[2, token] == 1
@@ -213,8 +213,8 @@ def test_native_flashinfer_rejects_invalid_rows_and_ignores_masked_nan(vocab_siz
         owner.state.grammar_mask[3, 0] = 1 << 7
         records = owner.replay()
         for slot in (0, 1, 2):
-            assert records[slot].tolist() == [1, 1, 0, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
-        assert records[3].tolist() == [1, 1, 0, 1, 7, RUNNING, 0, 0]
+            assert records[slot][..., :8].tolist() == [1, 1, 0, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
+        assert records[3][..., :8].tolist() == [1, 1, 0, 1, 7, RUNNING, 0, 0]
         assert owner.state.rng_counter.cpu().tolist() == [0, 0, 0, 1]
         assert owner.state.histogram.sum().item() == 1
         assert owner.state.histogram[3, 7].item() == 1
@@ -230,7 +230,7 @@ def test_native_flashinfer_rejects_invalid_rows_and_ignores_masked_nan(vocab_siz
         owner.live.fill_(1)
         owner.logits[0].fill_(-torch.inf)
         records = owner.replay()
-        assert records[2].tolist() == [1, 1, 0, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
+        assert records[2][..., :8].tolist() == [1, 1, 0, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
         assert owner.state.rng_counter[2].item() == 0
 
 
@@ -243,8 +243,8 @@ def test_native_flashinfer_stale_duplicate_and_disabled_rows_do_not_sample(vocab
         owner.logits[3].fill_(torch.nan)
         before = snapshot(owner.state)
         records = owner.replay()
-        assert records[0].tolist() == [1, 1, 0, 0, -1, ERROR, DUPLICATE_SLOT, 0]
-        assert records[3].tolist() == [1, 1, 0, 0, -1, RUNNING, 0, 0]
+        assert records[0][..., :8].tolist() == [1, 1, 0, 0, -1, ERROR, DUPLICATE_SLOT, 0]
+        assert records[3][..., :8].tolist() == [1, 1, 0, 0, -1, RUNNING, 0, 0]
         assert (records[[1, 2], 4] == -1).all() and records[[1, 2], 5].sum() == 0
         after = snapshot(owner.state)
         for name in before:

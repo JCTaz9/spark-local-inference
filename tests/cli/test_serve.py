@@ -109,16 +109,18 @@ def host(monkeypatch, tmp_path):
     recipe = replace(model.recipe, prepare=prepare, usage=lambda prepared: prepared.usage())
     monkeypatch.setattr(serve, "resolve_model", lambda configuration, name: ResolvedModel(recipe, model.checkpoint))
 
-    def export_model(prepared, images, storage, path, *, options, publisher, progress, console, staging, shard_size):
+    def export_model(prepared, images, storage, path, *, options, publisher, progress, console, staging):
         assert prepared is calls["prepared"] and not prepared.closed
         assert isinstance(images, Scope) and isinstance(storage, Scope)
         assert "api_key" not in options
         calls["publisher"] = publisher
-        calls["shard_size"] = shard_size
         calls["options"] = options
         calls["exports"] += 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"runtime package")
+        from ignition.preparation.package_snapshot import _OPTIONS
+        assert path is None
+        calls["cache"] = _OPTIONS.get().cache
+        calls["entry_path"] = calls["cache"] / "models" / "qwen38" / f"gb202-tp1-test-{calls['exports']}"
+        return types.SimpleNamespace(entry_path=calls["entry_path"])
     monkeypatch.setattr(model_package, "export_package", export_model)
 
     return calls
@@ -361,10 +363,9 @@ def test_serialized_branches_reach_the_plan_and_the_startup_line(host, capsys):
 @pytest.mark.parametrize("mixed", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tmp_path, reserve, mixed, overlap):
-    output = tmp_path / "package"
     config = tmp_path / "config.toml"
     config.write_text(f'[memory]\nreserve = "{reserve}"\n')
-    assert main(["export", "qwen3.8-flash", "--output", str(output), "--config", str(config),
+    assert main(["export", "qwen3.8-flash", "--config", str(config),
                  *(["--mixed-prefill"] if mixed else []), *([] if overlap else ["--no-stream-overlap"])]) == 0
     assert host["exports"] == 1 and host["prepared"].started is None
     assert host["plan"].prefill_chunk == 4096 and host["compile_forwards"]
@@ -375,9 +376,7 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["options"]["reserve_bytes"] == reserve
     assert "headroom_bytes" not in host["options"]
     assert host["prepared"].closed
-    assert output.with_suffix(".safetensors").is_file()
-    assert main(["export", "qwen3.8-flash", "--output", str(output)]) == 2
-    assert host["exports"] == 1
+    assert host["cache"] == Configuration.load(config).directory("package_cache")
 
 
 def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch):
@@ -544,40 +543,60 @@ def test_tensor_parallel_export_preserves_rank_selection(host):
     assert [gpu.index for gpu in host["gpus"]] == [0, 1]
 
 
+def test_multihost_export_dispatches_with_configured_cache(host, tmp_path, monkeypatch, capsys):
+    from ignition.preparation.package_snapshot import _OPTIONS
+
+    config = tmp_path / 'export.toml'
+    cache = tmp_path / 'prepared-models'
+    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    entry = cache / 'models' / 'qwen38' / 'gb202-tp2-test'
+    calls = []
+
+    def export_hosts(args):
+        calls.append((args.ranks, args.rendezvous, _OPTIONS.get().cache))
+        return 0, types.SimpleNamespace(entry_path=entry)
+
+    monkeypatch.setattr(serve, '_export_hosts', export_hosts)
+    assert main(['export', 'qwen3.8-flash', '--ranks', '2', '--rendezvous', '127.0.0.1:29630',
+                 '--config', str(config)]) == 0
+    assert calls == [(2, '127.0.0.1:29630', cache)]
+    assert f'Exported cache entry: {entry}' in capsys.readouterr().out
+    assert _OPTIONS.get() is None
+
+
 @pytest.mark.parametrize('command', ['export', 'serve'])
 def test_local_tuning_gpus_cannot_change_multihost_sharding(tmp_path, capsys, command):
     arguments = [command, 'qwen3.8-flash', '--ranks', '2', '--tuning-gpus', '0,1']
-    if command == 'export':
-        arguments += ['--output', str(tmp_path / 'unused.safetensors')]
     assert main(arguments) != 0
     assert 'multi-host ranks retain their sharding' in capsys.readouterr().err
 
 
-def test_shard_policy_reaches_export(host):
+def test_export_rejects_size_sharding(host):
     assert export("qwen3.8-flash") == 0
-    assert host["shard_size"] == 64 << 30
-    assert export("qwen3.8-flash", "--shard-size", "32G") == 0
-    assert host["shard_size"] == 32 << 30
-    assert host["exports"] == 2
-    assert export("qwen3.8-flash", "--shard-size", "65536M") == 0
-    assert host["shard_size"] == 64 << 30 and host["exports"] == 3
+    with pytest.raises(SystemExit) as error:
+        export("qwen3.8-flash", "--shard-size", "32G")
+    assert error.value.code == 2
+    assert host["exports"] == 1
 
 
-def test_export_defaults_to_local_recipe_namespace_and_honors_repository(host, capsys):
-    assert main(['export', 'qwen3.8-flash']) == 0
-    cache = Configuration.load().directory('package_cache')
-    snapshots = list((cache / 'models--qwen38' / 'snapshots').glob('*/model.safetensors'))
-    assert len(snapshots) == 1 and snapshots[0].is_file()
-    assert 'Hugging Face target:' not in capsys.readouterr().out
+def test_export_reports_cache_entry_and_repository(host, tmp_path, capsys):
+    config = tmp_path / 'export.toml'
+    cache = tmp_path / 'prepared-models'
+    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    assert main(['export', 'qwen3.8-flash', '--config', str(config)]) == 0
+    assert host['cache'] == cache
+    output = capsys.readouterr().out
+    assert f"Exported cache entry: {host['entry_path']}" in output
+    assert 'Hugging Face target:' not in output
     assert main(['export', 'qwen3.8-flash', '--repo-id', 'example/custom']) == 0
-    assert len(list((cache / 'models--example--custom' / 'snapshots').glob('*/model.safetensors'))) == 1
+    assert 'Hugging Face target: example/custom' in capsys.readouterr().out
 
 
 def test_no_weights_requires_cache_before_preparation(host, tmp_path, capsys):
     assert main(['export', 'qwen3.8-flash', '--no-weights']) == 2
     assert host['exports'] == 0 and 'plan' not in host
     assert 'existing blob cache' in capsys.readouterr().err
-    assert main(['export', 'qwen3.8-flash', '--repo-id', '../escape', '--output', str(tmp_path / 'output')]) == 2
+    assert main(['export', 'qwen3.8-flash', '--repo-id', '../escape']) == 2
     assert host['exports'] == 0
 
 
@@ -588,3 +607,12 @@ def test_autotune_effort_reaches_plan_and_startup_line(host, capsys, monkeypatch
     assert host["plan"].autotune_effort == effort
     assert host["plan"].to_dict()["autotune_effort"] == effort
     assert f"autotune effort {effort}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_native_dense_activations_reach_plan(host, monkeypatch, native):
+    monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
+    flags = ["--native-dense-activations"] if native else []
+    assert main(["serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
+    assert host["plan"].native_dense_activations is native
+    assert host["plan"].to_dict()["native_dense_activations"] is native

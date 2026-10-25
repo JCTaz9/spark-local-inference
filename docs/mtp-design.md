@@ -5,7 +5,7 @@ Flare's speculative engine supports the embedded MTP modules in
 `local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD`, and the DSpark drafter in
 `deepseek-ai/DeepSeek-V4.1-Flash` on SM120/121. Python prepares
 weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
-graphs. Acceptance and token feedback remain on the device. Speculative serving uses a versioned token-vector completion contract.
+graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI4 token-vector completion contract.
 Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
 select the draft-token maximum and default verification policy.
 `flare run PACKAGE --history-drafts` augments Qwen's learned MTP proposals
@@ -13,8 +13,7 @@ with continuations from shared decoded history. `--no-history-drafts` disables
 that augmentation. History drafting defaults to off and is selected at startup;
 Ignition exports no history preference. Both settings use the same captured
 MTP graphs and buffers. Development native `ignition serve` accepts the same
-options. Existing packages retain their recorded defaults unless overridden;
-existing copy-only packages remain loadable.
+options.
 
 With copying enabled, each loaded model retains the most recent 65,536 committed
 generated tokens across requests in a host-memory ring. Exact eight-token and four-token indexes
@@ -160,15 +159,19 @@ target execution; Helios delivers the requested rows through the shared embeddin
 table interface.
 
 DSpark uses the shared token-vector completion and adaptive verification contracts.
-Ignition captures verification widths one through six by default for every batch capacity;
-Flare can reduce draft count and concurrency when loading. Helios schedules and
-replays the selected graphs without interpreting DSpark layers or proposals.
-Every retained or packed proposal producer executes the full configured draft
-block. Cohort and verification-budget selection use historical joint prefix survival
-from the DSpark confidence head and measured proposal-plus-verification cost. After
-proposal completion, fresh confidence drives causal prefix selection using
-costs, service prices, and historical continuations frozen before submission.
-Verification outcomes remain separate from these confidence forecasts.
+The default catalog captures confidence-producing rounds with seven draft draws
+(`D=7`) and verification width eight (`W=8`), plus zero-draft width-one
+continuations (`D=0`, `W=1`). Each descriptor declares batch capacity `B`, draft
+depth `D`, verification width `W`, and physical target capacity `P` independently;
+packed targets may use fewer than `B*W` rows. Selecting a lower positive draft
+depth requires a captured producer at that depth; loading never relabels its `D`.
+A confidence-producing speculative operation captures proposal generation,
+fresh-confidence prefix allocation, target verification, and commit in one CUDA graph. The proposal
+backbone executes the full configured block. Before submission, cohort and target
+capacity selection use historical joint prefix survival and measured complete-round
+cost. Inside the graph, fresh confidence selects causal prefixes under the frozen
+host ceilings and physical capacity `P`. Verification outcomes update historical
+survival separately from these confidence forecasts.
 
 ## A speculative round is a state transaction
 
@@ -350,25 +353,33 @@ Masking later iterations of an unrolled draft graph does not automatically
 eliminate their compute. The design requires neither runtime recapture nor
 device-side graph construction.
 
-Speculative execution permits one generation round in flight. Rust consumes its
-completion before selecting the following width, copy continuation or grammar
-mask. CUDA dependencies serialize model work and protect shared scratch. Rust
-reserves the round's maximum possible page/output use before submission. ABI3
-uses two transfer frames of four 24-field `int64` records; each record retains
-the scalar ABI2 prefix and adds emitted/offered/accepted counts, copy-source
-bits, candidate and draft-cache lengths, verification width, and eight padded
-token IDs. A frame cannot be reused until its transfer finishes. Ordinary ABI2
-decode retains its two-submission pipeline. A two-round speculative pipeline
-requires a separate measurement and explicit configuration before deployment.
+Native execution can queue two generation rounds on the ordered model stream.
+Each speculative graph contains proposal generation, optional confidence-based
+prefix allocation, target verification, and accepted-state commit. Captured
+kernels read pending tokens and consumed positions from replicated GPU request
+state after the preceding graph. A matching-generation lane that has finished
+contributes no tokens, RNG advancement, or cache updates to a queued round.
+
+Rust freezes request epochs, page reservations, and CPU query lengths or GPU
+prefix ceilings before submission. CUDA dependencies serialize model work and
+protect shared scratch independently of completion readback. Rust reserves each
+round's maximum page and output extent before submission. ABI4 uses two transfer
+frames, each containing one 24-field `int64` record per prepared request slot.
+Each record contains request
+identity, token counters, terminal status, emitted/offered/accepted counts,
+copy-source bits, draft-cache position, verification width, and eight padded
+token IDs. Confidence, logprob, survival, and readiness outputs use the same
+frame index. A frame remains owned until its transfer and host consumption
+finish. Ordinary decode uses the same two-frame completion contract.
 
 Copy-only grammar rounds clone tentative native grammar states and upload a
 mask for each copied prefix, including the target bonus position. Rust advances
 the committed grammar with only the accepted tokens. MTP proposals are generated
 on the device; grammar-constrained MTP requests use width one until the runtime
 can provide valid masks for those conditional prefixes. Host-evaluated custom
-stops also use width one. Rust acknowledges each pending token before another
-graph consumes it. Prefix publication cannot include unacknowledged continuation
-tokens. One grammar mask reused across draft positions is invalid. Such rounds
+stops also use width one. Graphs consume GPU-owned pending tokens; host
+acknowledgments govern publication and reuse of the resulting continuation.
+Prefix publication cannot include unacknowledged continuation tokens. One grammar mask reused across draft positions is invalid. Such rounds
 remain single in-flight until the native grammar state and uploaded masks are ready.
 Multi-token custom stops similarly require ordered matching across token and
 round boundaries, retaining candidate checkpoints until the selected stopping

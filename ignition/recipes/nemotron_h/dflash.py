@@ -216,9 +216,9 @@ class SpeculativePreparation:
         self.block_size, self.logit_offset = weights.config.draft.block_size, 1
         self.draft_scratch = None
 
-    def begin(self, batch, width):
+    def begin(self, batch, width, target_token_capacity):
         self.cursor = self.buffers.cursor()
-        self.scratch = Scratch.allocate(batch * width, batch * width, self.weights.config, self.cursor)
+        self.scratch = Scratch.allocate(target_token_capacity, batch * width, self.weights.config, self.cursor)
         self.draft_scratch = Scratch.allocate(batch * self.block_size,
             batch * self.block_size, self.weights.config, self.cursor)
 

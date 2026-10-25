@@ -21,10 +21,6 @@ def prepare(signatures, buffers, pool, *, vocabulary, frontend, image_slots=4, d
         for name, tensor in pool.pages.items()]
     graphs = c.graph_contracts(signatures, inputs, continuation=continuation,
         pending=c.state_view("request_pending_token", 8), cursor=cursor)
-    for graph in graphs:
-        if graph["kind"] in (p.PROPOSAL, p.VERIFICATION, p.PACKED_SPECULATIVE):
-            graph["state"].extend(dict(view=c.state_view(name, tensor.stride(0) * tensor.element_size()),
-                access=p.READ_WRITE) for name, tensor in buffers.items() if name.startswith("proposal_"))
     vision = None
     if "vision" in kinds:
         from .vision import FEATURES, PATCH_CAPACITIES

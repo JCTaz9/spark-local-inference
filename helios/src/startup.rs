@@ -163,11 +163,11 @@ impl Phase {
     pub fn advance_bytes(&self, count: u64) {
         let mut state = self.state.lock().unwrap();
         state.completed = state.completed.saturating_add(count);
-        state.detail = format!(
-            "{:.1} / {:.1} GiB",
-            state.completed as f64 / (1u64 << 30) as f64,
-            state.total.unwrap_or(0) as f64 / (1u64 << 30) as f64,
-        );
+        let completed = state.completed as f64 / (1u64 << 30) as f64;
+        state.detail = match state.total {
+            Some(total) => format!("{completed:.1} / {:.1} GiB", total as f64 / (1u64 << 30) as f64),
+            None => format!("{completed:.1} GiB"),
+        };
     }
 
     pub fn detail(&self, detail: impl Into<String>) {

@@ -16,7 +16,7 @@ mod format;
 mod host;
 mod limits;
 mod metadata;
-pub use metadata::unverified_metadata;
+pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
@@ -32,9 +32,10 @@ mod publishers;
 #[cfg(any(test, feature = "test-tools"))]
 pub mod test_support;
 pub use protection::{
-    verify_package_metadata, AuthorizedPackage, PackageClaim, PackageLicense, Publisher,
-    VerifiedPackage,
+    AuthorizedPackage, PackageClaim, PackageLicense, PayloadAuthorizedPackage, PayloadSource,
+    PayloadVerifiedPackage, Publisher, VerifiedPackage, verify_package_metadata,
 };
+use std::path::Path;
 mod selection;
 mod serving;
 #[cfg(test)]
@@ -56,7 +57,6 @@ use crate::{
     BufferSpan, GraphBundle, Result,
     startup::{Phase, StartupProgress},
 };
-use archive::Archive;
 use driver::{
     Access, AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
     MemsetParams, TensorMap,
@@ -111,6 +111,56 @@ fn clamp_cooperative_grid(mut grid: [u32; 3], capacity: u64) -> Result<[u32; 3]>
     Ok(grid)
 }
 
+/// An accepted package from either on-disk format, ready for a loader entry point.
+pub enum ModelPackage {
+    Legacy(AuthorizedPackage),
+    Payload(PayloadAuthorizedPackage),
+}
+
+impl ModelPackage {
+    /// Open and authorize a package, selecting the deployment and rank to serve.
+    pub fn open(
+        path: &Path,
+        publishers: &[Publisher],
+        selection: crate::package::protection::Selection,
+        accepted: &str,
+        verify_weights: bool,
+    ) -> Result<Self> {
+        match NativeResources::package_format(path)? {
+            PackageFormat::Payload => {
+                let verified = PayloadVerifiedPackage::open(path, publishers, selection)?;
+                Ok(Self::Payload(verified.authorize(accepted, verify_weights)?))
+            }
+            PackageFormat::Legacy => {
+                let rank = match selection {
+                    crate::package::protection::Selection::Deployment {
+                        rank: Some(rank), ..
+                    } => rank as usize,
+                    _ => 0,
+                };
+                let verified = VerifiedPackage::open(path, publishers, Some(rank))?;
+                Ok(Self::Legacy(verified.authorize(accepted, verify_weights)?))
+            }
+        }
+    }
+}
+
+/// On-disk prepared-package formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageFormat {
+    /// Signed format-6 logical-resource packages read through the archive.
+    Legacy,
+    /// Payload-identity packages read through pinned payload containers.
+    Payload,
+}
+
+fn payload_selection(deployment: usize, rank: u32) -> crate::package::protection::Selection {
+    crate::package::protection::Selection::Deployment {
+        deployment,
+        rank: Some(rank),
+    }
+}
+
 impl NativeResources {
     /// Load compiled code and persistent storage, then bind and instantiate graphs.
     ///
@@ -120,16 +170,124 @@ impl NativeResources {
     /// Cooperative kernels must tolerate fewer worker CTAs in the largest grid dimension.
     /// This method makes the owner's context current on the calling thread.
     pub unsafe fn load(authorized: AuthorizedPackage, ordinal: i32) -> Result<Self> {
-        let AuthorizedPackage { archive, mut index } = authorized;
+        let (archive, mut index) = match authorized.kind {
+            protection::AuthorizedKind::Legacy { archive, index } => (archive, index),
+            protection::AuthorizedKind::Payload(payload) => {
+                if payload.rank_count() != 1 {
+                    return Err(invalid(
+                        "payload package holds several ranks; use the model loader",
+                    ));
+                }
+                return unsafe { payload.load(0, ordinal) };
+            }
+        };
         if index.ranks.len() != 1 || !index.peer_memory.is_empty() || index.engram.is_some() {
             return Err(invalid("resource loader requires one independent rank"));
         }
         let package = protobuf::decode(index.ranks.remove(0))?;
-        archive.validate(&package)?;
+        unsafe { Self::load_prepared(&archive, package, ordinal) }
+    }
+
+    /// Load an accepted package from either format.
+    ///
+    /// # Safety
+    /// The package must be trusted and the selected device must match its architecture.
+    pub unsafe fn load_any(package: ModelPackage, ordinal: i32) -> Result<Self> {
+        match package {
+            ModelPackage::Legacy(authorized) => unsafe { Self::load(authorized, ordinal) },
+            ModelPackage::Payload(payload) => {
+                if payload.rank_count() != 1 {
+                    return Err(invalid(
+                        "payload package holds several ranks; use the model loader",
+                    ));
+                }
+                unsafe { payload.load(0, ordinal) }
+            }
+        }
+    }
+
+    /// Detect the carrier from the safetensors header before applying its reader.
+    /// Logical-resource and payload readers validate their own framing and metadata.
+    pub fn package_format(path: &Path) -> Result<PackageFormat> {
+        let path = if path.is_dir() {
+            path.join("model.safetensors")
+        } else {
+            path.to_owned()
+        };
+        match crate::package::reader::declared_format(&path)? {
+            Some(format) if format == crate::package::container::PAYLOAD_FORMAT => {
+                Ok(PackageFormat::Payload)
+            }
+            _ => Ok(PackageFormat::Legacy),
+        }
+    }
+
+    /// Load one rank of the selected deployment from either format.
+    ///
+    /// Each carrier authenticates the selected rank and validates its prepared
+    /// execution contract before replay.
+    ///
+    /// # Safety
+    /// The package must be trusted and the selected device must match its architecture.
+    pub unsafe fn load_selected(
+        path: &Path,
+        publishers: &[Publisher],
+        selection: crate::package::protection::Selection,
+        accepted: &str,
+        verify_weights: bool,
+        ordinal: i32,
+    ) -> Result<Self> {
+        match Self::package_format(path)? {
+            PackageFormat::Payload => {
+                let selected = match selection {
+                    crate::package::protection::Selection::Deployment {
+                        deployment,
+                        rank: Some(rank),
+                    } => payload_selection(deployment, rank),
+                    crate::package::protection::Selection::Deployment { rank: None, .. } => {
+                        return Err(invalid(
+                            "loading one rank requires a selected rank; use the model loader",
+                        ));
+                    }
+                    crate::package::protection::Selection::Catalog => {
+                        return Err(invalid("catalog verification cannot be loaded"));
+                    }
+                };
+                let package =
+                    ModelPackage::open(path, publishers, selected, accepted, verify_weights)?;
+                unsafe { Self::load_any(package, ordinal) }
+            }
+            PackageFormat::Legacy => {
+                let rank = match selection {
+                    crate::package::protection::Selection::Deployment {
+                        rank: Some(rank), ..
+                    } => rank as usize,
+                    _ => 0,
+                };
+                let verified = VerifiedPackage::open(path, publishers, Some(rank))?;
+                let authorized = verified.authorize(accepted, verify_weights)?;
+                unsafe { Self::load(authorized, ordinal) }
+            }
+        }
+    }
+
+    /// Load one already-adapted rank description from files the caller opened and pinned.
+    ///
+    /// This is the payload-format entry point: the description came from an authenticated package
+    /// body, and every resource key resolves inside one of the caller's containers.
+    ///
+    /// # Safety
+    /// The package must be trusted and obey the CUDA execution contract, and the files it reads
+    /// must stay open for the returned owner's lifetime.
+    pub(in crate::runtime_package) unsafe fn load_prepared<F: payload::Files>(
+        files: &F,
+        package: Package,
+        ordinal: i32,
+    ) -> Result<Self> {
         package.validate()?;
         if package.allocations.iter().any(|a| a.sizing.is_some()) {
             return Err(invalid(
-                "runtime-sized storage requires a model memory plan",
+                "runtime-sized storage requires a memory model plan",
             ));
         }
         let phase = StartupProgress::silent().phase("Load model", None);
@@ -137,9 +295,9 @@ impl NativeResources {
         unsafe {
             owner.reserve(&package)?;
             owner.allocate(&package, &phase)?;
-            owner.load_payload(&archive, &package, &phase, 1)?;
-            owner.prepare_kernels(&archive, &package, &phase)?;
-            owner.prepare_graphs(&archive, &package, &phase)?;
+            owner.load_payload(files, &package, &phase, 1)?;
+            owner.prepare_kernels(files, &package, &phase)?;
+            owner.prepare_graphs(files, &package, &phase)?;
         }
         phase.finish("");
         Ok(owner)
@@ -191,16 +349,30 @@ impl NativeResources {
                 #[cfg(windows)]
                 host_mappings: Vec::new(),
             };
-            for [limit, value] in &package.context.limits {
+            let configured = (|| -> Result<()> {
+                for [limit, value] in &package.context.limits {
+                    owner.driver.check(
+                        "cuCtxSetLimit",
+                        (owner.driver.context_limit)(*limit as i32, *value),
+                    )?;
+                }
                 owner.driver.check(
-                    "cuCtxSetLimit",
-                    (owner.driver.context_limit)(*limit as i32, *value),
-                )?;
+                    "cuCtxSetCacheConfig",
+                    (owner.driver.context_cache)(package.context.cache),
+                )
+            })();
+            // Creation pushes the context; later operations bind it without
+            // retaining creation-stack entries that could outlive the owner.
+            let mut popped = null_mut();
+            let restored = owner.driver.check(
+                "cuCtxPopCurrent_v2",
+                (owner.driver.context_pop)(&mut popped),
+            );
+            configured?;
+            restored?;
+            if popped != owner.context {
+                return Err(invalid("CUDA context creation stack differs from its owner"));
             }
-            owner.driver.check(
-                "cuCtxSetCacheConfig",
-                (owner.driver.context_cache)(package.context.cache),
-            )?;
             Ok(owner)
         }
     }
@@ -452,9 +624,9 @@ impl NativeResources {
         Ok(())
     }
 
-    unsafe fn load_payload(
+    unsafe fn load_payload<F: payload::Files>(
         &mut self,
-        archive: &Archive,
+        files: &F,
         package: &Package,
         phase: &Phase,
         ranks: usize,
@@ -462,7 +634,7 @@ impl NativeResources {
         let driver = self.driver.clone();
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
-            payload::load(self, archive, package, phase, ranks)?;
+            payload::load(self, files, package, phase, ranks)?;
             for allocation in &package.allocations {
                 for relocation in &allocation.relocations {
                     let address =
@@ -483,9 +655,9 @@ impl NativeResources {
         Ok(())
     }
 
-    unsafe fn prepare_kernels(
+    unsafe fn prepare_kernels<F: payload::Files>(
         &mut self,
-        archive: &Archive,
+        files: &F,
         package: &Package,
         phase: &Phase,
     ) -> Result<()> {
@@ -494,7 +666,7 @@ impl NativeResources {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
             let mut modules = HashMap::new();
             for module in &package.modules {
-                let image = archive.read(package, &module.file)?;
+                let image = files.read(package, &module.file)?;
                 if !image.starts_with(b"\x7fELF") {
                     return Err(invalid("module image is not a compiled cubin"));
                 }
@@ -512,7 +684,7 @@ impl NativeResources {
                         "cuModuleGetGlobal_v2",
                         (driver.module_global)(&mut address, &mut size, handle, symbol.as_ptr()),
                     )?;
-                    let mut contents = archive.read(package, &global.file)?;
+                    let mut contents = files.read(package, &global.file)?;
                     if size != global.nbytes || contents.len() != size {
                         return Err(invalid(format!(
                             "module global size mismatch for {}",
@@ -574,9 +746,9 @@ impl NativeResources {
         Ok(())
     }
 
-    unsafe fn prepare_graphs(
+    unsafe fn prepare_graphs<F: payload::Files>(
         &mut self,
-        archive: &Archive,
+        files: &F,
         package: &Package,
         phase: &Phase,
     ) -> Result<()> {
@@ -602,7 +774,7 @@ impl NativeResources {
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
                 self.templates.push(handle);
                 let mut nodes = Vec::with_capacity(graph.node_count);
-                let mut records = archive.records(package, &graph.resource)?;
+                let mut records = files.records(package, &graph.resource)?;
                 for _ in 0..graph.node_count {
                     let node = protobuf::node(records.read()?)?;
                     package.validate_node(&node)?;

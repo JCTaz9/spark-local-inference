@@ -30,7 +30,8 @@ def test_serve_exact_budget_preserves_full_proposal_and_reaches_every_rank(monke
     from ignition.preparation import rank_group
     from ignition.preparation.rebuild_manifest import from_plan
 
-    args, model, plan = plan_for("--mtp-verification-token-budget", "8", policy=policy)
+    args, model, plan = plan_for("--mtp-verification-token-budget", "8",
+        "--draft-head-quantization", "mxfp8", policy=policy)
     assert plan.speculation.draft_tokens == 7 and plan.speculation.adaptive
     assert plan.to_dict()["speculation"]["verification_token_budget"] == 8
     assert "exact verification budget 8 tokens" in display.speculation(plan.speculation)
@@ -46,6 +47,11 @@ def test_serve_exact_budget_preserves_full_proposal_and_reaches_every_rank(monke
         assert peer.speculative_shapes == ((1, 1),)
         assert peer.draft_tokens == 7 and peer.decode_tokens == 8
         assert peer.prefill_chunk_size == 4096
+        assert peer.mla_compute_mode == "bf16"
+        assert peer.attention_projection_policy == policy
+        assert peer.draft_head_quantization == "mxfp8"
+        assert peer.markov_head_quantization is None
+        assert peer.stream_overlap and not peer.native_dense_activations
         assert peer.devices == ((0, 0, 0, 0) if remote else (0, 1, 2, 3))
     with pytest.raises(ValueError, match="cannot be exported"):
         from_plan(model, plan, compiled_forwards=True)

@@ -437,8 +437,13 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
             request = dict(control_fd=control_root.fileno(),
                            channels=host_ranks._export_channels([root_channel]),
                            destination=str(destination))
-            flare_heliopause.export_receive_ranks(json.dumps([request]), tmp_path / "cache", False,
-                                                (control_root, root_channel))
+            stage = flare_heliopause.NativeExportStage(None, None, tmp_path / "cache")
+            try:
+                flare_heliopause.export_receive_ranks(
+                    json.dumps([request]), tmp_path / "cache", False,
+                    (control_root, root_channel), stage)
+            finally:
+                stage.close()
         except BaseException as error:
             receiver_errors.append(error)
     receiver = None

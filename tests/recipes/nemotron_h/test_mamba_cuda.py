@@ -107,8 +107,9 @@ def test_checkpoint_mamba_block(tokens):
 
 
 @pytest.mark.parametrize("autotune", [False, True])
+@pytest.mark.parametrize("capacity", [5, 8])
 @torch.no_grad()
-def test_checkpoint_verification_commits_convolution_and_recurrence(autotune):
+def test_checkpoint_verification_commits_convolution_and_recurrence(autotune, capacity):
     from dataclasses import replace
     import triton
     from b12x.preparation import PreparationSession
@@ -136,14 +137,14 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune):
     state.convolution[1:].normal_(std=.1)
     state.recurrent[1:].normal_(std=.1)
     initial = pool.backing.clone()
-    source = torch.randn((8, config.hidden), device="cuda", dtype=torch.bfloat16) * .2
+    source = torch.randn((capacity, config.hidden), device="cuda", dtype=torch.bfloat16) * .2
     rows = torch.ones(1, device="cuda", dtype=torch.int64)
     lengths = torch.ones(1, device="cuda", dtype=torch.int32)
     counts = torch.ones_like(lengths)
     region = pool.layout.region("layer0.convolution")
     offsets = torch.tensor([region.offset // 2], dtype=torch.int64, device="cuda")
     metadata = [DeltaMetadata.allocate(1, "cuda:0") for _ in range(2)]
-    for m, tokens in zip(metadata, (1, 8), strict=True):
+    for m, tokens in zip(metadata, (1, capacity), strict=True):
         m.query_start_loc[1] = tokens
         m.initial_state_indices.fill_(1)
         m.final_state_indices.fill_(1)
@@ -161,11 +162,11 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune):
             mode="decode", session=session, name="decode", workspace=arena, buffers=buffers.cursor())
         verify = PreparedMamba(weights, source, state, metadata[1], config,
             mode="verify", session=session, name="verify", workspace=arena, buffers=buffers.cursor(),
-            replay=replay, records=pool.replay_records(0))
+            replay=replay, records=pool.replay_records(0), verification_width=8)
         arena.finalize()
         expected_outputs, expected_states = [], []
         pool.backing.copy_(initial)
-        for i in range(8):
+        for i in range(capacity):
             expected_outputs.append(decode(source[i:i + 1]).clone())
             expected_states.append((state.convolution[1, :, :3].clone(), state.recurrent[1].clone()))
 
@@ -187,12 +188,18 @@ def test_checkpoint_verification_commits_convolution_and_recurrence(autotune):
         flush()
         session.freeze()
         for length, accepted in ((8, 1), (8, 3), (8, 8), (5, 2), (5, 5)):
+            if length > capacity:
+                continue
             pool.backing.copy_(initial)
             counts.fill_(accepted)
             lengths.fill_(length)
             metadata[1].query_start_loc[1] = length
             metadata[1].num_tokens.fill_(length)
+            torch.cuda.synchronize()
+            allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
             graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
             flush()
             expected = torch.cat(expected_outputs[:length])
             assert (actual[:length].float() - expected.float()).norm() / expected.float().norm() < .015

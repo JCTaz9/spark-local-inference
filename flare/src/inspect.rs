@@ -3,7 +3,8 @@
 use std::{fmt::Write as _, io::IsTerminal};
 
 use flare_helios::runtime_package::{
-    InspectionOptions, PackageClaim, VerifiedPackage, unverified_metadata,
+    InspectionOptions, NativeResources, PackageClaim, PackageFormat, VerifiedPackage,
+    unverified_metadata_selected,
 };
 use serde_json::Value;
 
@@ -11,7 +12,8 @@ use crate::cli::Inspect;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub fn run(args: Inspect) -> Result<()> {
+pub fn run(mut args: Inspect) -> Result<()> {
+    let _entry = resolve_package(&mut args)?;
     let options = InspectionOptions {
         memory_map: args.memory_map,
         graphs: args.graphs,
@@ -19,13 +21,17 @@ pub fn run(args: Inspect) -> Result<()> {
         all: args.all,
     };
     let mut value = if args.unverified {
-        unverified_metadata(&args.package, options, args.rank)?
+        unverified_metadata_selected(&args.package, options, args.rank, args.tensor_parallel)?
     } else {
         verified(&args, options)?
     };
     value["package"]["path"] = Value::String(args.package.display().to_string());
     if args.json {
         println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    if args.unverified && value["package"]["format"] == "payload" {
+        print!("{}", render_payload(&value, Canvas::terminal(args.plain)));
         return Ok(());
     }
     let stdout = std::io::stdout();
@@ -38,6 +44,20 @@ pub fn run(args: Inspect) -> Result<()> {
     };
     print!("{}", render(&value, width, color));
     Ok(())
+}
+
+fn resolve_package(args: &mut Inspect) -> Result<Option<flare_helios::package::cache::Entry>> {
+    if crate::cache_support::explicit_package_path(&args.package).map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+    let root = flare_helios::package::cache::Root::open(
+        crate::cache_support::model_root(args.model_cache.as_deref()).map_err(|error| error.to_string())?,
+    )?;
+    let (entry, _) = crate::cache_support::local_model(&root, &args.package)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("model {} is not available in local model storage", args.package.display()))?;
+    args.package = root.primary(&entry)?;
+    Ok(Some(entry))
 }
 
 fn verified(args: &Inspect, options: InspectionOptions) -> Result<Value> {
@@ -58,19 +78,36 @@ fn verified(args: &Inspect, options: InspectionOptions) -> Result<Value> {
             profiles.push(profile);
         }
     }
-    let package = VerifiedPackage::open(&root, &profiles, args.rank).map_err(
-        |error| -> Box<dyn std::error::Error> {
-            if error.to_string().contains("unknown package publisher") {
-                return format!(
-                    "cannot verify signing key {}: no embedded, remembered, or --publisher-keys \
-                     profile names it (publisher {} at {})",
-                    claim.signer, claim.namespace, claim.official_source
-                )
-                .into();
+    let package = match args.tensor_parallel {
+        Some(tensor_parallel) => {
+            if NativeResources::package_format(&root).map_err(|error| error.to_string())?
+                != PackageFormat::Payload
+            {
+                return Err(
+                    "--tensor-parallel applies only to payload packages with multiple deployments"
+                        .into(),
+                );
             }
-            error.into()
-        },
-    )?;
+            let rank = args
+                .rank
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "rank exceeds the package rank domain")?;
+            VerifiedPackage::open_tensor_parallel(&root, &profiles, tensor_parallel, rank)
+        }
+        None => VerifiedPackage::open(&root, &profiles, args.rank),
+    }
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        if error.to_string().contains("unknown package publisher") {
+            return format!(
+                "cannot verify signing key {}: no embedded, remembered, or --publisher-keys \
+                     profile names it (publisher {} at {})",
+                claim.signer, claim.namespace, claim.official_source
+            )
+            .into();
+        }
+        error.into()
+    })?;
     Ok(package.describe(options)?)
 }
 
@@ -156,7 +193,7 @@ fn model_letter(letter: char) -> Option<[&'static str; 5]> {
     })
 }
 
-fn thousands(value: u64) -> String {
+pub(crate) fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut output = String::new();
     for (index, digit) in digits.chars().enumerate() {
@@ -168,7 +205,7 @@ fn thousands(value: u64) -> String {
     output
 }
 
-fn bytes(value: u64) -> String {
+pub(crate) fn bytes(value: u64) -> String {
     const KIB: f64 = 1024.0;
     let v = value as f64;
     if v >= KIB * KIB * KIB {
@@ -204,7 +241,7 @@ fn decimal(value: f64) -> String {
 
 /// A value as text, with control characters shown as escapes so a token such as a marker
 /// ending in a newline stays on its row.
-fn text(value: &Value) -> String {
+pub(crate) fn text(value: &Value) -> String {
     let raw = match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -225,6 +262,101 @@ fn text(value: &Value) -> String {
     output
 }
 
+/// Deliberate plain rendering for payload-format metadata: per-deployment capacities and native
+/// per-rank graph/allocation sections, with no invented single-model values.
+fn render_payload(value: &Value, mut canvas: Canvas) -> String {
+    let model = &value["model"];
+    canvas.heading(&text(&model["identity"]));
+    canvas.row("Package", &text(&value["package"]["path"]));
+    canvas.row("Format", "payload");
+    canvas.row("Signatures", if value["package"]["signatures_verified"].as_bool() == Some(true) {
+        "verified"
+    } else {
+        "unverified"
+    });
+    if let Some(publisher) = value["package"]["publisher"].as_object() {
+        canvas.row("Publisher", &text(&publisher["namespace"]));
+        canvas.row("Source", &text(&publisher["official_source"]));
+    }
+    canvas.row("Hardware", &text(&model["hardware"]));
+    let number = |v: &Value| v.as_u64().map_or_else(|| "—".into(), thousands);
+    for deployment in value["deployments"].as_array().into_iter().flatten() {
+        canvas.heading(&format!("Deployment {}", text(&deployment["id"])));
+        canvas.row("Tensor parallel", &number(&deployment["tensor_parallel"]));
+        canvas.row("Vocabulary", &number(&deployment["vocabulary"]));
+        canvas.row("Context", &format!("{} tokens", number(&deployment["max_sequence_tokens"])));
+        canvas.row("Prefill", &format!("{} tokens", number(&deployment["prefill_chunk_size"])));
+        canvas.row("Concurrency", &format!("{} requests", number(&deployment["max_active"])));
+        if !deployment["frontend"].is_null() {
+            canvas.row("Frontend", &text(&deployment["frontend"]));
+        }
+        if !deployment["vision"].is_null() {
+            canvas.row("Vision", &text(&deployment["vision"]));
+        }
+    }
+    for rank in value["ranks"].as_array().into_iter().flatten() {
+        if let Some(graphs) = rank["graphs"].as_array() {
+            canvas.heading(&format!("Graphs · rank {} · deployment {}", text(&rank["rank"]), text(&rank["deployment"])));
+            for graph in graphs {
+                canvas.row("Graph", &text(&graph["name"]));
+                if graph.get("node_count").is_some() {
+                    canvas.row("Nodes / edges", &format!("{} / {}", number(&graph["node_count"]), number(&graph["edge_count"])));
+                }
+                if let Some(execution) = rank["execution_graphs"].as_array()
+                    .and_then(|graphs| graphs.iter().find(|g| g["name"] == graph["name"])) {
+                    canvas.row("Kind / sampling", &format!("{} / {}", text(&execution["kind"]), text(&execution["sampling_mode"])));
+                    canvas.row("Batch / tokens", &format!("{} / {}", number(&execution["batch_capacity"]), number(&execution["token_capacity"])));
+                    canvas.row("Packed / prefill", &format!("{} / {}", number(&execution["packed_token_capacity"]), number(&execution["prefill_capacity"])));
+                    canvas.row("Duration", &execution["estimated_duration_ns"].as_u64().map_or_else(|| "—".into(), duration));
+                }
+            }
+        }
+        if let Some(allocations) = rank["allocations"].as_array() {
+            canvas.heading(&format!("Memory map · rank {} · deployment {}", text(&rank["rank"]), text(&rank["deployment"])));
+            let rows = allocations.iter().map(|allocation| vec![text(&allocation["name"]), bytes(u64_of(&allocation["nbytes"]))]).collect::<Vec<_>>();
+            canvas.table(&["Allocation", "Size"], &rows);
+            for reservation in rank["reservations"].as_array().into_iter().flatten() {
+                canvas.row("Reservation", &format!("{} · {}", text(&reservation["address"]), bytes(u64_of(&reservation["nbytes"]))));
+            }
+            for buffer in rank["execution_buffers"].as_array().into_iter().flatten() {
+                canvas.row("Buffer", &text(&buffer["name"]));
+                canvas.row("Allocation / offset", &format!("{} / {}", text(&buffer["allocation"]), number(&buffer["offset"])));
+                canvas.row("Type / shape / strides", &format!("{} / {} / {}", text(&buffer["dtype"]), array_text(&buffer["shape"]), array_text(&buffer["strides"])));
+            }
+            for initializer in rank["initializers"].as_array().into_iter().flatten() {
+                let payload = &initializer["payload"];
+                canvas.row("Initializer", &format!("{} + {}", text(&initializer["allocation"]), number(&initializer["destination_offset"])));
+                canvas.row("Payload", &text(&payload["id"]));
+                canvas.row("Offset / size", &format!("{} / {}", number(&payload["offset"]), bytes(u64_of(&payload["nbytes"]))));
+            }
+        }
+    }
+    if let Some(assets) = value["assets"].as_array().filter(|assets| !assets.is_empty()) {
+        canvas.heading("Frontend assets");
+        for asset in assets {
+            canvas.row(&text(&asset["name"]), &bytes(u64_of(&asset["bytes"])));
+        }
+    }
+    canvas.finish()
+}
+
+fn array_text(value: &Value) -> String {
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .map_or_else(|| text(value), |n| n.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
 fn u64_of(value: &Value) -> u64 {
     value.as_u64().unwrap_or(0)
 }
@@ -240,7 +372,7 @@ fn list(value: &Value) -> String {
         .unwrap_or_default()
 }
 
-struct Canvas {
+pub(crate) struct Canvas {
     out: String,
     width: usize,
     color: bool,
@@ -248,6 +380,30 @@ struct Canvas {
 }
 
 impl Canvas {
+    pub(crate) fn terminal(plain: bool) -> Self {
+        let terminal = std::io::stdout().is_terminal();
+        Self {
+            out: String::new(),
+            width: if terminal { terminal_width().clamp(MIN_WIDTH, MAX_WIDTH) } else { DEFAULT_WIDTH },
+            color: !plain && terminal && !std::env::var("TERM").is_ok_and(|t| t == "dumb"),
+            panel: None,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> String {
+        self.close();
+        self.out
+    }
+
+    pub(crate) fn heading(&mut self, title: &str) {
+        self.close();
+        self.out.push('\n');
+        for line in Self::wrap(title, self.width) {
+            self.styled("1;36", &line);
+            self.out.push('\n');
+        }
+    }
+
     fn styled(&mut self, style: &str, value: &str) {
         if self.color {
             write!(self.out, "\x1b[{style}m{value}\x1b[0m").unwrap();
@@ -382,7 +538,7 @@ impl Canvas {
         lines
     }
 
-    fn row(&mut self, key: &str, value: &str) {
+    pub(crate) fn row(&mut self, key: &str, value: &str) {
         let long_key = visible(key) > KEY_WIDTH;
         if long_key {
             for line in Self::wrap(key, self.content_width() - 2) {
@@ -407,7 +563,7 @@ impl Canvas {
         self.row(key, value);
     }
 
-    fn note(&mut self, value: &str) {
+    pub(crate) fn note(&mut self, value: &str) {
         for line in Self::wrap(value, self.content_width() - 2) {
             self.out.push_str("  ");
             self.styled("2", &line);
@@ -870,7 +1026,10 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
                 ),
             );
             if speculation["history_drafts"].as_bool().unwrap_or(false) {
-                canvas.row("recorded history default", "enabled; override with --no-history-drafts");
+                canvas.row(
+                    "recorded history default",
+                    "enabled; override with --no-history-drafts",
+                );
             }
         }
         canvas.close();
@@ -995,13 +1154,16 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
             canvas.row("image profile", &text(&image["profile"]));
             canvas.number(
                 "image tokens per prompt",
-                &vision["max_image_tokens_per_prompt"].as_u64()
+                &vision["max_image_tokens_per_prompt"]
+                    .as_u64()
                     .map(|limit| format!("{} (shared context)", thousands(limit)))
                     .unwrap_or_else(|| "not declared".into()),
             );
             canvas.number(
                 "images per prompt",
-                &vision["max_images"].as_u64().map(thousands)
+                &vision["max_images"]
+                    .as_u64()
+                    .map(thousands)
                     .unwrap_or_else(|| "not declared".into()),
             );
             canvas.number(
@@ -1222,7 +1384,40 @@ fn memory_map(canvas: &mut Canvas, rank: &Value, memory: &Value) {
                 b["reference"]["offset"]
             ),
         );
-        canvas.row("  strides", &format!("{} elements", text(&b["strides"])));
+        canvas.row(
+            "  strides",
+            &format!("{} elements", array_text(&b["strides"])),
+        );
+    }
+    if let Some(initializers) = memory["initializers"].as_array() {
+        canvas.open(&format!("Initializers · rank {}", rank["rank"]));
+        canvas.table(
+            &["Source", "Tensor", "Slice", "Payload", "Destination"],
+            &initializers
+                .iter()
+                .map(|initializer| {
+                    vec![
+                        if initializer["file"] == "" {
+                            "primary".to_string()
+                        } else {
+                            text(&initializer["file"])
+                        },
+                        text(&initializer["tensor"]),
+                        format!(
+                            "{} + {}",
+                            text(&initializer["source_offset"]),
+                            text(&initializer["nbytes"])
+                        ),
+                        text(&initializer["payload_id"]),
+                        format!(
+                            "{} + {}",
+                            text(&initializer["allocation"]),
+                            text(&initializer["destination_offset"])
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        );
     }
 }
 

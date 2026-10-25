@@ -399,11 +399,11 @@ impl ModelRuntime {
                         };
                     }
                 };
-                let mut scheduler = match RequestScheduler::new(
-                    worker_config.identity,
-                    worker_config.limits,
-                    crate::model::scheduler_capabilities(&worker_config),
-                ) {
+                let mut scheduler = match crate::model::scheduler_capabilities_with_manifest(
+                    &worker_config, executor.manifest(),
+                ).and_then(|capabilities| RequestScheduler::new(
+                    worker_config.identity, worker_config.limits, capabilities,
+                )) {
                     Ok(scheduler) => scheduler,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error.clone()));
@@ -470,30 +470,13 @@ impl ModelRuntime {
                                 .filter(|graph| {
                                     matches!(
                                         graph.kind,
-                                        GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative
+                                        GraphKind::Speculative
                                     )
                                 })
-                                .flat_map(|graph| {
-                                    let first = if graph.packed_token_capacity == 0 { graph.token_capacity } else { 1 };
-                                    let last = graph.token_capacity.min(graph.packed_tokens() / graph.batch_capacity);
-                                    (first..=last).map(move |width| (graph.batch_capacity, width))
-                                })
+                                .map(|graph| (graph.batch_capacity, graph.token_capacity))
                                 .collect::<std::collections::BTreeSet<_>>()
                                 .into_iter().collect::<Vec<_>>(),
                         )
-                    })
-                    .and_then(|()| {
-                        if let Some(width) = executor
-                            .manifest()
-                            .graphs
-                            .iter()
-                            .filter(|g| matches!(g.kind, GraphKind::Proposal | GraphKind::PackedSpeculative))
-                            .map(|g| g.token_capacity)
-                            .max()
-                        {
-                            scheduler.split_speculation(width)?;
-                        }
-                        Ok(())
                     })
                 {
                     let _ = ready_tx.send(Err(error.clone()));
@@ -906,12 +889,7 @@ impl<'a> Worker<'a> {
             let std::ops::ControlFlow::Continue(mut progress) = self.admit()? else {
                 return Ok(());
             };
-            loop {
-                let completion = match executor.poll() {
-                    Ok(None) => break,
-                    Ok(Some(completion)) => completion,
-                    Err(error) => return Err(error),
-                };
+            if let Some(completion) = executor.poll()? {
                 let kind = executor.manifest().graphs[completion.graph_index].kind;
                 self.complete(kind, completion)?;
                 progress = true;
@@ -1339,8 +1317,6 @@ impl<'a> Worker<'a> {
                 | GraphKind::ScoredPrefill
                 | GraphKind::Decode
                 | GraphKind::Speculative
-                | GraphKind::Verification
-                | GraphKind::PackedSpeculative
                 | GraphKind::Mixed
         ) {
             let step = self.scheduler.submitted_step(completion.fence)?;
@@ -1371,27 +1347,17 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        let generated = if kind == GraphKind::Proposal {
-            let confidence = completion
-                .proposal_confidence
-                .as_ref()
-                .ok_or("proposal completion lacks confidence")?;
-            self.scheduler.complete_proposal(
-                completion.fence,
-                &completion.records,
-                completion.timing,
+        let generated = if let Some(confidence) = completion.proposal_confidence.as_ref() {
+            self.scheduler.complete_packed_round_with_survival(
+                completion.fence, &completion.records, completion.timing,
                 &confidence[..measured_step.batch_capacity],
+                completion.speculative_survival.as_ref().map(|rows| rows.as_slice()),
             )?
-        } else if kind == GraphKind::PackedSpeculative {
-            let confidence = completion.proposal_confidence.as_ref()
-                .ok_or("packed combined completion lacks confidence")?;
-            self.scheduler.complete_packed_round_with_survival(completion.fence, &completion.records,
-                completion.timing, &confidence[..measured_step.batch_capacity],
-                completion.speculative_survival.as_ref().map(|rows| rows.as_slice()))?
         } else {
-            self.scheduler
-                .complete_with_survival(completion.fence, &completion.records, completion.timing,
-                    completion.speculative_survival.as_ref().map(|rows| rows.as_slice()))?
+            self.scheduler.complete_with_survival(
+                completion.fence, &completion.records, completion.timing,
+                completion.speculative_survival.as_ref().map(|rows| rows.as_slice()),
+            )?
         };
         self.metrics
             .progress(prefill, generated.len(), accepted, draft_rounds,
@@ -1411,29 +1377,15 @@ impl<'a> Worker<'a> {
                 self.scheduler.acceptance_credit_ns()
             } else { self.scheduler.refresh_credit_ns() },
         );
-        if kind == GraphKind::Proposal {
-            self.metrics.proposal_completed(measured_step.batch_capacity, measured_step.token_capacity,
-                completion.timing.gpu_ns.into_iter().flatten().max().unwrap_or(0));
-        }
-        if matches!(kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative) {
-            let nanos = completion
-                .timing
-                .gpu_ns
-                .into_iter()
-                .flatten()
-                .max()
-                .unwrap_or(0);
-            let step = &measured_step;
-            if kind == GraphKind::PackedSpeculative {
-                self.metrics.packed_speculative_completed(step.batch_capacity, step.token_capacity,
-                    step.draft_tokens, nanos, &completion.records);
-            } else { self.metrics.speculative_completed(
-                kind,
-                step.batch_capacity,
-                step.token_capacity,
-                nanos,
+        if kind == GraphKind::Speculative {
+            self.metrics.speculative_completed(
+                measured_step.batch_capacity, measured_step.token_capacity,
+                if self.config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Mtp {
+                    measured_step.draft_tokens
+                } else { 0 },
+                completion.timing.gpu_ns.into_iter().flatten().max().unwrap_or(0),
                 &completion.records,
-            ); }
+            );
         }
         if kind == GraphKind::ScoredPrefill {
             let lane = &measured_step.lanes[0];
@@ -2450,6 +2402,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {
@@ -2683,6 +2636,7 @@ mod tests {
                 snapshots: 40,
             },
             SchedulerCapabilities {
+                speculative_allocations: vec![],
                 vocabulary: 6,
                 page_tokens: 64,
                 vision: crate::model::testing::metadata().vision,
@@ -3204,6 +3158,7 @@ mod tests {
                 snapshots: 2,
             },
             SchedulerCapabilities {
+                speculative_allocations: vec![],
                 vocabulary: 248320,
                 page_tokens: 64,
                 vision: crate::model::VisionCapabilities {

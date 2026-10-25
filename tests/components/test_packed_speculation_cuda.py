@@ -1,7 +1,7 @@
 """A deterministic proposal backbone drives real validation and stochastic commit.
 
 The model-free fixture substitutes only proposal tokens and causal confidence.
-Request validation, retained storage, target filtering, stochastic verification,
+Request validation, direct tensor handoff, target filtering, stochastic verification,
 commit, and graph-buffer allocation use the shared production components.
 """
 
@@ -20,8 +20,6 @@ from ignition.components.parallel_draft import PreparedParallelDraftRound
 from ignition.components.sampling import DeviceRequestState, RequestAdmission
 from ignition.components.speculation import (PreparedSpeculativeCommit, PreparedSpeculativeDistributions,
                                              PreparedStochasticVerification, SpeculativeRngState)
-from ignition.components.split_draft import PreparedDraftVerification, PreparedProposalStorage
-from ignition.components.state import scatter_rows
 from ignition.preparation.scratch import GraphBufferPool
 from ignition.preparation.compilation import compile_forward
 from tests.components.causal_prefix_oracle import allocate
@@ -89,6 +87,44 @@ class _VerificationTarget(SimpleNamespace):
         self.commit()
 
 
+
+class _ForwardScratch:
+    def rows(self, tokens, samples):
+        return SimpleNamespace(hidden=torch.zeros((samples, 4), device="cuda"),
+            logits=torch.empty((samples, 256), device="cuda"))
+
+
+class _DeterministicDecoder:
+    def __init__(self, scratch, metadata):
+        self.scratch, self.metadata, self.auxiliary = scratch, metadata, None
+        self.logits = torch.full_like(scratch.logits, -torch.inf)
+        columns = torch.arange(self.logits.shape[0], device="cuda") % metadata.max_query_tokens + 5
+        self.logits.scatter_(1, columns[:, None], 8.)
+
+    def __call__(self):
+        self.scratch.logits.copy_(self.logits)
+        self.scratch.hidden.fill_(1.)
+
+    def commit(self, counts):
+        pass
+
+
+class _Context:
+    def __call__(self, *args):
+        pass
+
+
+def _decoder_factory(weights, tables, scratch, metadata, pool, **kwargs):
+    return _DeterministicDecoder(scratch, metadata)
+
+
+def _draft_factory(weights, scratch, metadata, pool, **kwargs):
+    return _DeterministicDecoder(scratch, metadata)
+
+
+def _context_factory(*args, **kwargs):
+    return _Context()
+
 def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadcast=None, coordinator=None, session=None):
     batch, width, vocab, device = 4, 8, 256, "cuda"
     state = DeviceRequestState.allocate(device, vocab_size=vocab, capacity=batch)
@@ -113,17 +149,17 @@ def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadca
     owner = SimpleNamespace(requests=state, inputs=inputs, sequence=torch.tensor([6], device=device),
         frame=torch.zeros(1, dtype=torch.int32, device=device), completion=completion_outputs(records),
         offset=torch.tensor([8, 12, 16, 20], device=device), generation=state.generation.clone(),
-        weights=SimpleNamespace(shard=TensorParallelShard(rank, world)),
+        weights=SimpleNamespace(shard=TensorParallelShard(rank, world),
+            draft=SimpleNamespace(confidence_head=None)),
         pool=SimpleNamespace(memory_capacity=torch.tensor([16, 16], device=device)),
         collectives=dict(runtime=runtime, vocabulary_runtime=broadcast, coordinator=coordinator), session=session)
     pool = GraphBufferPool(device, chunk_bytes=1 << 20)
     cursor = pool.cursor()
     source = _ProposalBackbone(owner, depth, cursor)
-    retained = PreparedProposalStorage(owner, 7)
     confidence = _Confidence(batch, depth, device)
-    proposal = SimpleNamespace(source=source, storage=retained, confidence=confidence,
-        allowed=torch.empty_like(source.active), depth=torch.full_like(source.before, depth))
+    confidence_output = torch.empty((2, batch, width - 1), device=device)
     target_cursor = pool.cursor()
+    target_cursor.join(cursor)
     target = _VerificationTarget(owner=owner, batch=batch, width=width, target_token_capacity=token_capacity,
         buffers=target_cursor, active=target_cursor.zeros((batch,), torch.bool),
         before=target_cursor.zeros((batch,), torch.int64), base_offset=target_cursor.zeros((batch,), torch.int64),
@@ -147,23 +183,25 @@ def _fixture(depth, *, token_capacity=12, rank=0, world=1, runtime=None, broadca
     commit.prepare()
 
     target.distributions, target.stochastic, target.commit = distributions, stochastic, commit
-    verification = PreparedDraftVerification(retained, target)
-    operation = PreparedPackedSpeculativeRound(proposal, verification, prefix_limits,
-                                              name="test.packed", buffers=pool.cursor())
+    from unittest.mock import patch
+    with patch("ignition.components.packed_speculation.PreparedDraftConfidence", return_value=confidence):
+        operation = PreparedPackedSpeculativeRound(source, target, prefix_limits, confidence_output,
+                                                  name="test.packed", buffers=pool.cursor())
     return SimpleNamespace(**locals())
 
 
-def _publish(f, admitted):
-    s, p, o = f.source, f.retained, f.owner
-    slots = o.inputs.row_slot_ids
-    safe = slots.long().clamp(0, 3)
+def _handoff(f, admitted):
+    s, t = f.source, f.target
     s.active.logical_and_(admitted)
-    for value, destination in ((o.requests.generation[safe], p.generations),
-        (o.inputs.request_state_rows[safe, 0], p.state_rows), (o.sequence.expand(4), p.sequence),
-        (f.proposal.depth, p.depths), (s.before, p.before), (s.base_offset, p.base_offset),
-        (s.candidates, p.candidates), (s.drafts, p.drafts), (s.probabilities, p.probabilities),
-        (s.valid, p.valid), (s.active, p.ready)):
-        scatter_rows(value, slots, destination, s.active)
+    for source, destination in ((s.before, t.before), (s.base_offset, t.base_offset),
+            (s.candidates, t.candidates), (s.drafts, t.drafts),
+            (s.probabilities, t.probabilities), (s.valid, t.valid)):
+        destination.zero_()
+        if source.ndim > 1:
+            destination[:, :source.shape[1]].copy_(source)
+        else:
+            destination.copy_(source)
+    t.active.copy_(s.active)
 
 
 @pytest.mark.parametrize("depth,compiled,token_capacity", [
@@ -171,7 +209,7 @@ def _publish(f, admitted):
     (3, False, 5), (3, True, 7), (5, False, 13), (5, True, 13),
 ])
 @torch.no_grad()
-def test_captured_packed_round_matches_split_oracle_state_rng_and_poison(depth, compiled, token_capacity):
+def test_captured_packed_round_matches_prefix_oracle_state_rng_and_poison(depth, compiled, token_capacity):
     f = _fixture(depth, token_capacity=token_capacity)
     state, inputs, owner = f.state, f.inputs, f.owner
     originals = {name: value.clone() for name, value in vars(state).items()}
@@ -210,14 +248,12 @@ def test_captured_packed_round_matches_split_oracle_state_rng_and_poison(depth, 
         elif case == "inactive":
             inputs.live_rows.fill_(2)
             f.confidence.values[2:] = torch.nan
-        f.retained.ready.zero_()
-        for tensor in (f.retained.probabilities, f.retained.candidates, f.retained.drafts,
-                       f.retained.valid, f.target.probabilities):
+        for tensor in (f.target.probabilities, f.target.candidates, f.target.drafts, f.target.valid):
             tensor.fill_(0)
         if poison:
-            f.retained.probabilities[:, depth:] = torch.nan
-            f.retained.drafts[:, depth:] = 999
-            f.retained.candidates[:, depth + 1:] = -777
+            f.target.probabilities[:, depth:] = torch.nan
+            f.target.drafts[:, depth:] = 999
+            f.target.candidates[:, depth + 1:] = -777
         owner.completion.records.fill_(-91)
         f.distributions.probabilities.fill_(torch.nan)
 
@@ -232,7 +268,7 @@ def test_captured_packed_round_matches_split_oracle_state_rng_and_poison(depth, 
     def result():
         return [value.cpu().clone() for value in (*vars(state).values(), *vars(f.rng).values(),
             owner.offset, owner.generation, owner.completion.records, f.commit.emitted_count,
-            inputs.query_lengths, f.retained.ready)]
+            inputs.query_lengths)]
 
     try:
         for case in ("valid", "accept", "confidence", "stale", "duplicate", "inactive"):
@@ -240,15 +276,15 @@ def test_captured_packed_round_matches_split_oracle_state_rng_and_poison(depth, 
                 restore(case, poison)
                 inputs.query_lengths.copy_(f.prefix_limits)
                 safe = inputs.row_slot_ids.long().clamp(0, 3)
-                f.proposal.allowed.copy_(~f.retained.ready[safe])
-                f.source.propose(True, f.confidence, f.proposal.allowed)
+                finished = (inputs.row_generations == state.generation[safe]) & (state.status[safe] == 2)
+                submitted = ((f.source.rows < inputs.live_rows) & ~finished).tolist()
+                f.source.propose(True, f.confidence)
                 f.confidence()
-                submitted = (f.source.rows < inputs.live_rows).tolist()
                 lengths, admitted = allocate(f.confidence.output.tolist(), inputs.row_slot_ids.tolist(),
                     submitted, f.source.active.tolist(), f.prefix_limits.tolist(), token_capacity, 4)
                 inputs.query_lengths.copy_(torch.tensor(lengths, dtype=torch.int32, device="cuda"))
-                _publish(f, torch.tensor(admitted, dtype=torch.bool, device="cuda"))
-                f.verification(same_graph=True)
+                _handoff(f, torch.tensor(admitted, dtype=torch.bool, device="cuda"))
+                f.target.verify(torch.tensor(admitted, dtype=torch.bool, device="cuda"))
                 expected = result()
                 restore(case, poison)
                 frozen_limits = f.prefix_limits.clone()
@@ -267,11 +303,19 @@ def test_captured_packed_round_matches_split_oracle_state_rng_and_poison(depth, 
                     assert torch.equal(f.commit.emitted_count, inputs.query_lengths)
                 if case == "confidence":
                     assert torch.equal(owner.offset, offset + 4 * depth)
+                    assert state.status.eq(3).all()
+                    assert state.error_code.eq(6).all()
                     for name, value in originals.items():
-                        assert torch.equal(getattr(state, name), value), name
+                        if name not in ("status", "error_code"):
+                            assert torch.equal(getattr(state, name), value), name
                 if case in ("confidence", "stale", "duplicate"):
-                    assert not f.retained.ready.any()
+                    assert not f.commit.emitted_count.any()
                     assert torch.equal(f.rng.target_offset, rng_originals["target_offset"])
+                if case == "stale":
+                    for name, value in originals.items():
+                        assert torch.equal(getattr(state, name)[0], value[0]), name
+                    assert state.status[1:].eq(3).all()
+                    assert state.error_code[1:].eq(6).all()
     finally:
         graph.reset()
 
@@ -298,10 +342,9 @@ def test_native_packed_signature_prefix_upload_and_terminal_feedback(survival):
             getattr(f.rng, name).copy_(value)
         f.owner.offset.copy_(initial_offset)
         f.owner.generation.copy_(initial_generation)
-        f.retained.ready.zero_()
-        f.retained.probabilities[:, 3:] = torch.nan
-        f.retained.drafts[:, 3:] = 999
-        f.retained.candidates[:, 4:] = -777
+        f.target.probabilities[:, 3:] = torch.nan
+        f.target.drafts[:, 3:] = 999
+        f.target.candidates[:, 4:] = -777
         f.prefix_limits.copy_(torch.tensor(limits, dtype=torch.int32, device="cuda"))
         f.inputs.query_lengths.fill_(-111)
         f.target.probabilities.fill_(torch.nan)
@@ -327,11 +370,11 @@ def test_native_packed_signature_prefix_upload_and_terminal_feedback(survival):
     with torch.cuda.graph(graph):
         operation()
     model = PreparedExecution(device=torch.cuda.current_device(), max_active=4, graphs={"packed": graph},
-        signatures={"packed": GraphSignature("packed_speculative", 4, 8, ("speculative_prefix_limits",),
-            speculation_enabled=True, packed_token_capacity=12, draft_tokens=3)},
+        signatures={"packed": GraphSignature("speculative", 4, 8, ("speculative_prefix_limits",),
+            speculation_enabled=True, packed_token_capacity=12, draft_tokens=3, confidence_width=3)},
         buffers=dict(frame_index=f.owner.frame, submission_sequence=f.owner.sequence,
             completion_records=f.owner.completion.records, speculative_prefix_limits=f.prefix_limits,
-            proposal_confidence=f.operation.confidence,
+            proposal_confidence=f.confidence_output,
             **({"completion_speculative_survival": f.owner.completion.speculative_survival} if survival else {})),
         resources=(f, operation))
     manifest = model.manifest()
@@ -377,6 +420,198 @@ def test_native_packed_signature_prefix_upload_and_terminal_feedback(survival):
         assert executor.drained
         graph.reset()
 
+
+
+@torch.no_grad()
+def test_native_two_rounds_preserve_frames_lengths_and_terminal_state():
+    import struct
+    import time
+    from ignition.preparation.execution import GraphSignature, PreparedExecution
+
+    f = _fixture(3, token_capacity=12)
+    f.state.max_new_tokens[0] = f.state.generated_tokens[0] + 1
+    f.logits.fill_(-torch.inf)
+    for position in range(8):
+        f.logits[:, position, 5 + position] = 8.
+    initial_state = {name: value.clone() for name, value in vars(f.state).items()}
+    initial_rng = {name: value.clone() for name, value in vars(f.rng).items()}
+    initial_offset, initial_generation = f.owner.offset.clone(), f.owner.generation.clone()
+    variants = (([1, 4, 2, 4], .75), ([4, 1, 4, 2], .25))
+
+    def restore():
+        for name, value in initial_state.items():
+            getattr(f.state, name).copy_(value)
+        for name, value in initial_rng.items():
+            getattr(f.rng, name).copy_(value)
+        f.owner.offset.copy_(initial_offset)
+        f.owner.generation.copy_(initial_generation)
+        f.owner.completion.records.fill_(-91)
+        f.owner.completion.speculative_survival.fill_(-91.)
+        f.confidence_output.fill_(-91.)
+
+    def snapshot():
+        return [tensor.cpu().clone() for tensor in (*vars(f.state).values(), *vars(f.rng).values(),
+                f.owner.offset, f.owner.generation)]
+
+    operation = compile_forward(f.operation)
+    restore()
+    expected, terminal_state = [], None
+    for sequence, (limits, confidence) in enumerate(variants, 1):
+        frame = sequence % 2
+        f.owner.frame.fill_(frame)
+        f.owner.sequence.fill_(sequence)
+        f.prefix_limits.copy_(torch.tensor(limits, dtype=torch.int32, device="cuda"))
+        f.confidence.values.fill_(confidence)
+        operation()
+        torch.cuda.synchronize()
+        expected.append((f.owner.completion.records[frame].cpu().clone(),
+            f.confidence_output[frame].cpu().clone(),
+            f.owner.completion.speculative_survival[frame].cpu().clone(),
+            f.inputs.query_lengths.cpu().clone()))
+        if sequence == 1:
+            assert f.state.status[0].item() == 2
+            terminal_state = {name: value[0].clone() for name, value in vars(f.state).items()}
+        else:
+            for name, value in terminal_state.items():
+                assert torch.equal(getattr(f.state, name)[0], value), name
+            assert f.inputs.query_lengths[1].item() == 0
+            record = f.owner.completion.records[frame, 0]
+            assert record[0].item() == f.state.generation[0].item()
+            assert record[1].item() == sequence
+            assert record[2].item() == terminal_state["consumed_tokens"].item()
+            assert record[3].item() == terminal_state["generated_tokens"].item()
+            assert record[5].item() == 2
+            assert record[8].item() == 0
+            assert f.confidence_output[frame, 1].eq(0).all()
+    expected_final = snapshot()
+    restore()
+    f.prefix_limits.fill_(4)
+    f.confidence.values.fill_(.75)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        operation()
+    restore()
+    torch.cuda.synchronize()
+    model = PreparedExecution(device=torch.cuda.current_device(), max_active=4, graphs={"packed": graph},
+        signatures={"packed": GraphSignature("speculative", 4, 8,
+            ("speculative_prefix_limits", "test_confidence"), speculation_enabled=True,
+            packed_token_capacity=12, draft_tokens=3, confidence_width=3)},
+        buffers=dict(frame_index=f.owner.frame, submission_sequence=f.owner.sequence,
+            completion_records=f.owner.completion.records, speculative_prefix_limits=f.prefix_limits,
+            proposal_confidence=f.confidence_output, test_confidence=f.confidence.values,
+            completion_speculative_survival=f.owner.completion.speculative_survival),
+        resources=(f, operation))
+    executor = model.start_executor()
+    try:
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        fences = [executor.submit(0, [
+            ("speculative_prefix_limits", 0, struct.pack("4i", *limits)),
+            ("test_confidence", 0, struct.pack("12f", *([confidence] * 12)))])
+            for limits, confidence in variants]
+        assert all(fence is not None for fence in fences)
+        assert executor.outstanding == 2
+        completions = []
+        deadline = time.monotonic() + 30
+        while len(completions) < 2:
+            assert time.monotonic() < deadline
+            completion = executor.poll()
+            if completion is None:
+                time.sleep(.001)
+            else:
+                completions.append(completion)
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        for fence, completion, (records, confidence, survival, lengths) in zip(
+                fences, completions, expected, strict=True):
+            assert completion.fence == fence
+            assert torch.equal(torch.tensor(completion.records), records)
+            assert torch.equal(torch.tensor(completion.proposal_confidence), confidence)
+            assert torch.equal(torch.tensor(completion.speculative_survival), survival)
+            assert lengths.sum().item() <= 12
+        for actual, reference in zip(snapshot(), expected_final, strict=True):
+            assert torch.equal(actual, reference), (actual.shape, actual.dtype)
+        assert executor.outstanding == 0
+    finally:
+        executor.close()
+        assert executor.drained
+        graph.reset()
+
+
+@torch.no_grad()
+def test_compiled_parallel_draft_ragged_target_matches_rectangle_state():
+    f = _fixture(3)
+    o = f.owner
+    o.inputs.live_rows.fill_(2)
+    o.inputs.query_lengths.copy_(torch.tensor([2, 1, 0, 0], dtype=torch.int32, device="cuda"))
+    o.pool.backing = torch.empty(1, device="cuda")
+    o.pool.last_hidden = torch.zeros((16, 4), device="cuda")
+    o.weights.config = SimpleNamespace(draft=SimpleNamespace(noise_token=0), text=dict(hidden_size=4))
+    o.scratch, o.draft_scratch = _ForwardScratch(), _ForwardScratch()
+    o.forwards = SimpleNamespace(decoder=_decoder_factory, context=_context_factory,
+        draft=_draft_factory, markov=None)
+    o.tables, o.workspace, o.markov_runtime = None, None, None
+    o.block_size, o.logit_offset, o.page_tokens, o.rng = 4, 0, 64, f.rng
+    initial_state = {name: value.clone() for name, value in vars(f.state).items()}
+    initial_rng = {name: value.clone() for name, value in vars(f.rng).items()}
+    initial_offset, initial_generation = o.offset.clone(), o.generation.clone()
+
+    def restore():
+        for name, value in initial_state.items():
+            getattr(f.state, name).copy_(value)
+        for name, value in initial_rng.items():
+            getattr(f.rng, name).copy_(value)
+        o.offset.copy_(initial_offset)
+        o.generation.copy_(initial_generation)
+        o.pool.last_hidden.zero_()
+        o.completion.records.fill_(-91)
+
+    def snapshot():
+        return [tensor.cpu().clone() for tensor in (*vars(f.state).values(), *vars(f.rng).values(),
+            o.offset, o.generation, o.pool.last_hidden, o.completion.records)]
+
+    expected = None
+    for capacity in (8, 3):
+        buffers = GraphBufferPool(o.pool.backing.device, chunk_bytes=1 << 20)
+        operation = PreparedParallelDraftRound(o, 2, 4, f"test.parallel{capacity}",
+            target_token_capacity=capacity, buffers=buffers.cursor())
+        operation.prepare()
+        compiled = compile_forward(operation)
+        restore()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            compiled()
+        restore()
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        try:
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            assert operation.metadata.token_ids.numel() == capacity
+            assert operation.decoder.scratch.hidden.shape == (8, 4)
+            assert operation.operations[-1].emitted_count.tolist() == [2, 1]
+            actual = snapshot()
+            if expected is None:
+                expected = actual
+            else:
+                for left, right in zip(actual, expected, strict=True):
+                    assert torch.equal(left, right), (left.shape, left.dtype)
+            if capacity == 3:
+                restore()
+                o.inputs.query_lengths.copy_(torch.tensor([3, 1, 0, 0], dtype=torch.int32, device="cuda"))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert operation.operations[-1].emitted_count.eq(0).all()
+                assert f.state.status[[3, 0]].eq(3).all()
+                assert f.state.error_code[[3, 0]].eq(32).all()
+                for name, value in initial_state.items():
+                    if name not in ("status", "error_code"):
+                        assert torch.equal(getattr(f.state, name), value), name
+                for name, value in initial_rng.items():
+                    assert torch.equal(getattr(f.rng, name), value), name
+                assert torch.equal(o.offset, initial_offset)
+                assert o.pool.last_hidden.eq(0).all()
+        finally:
+            graph.reset()
 
 def _tp_rank(rank, rendezvous, sockets):
     from contextlib import ExitStack
@@ -429,7 +664,6 @@ def _tp_rank(rank, rendezvous, sockets):
                 for name, value in initial_rng.items():
                     getattr(f.rng, name).copy_(value)
                 f.owner.offset.copy_(initial_offset)
-                f.retained.ready.zero_()
                 f.owner.completion.records.fill_(-91 - rank)
                 f.inputs.live_rows.fill_(2 if case == "partial" else 4)
                 f.prefix_limits[2:].fill_(0 if case == "partial" else 4)
@@ -474,9 +708,11 @@ def _tp_rank(rank, rendezvous, sockets):
                 assert torch.equal(f.owner.offset, expected_offset)
                 if case in ("rank2_nan", "root_nan"):
                     assert actual_lengths == [0] * 4
-                    assert not f.retained.ready.any()
+                    assert f.state.status.eq(3).all()
+                    assert f.state.error_code.eq(6).all()
                     for name, value in initial_state.items():
-                        assert torch.equal(getattr(f.state, name), value), name
+                        if name not in ("status", "error_code"):
+                            assert torch.equal(getattr(f.state, name), value), name
                     for name, value in initial_rng.items():
                         assert torch.equal(getattr(f.rng, name), value), name
                 else:
@@ -493,17 +729,21 @@ def _tp_rank(rank, rendezvous, sockets):
             # independent cohorts without Python touching their owned state.
             failure = torch.zeros(1, dtype=torch.int32, device="cuda")
             initial_generation = f.owner.generation.clone()
+            reset_state = torch.ones(1, dtype=torch.int32, device="cuda")
+            confidence_scale = torch.ones(1, device="cuda")
 
             def native_forward():
+                reset = reset_state[0] != 0
                 for name, value in initial_state.items():
-                    getattr(f.state, name).copy_(value)
+                    target = getattr(f.state, name)
+                    target.copy_(torch.where(reset, value, target))
                 for name, value in initial_rng.items():
-                    getattr(f.rng, name).copy_(value)
-                f.owner.offset.copy_(initial_offset)
-                f.owner.generation.copy_(initial_generation)
-                f.retained.ready.zero_()
-                f.owner.completion.records.fill_(-91 - rank)
+                    target = getattr(f.rng, name)
+                    target.copy_(torch.where(reset, value, target))
+                f.owner.offset.copy_(torch.where(reset, initial_offset, f.owner.offset))
+                f.owner.generation.copy_(torch.where(reset, initial_generation, f.owner.generation))
                 f.confidence.values.fill_(.25 * (rank + 1))
+                f.confidence.values.mul_(confidence_scale)
                 if rank == 2:
                     f.confidence.values.masked_fill_(failure[0] == 1, torch.nan)
                 f.confidence.values[2:].masked_fill_(failure[0] == 2, torch.nan)
@@ -520,12 +760,15 @@ def _tp_rank(rank, rendezvous, sockets):
                 native_forward()
             session.freeze()
             model = PreparedExecution(device=rank, max_active=4, graphs={"packed": native_graph},
-                signatures={"packed": GraphSignature("packed_speculative", 4, 8,
-                    ("speculative_prefix_limits", "confidence_failure", "live_rows"), speculation_enabled=True,
-                    packed_token_capacity=12, draft_tokens=3)},
+                signatures={"packed": GraphSignature("speculative", 4, 8,
+                    ("speculative_prefix_limits", "confidence_failure", "live_rows", "reset_state",
+                     "confidence_scale", "row_slot_ids", "row_generations"), speculation_enabled=True,
+                    packed_token_capacity=12, draft_tokens=3, confidence_width=3)},
                 buffers=dict(frame_index=f.owner.frame, submission_sequence=f.owner.sequence,
                     completion_records=f.owner.completion.records, speculative_prefix_limits=f.prefix_limits,
-                    proposal_confidence=f.operation.confidence, confidence_failure=failure, live_rows=f.inputs.live_rows,
+                    proposal_confidence=f.confidence_output, confidence_failure=failure, live_rows=f.inputs.live_rows,
+                    reset_state=reset_state, confidence_scale=confidence_scale,
+                    row_slot_ids=f.inputs.row_slot_ids, row_generations=f.inputs.row_generations,
                     completion_speculative_survival=f.owner.completion.speculative_survival),
                 resources=(f, native_forward, initial_state, initial_rng, session, runtime, broadcast, stream))
             torch.cuda.synchronize()
@@ -535,10 +778,53 @@ def _tp_rank(rank, rendezvous, sockets):
                 model.serve_rank(connection, rank=rank, world=4)
             else:
                 executor = model.start_executor(peers=peers)
+                for same_requests in (True, False):
+                    pending = []
+                    for round_index, (limits, scale) in enumerate((((2, 1, 0, 0), 1.), ((1, 3, 0, 0), .5))):
+                        slots = [3, 0, 2, 1] if round_index == 0 or same_requests else [2, 1, 3, 0]
+                        epochs = [11 + slot for slot in slots]
+                        uploads = [
+                            ("speculative_prefix_limits", 0, struct.pack("4i", *limits)),
+                            ("confidence_failure", 0, struct.pack("i", 0)),
+                            ("live_rows", 0, struct.pack("i", 2)),
+                            ("reset_state", 0, struct.pack("i", int(round_index == 0))),
+                            ("confidence_scale", 0, struct.pack("f", scale)),
+                            ("row_slot_ids", 0, struct.pack("4i", *slots)),
+                            ("row_generations", 0, struct.pack("4q", *epochs))]
+                        deadline = time.monotonic() + 30
+                        fence = executor.submit(0, uploads)
+                        while fence is None:
+                            assert time.monotonic() < deadline
+                            assert executor.poll() is None
+                            fence = executor.submit(0, uploads)
+                        pending.append((fence, limits, scale, slots))
+                    assert executor.outstanding == 2
+                    for round_index, (fence, limits, scale, slots) in enumerate(pending):
+                        deadline, completion = time.monotonic() + 30, None
+                        while completion is None:
+                            assert time.monotonic() < deadline
+                            completion = executor.poll()
+                            if completion is None:
+                                time.sleep(.001)
+                        assert completion.fence == fence
+                        assert completion.proposal_confidence == [[.25 * scale] * 3 + [0.] * 4] * 2 + [[0.] * 7] * 2
+                        for row, slot in enumerate(slots[:2]):
+                            record = completion.records[slot]
+                            assert record[1] == fence
+                            assert record[8] == limits[row]
+                            predecessor = (2, 1)[row] if round_index and same_requests else 0
+                            assert record[2] == 10 + predecessor + limits[row]
+                            assert record[3] == 3 + predecessor + limits[row]
+                        assert all(completion.records[slot] == f.commit.idle_record.tolist() for slot in slots[2:])
+                    assert f.target.candidates.cpu()[:2, 0].tolist() == ([6, 5] if same_requests else [4, 4])
+                    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
                 for case, mode, live in (("valid", 0, 4), ("partial", 2, 2), ("rank2_nan", 1, 4)):
                     limits = (1, 4, 0, 0) if case == "partial" else (1, 4, 4, 4)
                     fence = executor.submit(0, [("speculative_prefix_limits", 0, struct.pack("4i", *limits)),
-                        ("confidence_failure", 0, struct.pack("i", mode)), ("live_rows", 0, struct.pack("i", live))])
+                        ("confidence_failure", 0, struct.pack("i", mode)), ("live_rows", 0, struct.pack("i", live)),
+                        ("reset_state", 0, struct.pack("i", 1)), ("confidence_scale", 0, struct.pack("f", 1.)),
+                        ("row_slot_ids", 0, struct.pack("4i", 3, 0, 2, 1)),
+                        ("row_generations", 0, struct.pack("4q", 14, 11, 13, 12))])
                     assert fence is not None
                     deadline, completion = time.monotonic() + 30, None
                     while completion is None:
@@ -551,7 +837,7 @@ def _tp_rank(rank, rendezvous, sockets):
                                                                + [[0.] * 7] * (4 - live))
                     assert completion.speculative_survival is not None
                     if case == "rank2_nan":
-                        assert all(row[5:7] == [3, 256] for row in completion.records)
+                        assert all(row[5:7] == [3, 6] for row in completion.records)
                         assert completion.speculative_survival == [[-1.] * 7] * 4
                     else:
                         admitted, _ = allocate([[.25] * 3] * 4, [3, 0, 2, 1],
@@ -569,8 +855,11 @@ def _tp_rank(rank, rendezvous, sockets):
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
             assert f.inputs.query_lengths.eq(0).all()
             assert torch.equal(f.owner.offset, initial_offset + 12)
+            assert f.state.status.eq(3).all()
+            assert f.state.error_code.eq(6).all()
             for name, value in initial_state.items():
-                assert torch.equal(getattr(f.state, name), value), name
+                if name not in ("status", "error_code"):
+                    assert torch.equal(getattr(f.state, name), value), name
             for name, value in initial_rng.items():
                 assert torch.equal(getattr(f.rng, name), value), name
             dist.barrier()
@@ -643,7 +932,6 @@ def test_worker_serialized_packed_round_restores_and_captures(tmp_path, monkeypa
             getattr(f.rng, name).copy_(value)
         f.owner.offset.copy_(initial_offset)
         f.owner.generation.copy_(initial_generation)
-        f.retained.ready.zero_()
         f.owner.completion.records.fill_(-91)
         f.inputs.query_lengths.fill_(-111)
 
@@ -658,12 +946,12 @@ def test_worker_serialized_packed_round_restores_and_captures(tmp_path, monkeypa
             namespace=dict(fixture="causal-prefix-worker")) as session:
         session.requested_compile_workers = 1
         stream = torch.cuda.Stream()
-        signatures = {"packed": GraphSignature("packed_speculative", 4, 8,
+        signatures = {"packed": GraphSignature("speculative", 4, 8,
             ("speculative_prefix_limits", "live_rows"), speculation_enabled=True,
-            packed_token_capacity=12, draft_tokens=3)}
+            packed_token_capacity=12, draft_tokens=3, confidence_width=3)}
         graphs, compiled = capture_forwards({"packed": f.operation}, signatures, session=session,
             device=torch.device("cuda", 0), stream=stream, pool=torch.cuda.graph_pool_handle(),
-            materialize=materialize, cache_root=tmp_path, compile_kinds=("packed_speculative",))
+            materialize=materialize, cache_root=tmp_path, compile_kinds=("speculative",))
         assert materialized == [True]
         assert len(submitted) == 1 and submitted[0].is_file()
         assert list(tmp_path.rglob("*.bin")) == submitted
@@ -685,3 +973,131 @@ def test_worker_serialized_packed_round_restores_and_captures(tmp_path, monkeypa
         finally:
             for graph in graphs.values():
                 graph.reset()
+
+
+def _ordinary_generation_rank(rank, rendezvous):
+    from contextlib import ExitStack
+    from datetime import timedelta
+    import torch.distributed as dist
+    from ignition.components.paged_generation import PreparedGeneration
+    from ignition.preparation.collectives import (CollectivePreparation, create_all_reduce_runtime,
+                                                  create_result_broadcast_runtime)
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4,
+                            timeout=timedelta(minutes=3))
+    coordinator = CollectivePreparation(dist.group.WORLD)
+    runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1, hidden_size=8)
+    result = create_result_broadcast_runtime(dist.group.WORLD, device, layouts=[dict(
+        tokens=((4,), torch.int32), valid=((4,), torch.bool), maximum=((4,), torch.float32),
+        mass=((4, 1), torch.float32))])
+    graph = None
+    try:
+        with torch.no_grad(), RecordedPreparationSession(device=device, checkpoint="ordinary-sampling",
+                workload_schema="tp4-generation", numerical_policy="exact", coordinator=coordinator) as session:
+            state = DeviceRequestState.allocate(device, vocab_size=256, capacity=4)
+            for slot in range(4):
+                state.admit(slot, RequestAdmission(generation=11 + slot, seed=41800 + slot,
+                    max_new_tokens=4 if slot == 0 else 100, top_k=-1, top_p=1.), [4])
+            state.pending_token.fill_(4)
+            state.consumed_tokens.fill_(10)
+            state.generated_tokens.fill_(3)
+            state.rng_counter.fill_(9)
+            inputs = BatchInputs.allocate(4, 2, device, capacity=4)
+            inputs.row_slot_ids.copy_(torch.tensor([3, 0, 2, 1], dtype=torch.int32, device=device))
+            inputs.row_generations.copy_(state.generation[inputs.row_slot_ids.long()])
+            inputs.live_rows.fill_(2)
+            inputs.request_state_rows[:, 0].copy_(torch.arange(1, 5, device=device))
+            inputs.page_tables.copy_(torch.arange(8, dtype=torch.int32, device=device).view(4, 2))
+            inputs.query_lengths.fill_(1)
+            inputs.sample_enabled.fill_(1)
+            pool = SimpleNamespace(backing=torch.empty(1, device=device),
+                memory_capacity=torch.tensor([16, 16], device=device),
+                last_hidden=torch.zeros((16, 4), device=device))
+            metadata = Metadata.allocate(4, 4, 2, device)
+            batch = PreparedBatch(inputs, state, metadata, mode="decode",
+                shard=TensorParallelShard(rank, 4), pool=pool)
+            decoder = _DeterministicDecoder(_ForwardScratch().rows(4, 4), metadata)
+            decoder.logits.fill_(-torch.inf)
+            decoder.logits[:, 5 + rank].fill_(8.)
+            decoder.weights, decoder.pool = SimpleNamespace(draft=None), pool
+            decoder.head = SimpleNamespace(gather=SimpleNamespace(runtime=result))
+            outputs = completion_outputs(torch.zeros((2, 4, 24), dtype=torch.int64, device=device))
+            frame = torch.zeros(1, dtype=torch.int32, device=device)
+            sequence = torch.ones(1, dtype=torch.int64, device=device)
+            initial = {name: value.clone() for name, value in vars(state).items()}
+            buffers = GraphBufferPool(device, chunk_bytes=1 << 20)
+            operation = PreparedGeneration(decoder, batch, outputs, frame, sequence, runtime=runtime,
+                coordinator=coordinator, session=session, name="ordinary", workspace=None, buffers=buffers.cursor())
+            session.tune(show_progress=False)
+            compiled = compile_forward(operation)
+            compiled()
+            torch.cuda.synchronize()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with ExitStack() as stack:
+                stack.enter_context(runtime.capture(stream=stream))
+                stack.enter_context(session.capture())
+                stack.enter_context(torch.cuda.graph(graph, stream=stream))
+                compiled()
+            session.freeze()
+            for name, value in initial.items():
+                getattr(state, name).copy_(value)
+            pool.last_hidden.zero_()
+            outputs.records.fill_(-91)
+            terminal, first_records = None, None
+            for step in (1, 2):
+                frame.fill_(step % 2)
+                sequence.fill_(step)
+                torch.cuda.synchronize()
+                dist.barrier()
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                values = {name: value.cpu() for name, value in vars(state).items()}
+                assert values["pending_token"].tolist() == [5, 4, 4, 5]
+                assert values["status"].tolist() == [2, 1, 1, 1]
+                assert values["consumed_tokens"].tolist() == [11, 10, 10, 10 + step]
+                assert values["generated_tokens"].tolist() == [4, 3, 3, 3 + step]
+                assert values["rng_counter"].tolist() == [10, 9, 9, 9 + step]
+                for name, value in initial.items():
+                    assert torch.equal(values[name][1:3], value.cpu()[1:3]), name
+                records = outputs.records.cpu()
+                assert records[step % 2, 3, 4].item() == 5
+                assert records[step % 2, 3, 1].item() == step
+                if step == 1:
+                    terminal = {name: value[0].clone() for name, value in values.items()}
+                    first_records = records[1].clone()
+                else:
+                    for name, value in terminal.items():
+                        assert torch.equal(values[name][0], value), name
+                    assert torch.equal(records[1], first_records)
+                    assert records[0, 0, 5].item() == 2
+                    assert records[0, 0, 8].item() == 0
+                    assert metadata.token_ids.cpu()[0].item() == 5
+                state_bytes = {name: (str(value.dtype), tuple(value.shape),
+                    value.contiguous().view(torch.uint8).numpy().tobytes()) for name, value in values.items()}
+                gathered = [None] * 4
+                dist.all_gather_object(gathered, state_bytes)
+                assert all(peer == state_bytes for peer in gathered), rank
+            hidden = pool.last_hidden.cpu()
+            assert hidden[[1, 4]].eq(1).all()
+            assert hidden[[2, 3]].eq(0).all()
+    finally:
+        if graph is not None:
+            graph.reset()
+        result.close()
+        runtime.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
+                    reason="requires four explicitly assigned helper GPUs")
+def test_tp4_ordinary_generation_broadcast_preserves_continuation(tmp_path):
+    import torch.multiprocessing as mp
+    assert torch.cuda.device_count() == 4
+    mp.spawn(_ordinary_generation_rank, args=((tmp_path / "ordinary").as_uri(),), nprocs=4, join=True)

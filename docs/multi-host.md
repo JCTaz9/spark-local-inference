@@ -93,8 +93,10 @@ Flare verifies that its export matches rank zero's.
 
 Received files contain only the rank's required ranges. Flare verifies their
 stored data, reuses verified cache entries, and keeps relays alive until every
-rank has finished receiving. `--package-cache PATH` selects a receiver's cache
-root, default `~/.cache/flare`. `--stage-only` on rank zero distributes and
+rank has finished receiving. `--model-cache PATH` selects a receiver's cache
+root; `--package-cache PATH` is the compatible fallback when `--model-cache` is
+absent. The default is `paths.package_cache`, otherwise
+`~/.cache/flare/packages`. `--stage-only` on rank zero distributes and
 verifies packages, then exits all ranks before GPU loading. Manual ranks apply
 normal publisher trust independently; unattended first use requires the exact
 publisher key and namespace acceptance flags described in the CLI reference.
@@ -259,12 +261,14 @@ authentication without encryption. Payloads travel through rank-owned helpers on
 using direct peer connections or ring relays selected by `--roce-ring`.
 
 The example prepares GLM-5.3 Flash on two Sparks. Run from each checkout root.
-On `maxwell`, whose preparation address is `10.200.0.12`, select an unused output:
+On `maxwell`, whose preparation address is `10.200.0.12`, publish to its model
+cache. Replace `CACHE_ENTRY` in the conversion command with the printed entry
+path after preparation completes:
 
 ```sh
 .venv/bin/ignition export glm-5.3-flash --ranks 2 \
-  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8 \
-  --output /data/flare-runtime/glm53-spark-tp2.safetensors --verbose
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-spark-tp2.safetensors
 ```
 
 On `hertz`:
@@ -317,7 +321,7 @@ throughput separately for each peer. Cache hits skip bulk payload transfer.
 Each rank loads its weights and prepares its graphs. Forward compilation is
 shared across ranks, and compiled artifacts go to the ranks that need them.
 Peers send export manifests; rank zero requests missing payload files,
-assembles the package, signs it, and encrypts executable resources. Temporary
+assembles the package, signs it, and zstd-compresses executable resources. Temporary
 staging is removed after use; reusable cached blobs remain.
 
 GLM-5.3 Flash supports `--no-context-parallel` to replicate attention pages and

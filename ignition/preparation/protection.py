@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CHUNK = 4 << 20
-VERSION = 4
+VERSION = 6
 
 
 def validate_namespace(value):

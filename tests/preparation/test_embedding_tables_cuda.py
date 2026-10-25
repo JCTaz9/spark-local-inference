@@ -58,7 +58,7 @@ def _rank(rank, sockets, root):
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     mailbox = MappedHostAllocation((4 * 24 + 1,), torch.int64, device)
     mailbox.host_view.zero_()
-    records = torch.zeros((2, 4, 8), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
     worker = graph = None
     try:
         with PreparationSession(device=device, autotune=False, compile_workers=2) as session, ExitStack() as native:
@@ -82,7 +82,7 @@ def _rank(rank, sockets, root):
             with session.capture(), torch.cuda.graph(graph):
                 compiled()
             tables = Tables(geometry, tuple(range(32)), {1: sources}, {1: inputs}, {1: mailbox}, sequence,
-                TensorParallelShard(0, 1), {},
+                TensorParallelShard(rank, 4),
                 torch.arange(6144, device=device))
             catalog = tables.resident_catalog()
             buffers = dict(tables.buffers(), output=output, live_count=count, frame_index=frame,

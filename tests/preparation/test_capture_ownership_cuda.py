@@ -10,6 +10,8 @@ import torch
 
 from ignition.components.linear import UnquantizedProjection
 from ignition.preparation.aot import BindingMismatch, BoundForward, aot_forward
+from ignition.preparation.capture import capture_forwards
+from ignition.preparation.execution import GraphSignature
 from ignition.preparation.tuning import RecordedPreparationSession
 
 
@@ -25,6 +27,52 @@ class Forward:
     def __call__(self):
         value = self.source.square() if self.operation is None else self.operation(self.source)
         self.output.copy_(value + (1 if self.offset else 0))
+
+
+@pytest.mark.parametrize("compile_decoder", [False, True])
+@pytest.mark.parametrize("autotune_effort", ["off", "medium"])
+@torch.no_grad()
+def test_forward_warmup_captures_unprimed_plans_and_cached_restart(tmp_path, compile_decoder, autotune_effort):
+    device = torch.device("cuda:0")
+    source = (torch.randn((4, 128), device=device) * .1).bfloat16()
+    weight = (torch.randn((128, 128), device=device) * .1).bfloat16()
+    projection_output = torch.empty_like(source)
+    output = torch.empty_like(source)
+    signature = GraphSignature(kind="decode", batch_capacity=4, token_capacity=1)
+    for restart in (False, True):
+        projection_output.fill_(float("nan"))
+        with RecordedPreparationSession(device=device, checkpoint="unprimed-capture",
+                workload_schema="projection", numerical_policy="bf16", compile_workers=1,
+                autotune_effort=autotune_effort) as session:
+            session.cache_dir = tmp_path / "kernels"
+            assert session.prime is False
+            operation = UnquantizedProjection(source, weight, projection_output,
+                session=session, name="projection")
+            session.tune(show_progress=False)
+            assert projection_output.isnan().all()
+            forward = Forward(source, output, operation)
+            graphs, compiled = capture_forwards({"decode": forward}, {"decode": signature},
+                session=session, device=device, stream=torch.cuda.Stream(device=device),
+                pool=torch.cuda.graph_pool_handle(), compile_decoder=compile_decoder,
+                cache_root=tmp_path / "forwards")
+            try:
+                if compile_decoder:
+                    assert compiled["decode"].cache_hit is restart
+                session.freeze()
+                for value in (.125, -.25):
+                    source.fill_(value)
+                    before = torch.cuda.memory_stats(device)
+                    graphs["decode"].replay()
+                    torch.cuda.synchronize(device)
+                    after = torch.cuda.memory_stats(device)
+                    for key in ("allocation.all.allocated", "allocation.all.freed",
+                                "segment.all.allocated", "segment.all.freed"):
+                        assert before[key] == after[key]
+                    expected = (source.float() @ weight.float().T).bfloat16() + 1
+                    torch.testing.assert_close(output, expected, atol=.01, rtol=.01)
+            finally:
+                graphs["decode"].reset()
+                compiled.clear()
 
 
 @pytest.mark.parametrize("opaque", [False, True])

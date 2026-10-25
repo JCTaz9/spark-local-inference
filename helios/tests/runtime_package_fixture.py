@@ -7,16 +7,19 @@ from pathlib import Path
 from signing import publisher
 
 
-def prepare(root, shard_size=64 << 30):
+def prepare(root, shard_size=64 << 30, legacy=False, *, capacity=65, allocation_padding=0,
+            weight_delta=0., layer_groups=False):
     import torch
     from ignition.preparation.module_images import ModuleImages
 
     torch.cuda.set_device(0)
     with ModuleImages() as images:
-        _prepare(root, images, shard_size)
+        _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
+                 weight_delta, layer_groups)
 
 
-def _prepare(root, images, shard_size):
+def _prepare(root, images, shard_size, legacy, capacity, allocation_padding,
+             weight_delta, layer_groups):
     import torch
     import cutlass
     from cuda.bindings import driver as cuda
@@ -25,10 +28,14 @@ def _prepare(root, images, shard_size):
     except ImportError:
         from b12x._lib.dense_gemm.config import _DenseGemmPolicy
         from b12x._lib.dense_gemm.compile import _get_compiled_dense_gemm
+    from ignition.preparation.rebuild_manifest import declare_weights
     from ignition.preparation.runtime_package import Allocation, Argument, Kernel, Reference, Relocation, RuntimePackage
+    from fixture_frontend import server_config
 
     torch.cuda.set_device(0)
     torch.manual_seed(21)
+    assert capacity >= 65
+    address_padding = torch.empty(allocation_padding, dtype=torch.uint8, device="cuda")
     settings = dict(
         n=128, k=128, l=1, c_l=1, a_major="k", b_major="k", c_major="n",
         ab_dtype=cutlass.Float8E4M3FN, sf_dtype=cutlass.Float8E8M0FNU,
@@ -41,13 +48,20 @@ def _prepare(root, images, shard_size):
     )
     gemm = _get_compiled_dense_gemm(**settings)
     other_gemm = _get_compiled_dense_gemm(**{**settings, "n": 256})
+    inputs = torch.randn(65, 128, 1, device="cuda").to(torch.float8_e4m3fn)
+    if capacity > 65:
+        expanded = torch.zeros(capacity, 128, 1, dtype=torch.float8_e4m3fn, device="cuda")
+        expanded[:65].copy_(inputs)
+        inputs = expanded
     tensors = {
-        "input": torch.randn(65, 128, 1, device="cuda").to(torch.float8_e4m3fn),
+        "input": inputs,
         "weight": torch.randn(128, 128, 1, device="cuda").to(torch.float8_e4m3fn),
         "scale": torch.zeros(1024, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu),
         "alpha": torch.ones(1, dtype=torch.float32, device="cuda"),
-        "scratch": torch.zeros(65, 128, 1, dtype=torch.bfloat16, device="cuda"),
+        "scratch": torch.zeros(capacity, 128, 1, dtype=torch.bfloat16, device="cuda"),
     }
+    if weight_delta:
+        tensors["weight"][0, 0, 0] = tensors["weight"][0, 0, 0].float() + weight_delta
     other_weight = torch.zeros((256, 128, 1), dtype=torch.float8_e4m3fn, device="cuda")
     other_output = torch.zeros((64, 256, 1), dtype=torch.bfloat16, device="cuda")
     other_gemm(tensors["input"][:64], other_weight, tensors["scale"], tensors["scale"],
@@ -124,9 +138,18 @@ def _prepare(root, images, shard_size):
     package = RuntimePackage(allocations=allocations, modules={}, recorder=images.native,
                              kernels=[Kernel(function, "dense", tuple(arguments)),
                                       Kernel(int(fill.func), "fill", fill_arguments)],
-                             owners=(gemm, tensors))
-    package.write(root / "package", graphs, publisher=publisher(), shard_size=shard_size,
-                  rebuild_weights={"weight": tensors["weight"]})
+                             owners=(gemm, tensors, address_padding))
+    declared = (declare_weights({"weight": tensors["weight"], "alpha": tensors["alpha"]},
+                               components={"weight": "layer-000", "alpha": "layer-001"})
+                if layer_groups else declare_weights({"weight": tensors["weight"]},
+                                                     components=("weight",)))
+    package.write(root / ("rank.json" if legacy else "package"), graphs,
+                  publisher=None if legacy else publisher(), sources=legacy,
+                  server=server_config(root),
+                  rebuild_weights={"weight": tensors["weight"]} if legacy else declared)
+    if legacy:
+        from signing import publish_captured_legacy
+        publish_captured_legacy(root / "package", root / "rank.json", shard_size=shard_size)
     tensors["input"].copy_((tensors["input"].float() * 0.25 + 0.5).to(torch.float8_e4m3fn))
     (root / "modified-input.bin").write_bytes(tensors["input"].view(torch.uint8).cpu().numpy().tobytes())
     for rows in (32, 64):
@@ -146,6 +169,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--shard-size", type=int, default=64 << 30)
+    parser.add_argument("--legacy", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size)
+    prepare(args.directory, args.shard_size, args.legacy)

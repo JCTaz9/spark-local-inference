@@ -268,7 +268,6 @@ class PreparedRound:
             verification_width=w,
             buffers=buffers,
         )
-        self.validator.accept_unsampled = False
         self.validation = PreparedAllReduce(
             self.validator.validation_input,
             self.validator.validation_sum,

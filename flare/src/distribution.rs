@@ -6,11 +6,13 @@ use crate::{
     cluster::Membership,
     fabric::{self, Failure, Topology},
     fabric_transport::{Endpoint, Relay},
-    package_cache::{self as cache, Lease},
-    trust,
+    package_cache as cache, trust,
 };
+use flare_helios::package::cache::{self as model_cache, Entry, Root};
 use flare_helios::{
-    runtime_package::{self, AuthorizedPackage, Publisher, VerifiedPackage},
+    runtime_package::{
+        self, AuthorizedPackage, NativeResources, PackageFormat, Publisher, VerifiedPackage,
+    },
     startup::StartupProgress,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,7 +20,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -27,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 const TIMEOUT: Duration = Duration::from_secs(1800);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_FRAME: usize = 16 << 20;
@@ -44,7 +46,7 @@ struct FileSpec {
     size: u64,
     ranges: Vec<(u64, u64)>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Plan {
     version: u32,
     rank: usize,
@@ -52,6 +54,16 @@ struct Plan {
     primary: String,
     directory: String,
     files: Vec<FileSpec>,
+    /// Verified identity of rank zero's selected deployment (model/deployment, not a hash).
+    #[serde(default)]
+    model: String,
+    /// Physical device platform name from hardware detection (gb202/gb10).
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    tensor_parallel: u32,
+    /// SHA-256 of rank zero's exact authenticated signed envelope.
+    expected_envelope: [u8; 32],
     publisher: Publisher,
     topology: Topology,
     streams: usize,
@@ -107,7 +119,7 @@ fn endpoint() -> Result<(TcpListener, Endpoint), Failure> {
 pub struct Received {
     pub authorized: AuthorizedPackage,
     pub membership: Membership,
-    pub lease: Option<Lease>,
+    pub lease: Option<Entry>,
 }
 
 /// Rank zero already owns the trusted complete package. Peers receive only their required ranges.
@@ -136,6 +148,13 @@ pub fn root(
         .ok_or("package filename must be UTF-8")?
         .to_owned();
     let streams = args.transfer_streams.unwrap_or(8) as usize;
+    let signed = package.identity().map_err(|e| e.to_string())?;
+    let expected_envelope = package.envelope_digest();
+    let platform = if flare_helios::package::naming::PLATFORMS.contains(&signed.hardware.as_str()) {
+        signed.hardware.clone()
+    } else {
+        String::new()
+    };
     let mut files = Vec::new();
     let mut specifications = Vec::new();
     for rank in 0..world {
@@ -210,6 +229,10 @@ pub fn root(
                 version: VERSION,
                 rank,
                 export: export.clone(),
+                model: signed.model.clone(),
+                platform: platform.clone(),
+                tensor_parallel: signed.tensor_parallel,
+                expected_envelope,
                 primary: primary.clone(),
                 directory: format!("{export}-{}-rank{rank}", specifications[rank][0].size),
                 files: specifications[rank].clone(),
@@ -279,6 +302,33 @@ fn expect(socket: &mut TcpStream, expected: &str) -> Result<(), Failure> {
 }
 
 /// A manually launched peer needs only its rank, rendezvous address, and publisher acceptance.
+fn model_cache_root(args: &Run) -> Option<&std::path::Path> {
+    args.hub
+        .model_cache
+        .as_deref()
+        .or(args.package_cache.as_deref())
+}
+
+/// Fill the peer's selection from the received distribution plan when the user omitted it.
+/// An explicit conflicting selection is rejected rather than overwritten.
+fn select_plan_tensor_parallel(args: &mut Run, tensor_parallel: u32) -> Result<(), Failure> {
+    if tensor_parallel == 0 {
+        return Err("serving distribution plan has no tensor-parallel size".into());
+    }
+    match args.serving.hub.tensor_parallel.as_slice() {
+        [] => {
+            args.serving.hub.tensor_parallel.push(tensor_parallel);
+            Ok(())
+        }
+        [selected] if *selected == tensor_parallel => Ok(()),
+        _ => Err(format!(
+            "requested tensor-parallel size {:?} differs from rank zero's plan {tensor_parallel}",
+            args.serving.hub.tensor_parallel
+        )
+        .into()),
+    }
+}
+
 pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, Failure> {
     let rank = args.rank.ok_or("a peer requires --rank")?;
     if rank == 0 {
@@ -336,31 +386,21 @@ pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, 
     args.roce_ring = plan.topology.ring;
     args.roce_chain = plan.topology.chain;
     args.stage_only = plan.stage_only;
+    select_plan_tensor_parallel(args, plan.tensor_parallel)?;
     let relay = Relay::start(rank, plan.streams, plan.topology.clone(), network, 0)?;
     write(&mut control, &"ready")?;
     expect(&mut control, "transfer")?;
     if let Some(path) = args.package.as_ref().filter(|path| path.is_file()) {
-        let cache_root = args
-            .package_cache
-            .clone()
-            .unwrap_or_else(cache::default_root)
-            .join("packages");
-        let lease = if path
-            .canonicalize()?
-            .starts_with(cache_root.canonicalize().unwrap_or(cache_root))
-        {
-            Some(Lease::shared(
-                path.parent().ok_or("package path lacks a parent")?,
-            )?)
-        } else {
-            None
-        };
+        let cache_root = cache::model_root(model_cache_root(args))?;
+        // A path inside the managed model cache is leased before it is read, so collection and
+        // eviction cannot reclaim the entry while this rank serves from it. Caller-owned packages
+        // outside the cache remain their own responsibility.
+        let lease = Root::open(&cache_root)
+            .map_err(|e| e.to_string())?
+            .entry_for_path(path)
+            .map_err(|e| e.to_string())?;
         let (authorized, _) = trust::load(path, args, progress, None).map_err(|e| e.to_string())?;
-        if runtime_package::package_cluster(&authorized)
-            != Some((plan.topology.links.len(), plan.export.clone()))
-        {
-            return Err("local package differs from rank zero's export".into());
-        }
+        verify_local_package(&authorized, &plan)?;
         write(&mut control, &"verified")?;
         expect(&mut control, "serve")?;
         relay.finish()?;
@@ -370,68 +410,10 @@ pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, 
             lease,
         });
     }
-    let cache = args
-        .package_cache
-        .clone()
-        .unwrap_or_else(cache::default_root);
-    for file in &plan.files {
-        cache::entry(
-            &cache,
-            "packages",
-            &format!("{}/{}", plan.directory, file.name),
-        )?;
-        cache::validate_ranges(file.size, &file.ranges)?;
-    }
-    let path = cache::entry(
-        &cache,
-        "packages",
-        &format!("{}/{}", plan.directory, plan.primary),
-    )?;
-    let lease = Lease::shared(path.parent().unwrap())?;
-    let marker = path.parent().unwrap().join(".verified");
-    let marker_text = format!("{} {}\n", plan.primary, plan.files[0].size);
-    let complete = || -> Result<bool, Failure> {
-        if fs::read_to_string(&marker).ok().as_deref() != Some(&marker_text) {
-            return Ok(false);
-        }
-        for file in &plan.files {
-            if cache::have(
-                &cache,
-                "package",
-                &format!("{}/{}", plan.directory, file.name),
-                file.size,
-            )?
-            .is_none()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    if !complete()? {
-        lease.exclusive()?;
-        if !complete()? {
-            let phase = progress.phase("Receive rank package over CX7", None);
-            let result = receive_files(&cache, &plan, &relay).and_then(|()| {
-                VerifiedPackage::open(&path, std::slice::from_ref(&plan.publisher), Some(rank))
-                    .and_then(|p| p.verify_stored_data())
-                    .map_err(|e| e.to_string())?;
-                fs::write(&marker, &marker_text)?;
-                Ok(())
-            });
-            if let Err(e) = result {
-                // A rejected sparse package must not look complete on a subsequent attempt.
-                for file in &plan.files {
-                    let _ = fs::remove_file(path.with_file_name(&file.name));
-                }
-                let _ = fs::remove_file(&marker);
-                return Err(e);
-            }
-            phase.finish(format!("rank {rank} verified"));
-        }
-        lease.downgrade()?;
-    }
-    let profiles = cache.join("publishers");
+    let model_root = cache::model_root(model_cache_root(args))?;
+    let entry = receive_rank(&model_root, &plan, &relay, progress, rank)?;
+    let path = entry.directory().join("model.safetensors");
+    let profiles = model_root.join("publishers");
     fs::create_dir_all(&profiles)?;
     let profile = profiles.join(format!("{}.json", plan.publisher.fingerprint()));
     fs::write(&profile, serde_json::to_vec(&vec![&plan.publisher])?)?;
@@ -453,8 +435,182 @@ pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, 
     Ok(Received {
         authorized,
         membership: Membership::Peer(membership(control)?),
-        lease: Some(lease),
+        lease: Some(entry),
     })
+}
+
+/// Compare a locally supplied authorized package with rank zero's plan.
+fn verify_local_package(package: &AuthorizedPackage, plan: &Plan) -> Result<(), Failure> {
+    if package.envelope_digest() != plan.expected_envelope {
+        return Err("local package signed envelope differs from rank zero's package".into());
+    }
+    let identity = package.identity().map_err(|error| error.to_string())?;
+    let cluster_ok = identity.cluster.as_ref().is_some_and(|cluster| {
+        cluster.world as usize == plan.topology.links.len() && cluster.export == plan.export
+    });
+    if identity.model != plan.model
+        || identity.tensor_parallel != plan.tensor_parallel
+        || !cluster_ok
+    {
+        return Err("local package differs from the planned verified identity".into());
+    }
+    Ok(())
+}
+
+/// Verify one received rank against the plan using signed metadata only, then hash its stored
+/// bytes. Returns the verified package for the caller to retain or discard.
+fn verify_plan(
+    path: &Path,
+    plan: &Plan,
+    rank: usize,
+) -> Result<runtime_package::VerifiedPackage, Failure> {
+    // Open exactly the deployment the sender selected. Payload packages can hold several
+    // deployments, so they are opened by topology; legacy packages are one prepared size and use
+    // the compatibility constructor. Both keep their normal signature/rank verification.
+    let rank_id = u32::try_from(rank).map_err(|_| "rank id exceeds the package rank domain")?;
+    let package = match NativeResources::package_format(path).map_err(|e| e.to_string())? {
+        PackageFormat::Payload => runtime_package::VerifiedPackage::open_tensor_parallel(
+            path,
+            std::slice::from_ref(&plan.publisher),
+            plan.tensor_parallel,
+            Some(rank_id),
+        ),
+        PackageFormat::Legacy => runtime_package::VerifiedPackage::open(
+            path,
+            std::slice::from_ref(&plan.publisher),
+            Some(rank),
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+    if package.envelope_digest() != plan.expected_envelope {
+        return Err("received rank signed envelope differs from rank zero's package".into());
+    }
+    package.verify_stored_data().map_err(|e| e.to_string())?;
+    let identity = package.identity().map_err(|e| e.to_string())?;
+    // Distribution carries one rank of a multi-host package. The signed cluster identity must
+    // match the planned world and export exactly; an absent cluster identity is rejected.
+    let cluster_ok = identity.cluster.as_ref().is_some_and(|cluster| {
+        cluster.world as usize == plan.topology.links.len() && cluster.export == plan.export
+    });
+    if identity.model != plan.model
+        || identity.tensor_parallel != plan.tensor_parallel
+        || !cluster_ok
+    {
+        return Err("received rank differs from the planned verified identity".into());
+    }
+    Ok(package)
+}
+
+fn receiver_candidate(platform: &str, tensor_parallel: u32) -> Result<String, Failure> {
+    use flare_helios::package::naming;
+    let now = std::time::SystemTime::now();
+    if naming::PLATFORMS.contains(&platform) {
+        return naming::candidate(platform, tensor_parallel, now).ok_or(
+            "receiver naming requires a supported platform and tensor-parallel size".into(),
+        );
+    }
+    naming::unknown_device_candidate(&[tensor_parallel], now)
+        .ok_or("receiver naming requires a tensor-parallel size".into())
+}
+
+/// Receive, verify, and publish one sparse rank package inside the model cache transaction.
+///
+/// Warm reuse resolves `<export>-rank<rank>` and re-validates the selected rank before use.
+/// A miss stages an owned tree, receives the sparse ranges, flattens them to the canonical entry
+/// root, verifies the selected rank, commits the entry, records the source reference, and selects
+/// the entry only after publication. The returned `Entry` lease must be retained through serving.
+pub(crate) fn receive_rank(
+    model_root: &Path,
+    plan: &Plan,
+    relay: &Relay,
+    progress: &StartupProgress,
+    rank: usize,
+) -> Result<Entry, Failure> {
+    let root = Root::open(model_root).map_err(|e| e.to_string())?;
+    // Warm reuse keys on the distributed source identity and this rank, never on a claim of full
+    // package readiness: a sparse rank slice is not a complete package.
+    let selector = format!("{}-rank{rank}", plan.export);
+    let (entry, path) = match root
+        .resolve_source_ref(&selector)
+        .map_err(|e| e.to_string())?
+    {
+        Some((_revision, entry)) => {
+            let path = entry.directory().join("model.safetensors");
+            if path.is_file() && verify_plan(&path, plan, rank).is_ok() {
+                (Some(entry), path)
+            } else {
+                (None, PathBuf::new())
+            }
+        }
+        None => (None, PathBuf::new()),
+    };
+    if let Some(entry) = entry {
+        // Warm reuse is a successful acquisition: it moves the selected default like a fresh
+        // download, under the same atomic last-writer-wins ref semantics.
+        root.publish_entry(&entry).map_err(|e| e.to_string())?;
+        return Ok(entry);
+    }
+    {
+        for file in &plan.files {
+            cache::validate_ranges(file.size, &file.ranges)?;
+        }
+        if plan.model.is_empty() || plan.tensor_parallel == 0 {
+            return Err("rank plan lacks verified model/deployment identity".into());
+        }
+        let model = model_cache::model_key(&plan.model).map_err(|e| e.to_string())?;
+        let candidate = receiver_candidate(&plan.platform, plan.tensor_parallel)?;
+        let staging = root
+            .stage_named(&model, &candidate)
+            .map_err(|e| e.to_string())?;
+        {
+            let phase = progress.phase("Receive rank package over CX7", None);
+            let staging_dir = staging.directory().to_path_buf();
+            let received = receive_files(&staging_dir, &plan, &relay).and_then(|()| {
+                // Cache readers resolve model.safetensors and companions at the entry root, not
+                // under a transport directory; flatten the received sparse files in place.
+                let nested = staging_dir.join("packages").join(&plan.directory);
+                for file in &plan.files {
+                    let source = nested.join(&file.name);
+                    let destination = if file.name == plan.primary {
+                        staging_dir.join("model.safetensors")
+                    } else {
+                        staging_dir.join(&file.name)
+                    };
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::rename(&source, &destination).map_err(|e| e.to_string())?;
+                }
+                let _ = fs::remove_dir_all(staging_dir.join("packages"));
+                let path = staging_dir.join("model.safetensors");
+                verify_plan(&path, plan, rank)?;
+                Ok(())
+            });
+            if let Err(error) = received {
+                staging.abort();
+                return Err(error);
+            }
+            phase.finish(format!("rank {rank} verified"));
+        }
+        let entry = staging.commit().map_err(|e| e.to_string())?;
+        if let Err(error) =
+            root.publish_source_ref(&selector, &plan.export, &entry, plan.expected_envelope)
+        {
+            // The entry is not yet selected; report the original failure and any cleanup conflict.
+            let (model_key, entry_id) = (entry.model().to_owned(), entry.id().to_owned());
+            drop(entry);
+            return match root.remove(&model_key, &entry_id, false) {
+                Ok(()) => Err(error.to_string().into()),
+                Err(cleanup) => Err(format!(
+                    "{error}; unselected cache entry {model_key}/{entry_id} could not be removed: {cleanup}"
+                )
+                .into()),
+            };
+        }
+        // A verified rank package is complete for this host; select it only after publication.
+        root.publish_entry(&entry).map_err(|e| e.to_string())?;
+        Ok(entry)
+    }
 }
 
 fn receive_files(cache: &Path, plan: &Plan, relay: &Relay) -> Result<(), Failure> {
@@ -737,6 +893,219 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peer_cache_root_prefers_model_cache_then_package_cache() {
+        use clap::Parser as _;
+        let run = |arguments: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(arguments).unwrap();
+            match cli.command {
+                crate::cli::Command::Run(run) => *run,
+                _ => panic!("expected run command"),
+            }
+        };
+        let both = run(&[
+            "flare",
+            "run",
+            "/tmp/package.safetensors",
+            "--package-cache",
+            "/tmp/package-cache",
+            "--model-cache",
+            "/tmp/model-cache",
+        ]);
+        assert_eq!(
+            model_cache_root(&both),
+            Some(std::path::Path::new("/tmp/model-cache"))
+        );
+        let package_only = run(&[
+            "flare",
+            "run",
+            "/tmp/package.safetensors",
+            "--package-cache",
+            "/tmp/package-cache",
+        ]);
+        assert_eq!(
+            model_cache_root(&package_only),
+            Some(std::path::Path::new("/tmp/package-cache"))
+        );
+        let neither = run(&["flare", "run", "/tmp/package.safetensors"]);
+        assert_eq!(model_cache_root(&neither), None);
+    }
+
+    #[test]
+    fn plan_tensor_parallel_fills_missing_and_rejects_conflicts() {
+        use clap::Parser as _;
+        let run = |tensor_parallel: Option<&str>| {
+            let mut arguments = vec![
+                "flare".to_owned(),
+                "run".to_owned(),
+                "/tmp/package.safetensors".to_owned(),
+            ];
+            if let Some(value) = tensor_parallel {
+                arguments.extend(["--tensor-parallel".to_owned(), value.to_owned()]);
+            }
+            let cli = crate::cli::Cli::try_parse_from(arguments).unwrap();
+            match cli.command {
+                crate::cli::Command::Run(run) => *run,
+                _ => panic!("expected run command"),
+            }
+        };
+
+        let mut omitted = run(None);
+        select_plan_tensor_parallel(&mut omitted, 2).unwrap();
+        assert_eq!(omitted.serving.hub.tensor_parallel, vec![2]);
+
+        let mut matching = run(Some("2"));
+        select_plan_tensor_parallel(&mut matching, 2).unwrap();
+        assert_eq!(matching.serving.hub.tensor_parallel, vec![2]);
+
+        let mut conflict = run(Some("4"));
+        let error = select_plan_tensor_parallel(&mut conflict, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("differs from rank zero's plan"), "{error}");
+        assert_eq!(conflict.serving.hub.tensor_parallel, vec![4]);
+    }
+
+    #[test]
+    fn selected_plan_tp_verifies_existing_multi_deployment_package() {
+        use clap::Parser as _;
+        let temp = tempfile::tempdir().unwrap();
+        let (files, _, plan) = cache_tests::fixture(temp.path(), "selected-plan-tp");
+        let package = files
+            .iter()
+            .find(|path| path.ends_with("model.safetensors"))
+            .unwrap()
+            .parent()
+            .unwrap();
+        let arguments = vec![
+            "flare".to_owned(),
+            "run".to_owned(),
+            package.join("model.safetensors").display().to_string(),
+        ];
+        let cli = crate::cli::Cli::try_parse_from(&arguments).unwrap();
+        let mut args = match cli.command {
+            crate::cli::Command::Run(run) => *run,
+            _ => panic!("expected run command"),
+        };
+        select_plan_tensor_parallel(&mut args, plan.tensor_parallel).unwrap();
+        let selected = args.serving.hub.tensor_parallel[0];
+        let verified = runtime_package::VerifiedPackage::open_tensor_parallel(
+            package,
+            std::slice::from_ref(&plan.publisher),
+            selected,
+            Some(1),
+        )
+        .unwrap();
+        let identity = verified.identity().unwrap();
+        assert_eq!(identity.tensor_parallel, plan.tensor_parallel);
+    }
+
+    #[test]
+    #[ignore = "requires FLARE_LEGACY_FIXTURE with a signed multi-host legacy package and publisher.json"]
+    fn receive_rank_accepts_old_metadata_with_empty_platform() {
+        use flare_helios::runtime_package::{VerifiedPackage, rank_ranges};
+        let fixture = PathBuf::from(
+            std::env::var_os("FLARE_LEGACY_FIXTURE")
+                .expect("FLARE_LEGACY_FIXTURE must name the legacy fixture"),
+        );
+        let primary = fixture.join("model.safetensors");
+        let profile = fixture.join("publisher.json");
+        let publishers: Vec<runtime_package::Publisher> =
+            serde_json::from_slice(&std::fs::read(profile).unwrap()).unwrap();
+        let verified =
+            VerifiedPackage::open(&primary, std::slice::from_ref(&publishers[0]), None).unwrap();
+        let authorized = verified.authorize(&publishers[0].namespace, false).unwrap();
+        let identity = authorized.identity().unwrap();
+        let cluster = identity
+            .cluster
+            .clone()
+            .expect("fixture must be multi-host");
+        let rank = 1usize;
+        let ranges = rank_ranges(&authorized, rank).unwrap();
+        let primary_name = primary.file_name().unwrap().to_string_lossy().into_owned();
+        let mut handles = Vec::new();
+        let mut specs = Vec::new();
+        for range in ranges {
+            let name = if range.filename.is_empty() {
+                primary_name.clone()
+            } else {
+                range.filename
+            };
+            specs.push(FileSpec {
+                name,
+                size: range.file.metadata().unwrap().len(),
+                ranges: range.ranges,
+            });
+            handles.push(range.file);
+        }
+        let source = Source::start(
+            vec![Vec::new(), handles],
+            vec![Vec::new(), specs.clone()],
+            1,
+        )
+        .unwrap();
+        let network0 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let network1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ports = vec![
+            network0.local_addr().unwrap().port(),
+            network1.local_addr().unwrap().port(),
+        ];
+        let topology = Topology::plan(
+            &vec![
+                b"a 127.0.0.1/8
+"
+                .to_vec();
+                2
+            ],
+            &ports,
+            false,
+        )
+        .unwrap();
+        let _relay0 = Relay::start(0, 1, topology.clone(), network0, source.port).unwrap();
+        let relay1 = Relay::start(1, 1, topology.clone(), network1, 0).unwrap();
+        let plan = Plan {
+            version: VERSION,
+            rank,
+            export: cluster.export,
+            primary: primary_name,
+            directory: format!("legacy-export-rank{rank}"),
+            files: specs.clone(),
+            model: identity.model,
+            platform: String::new(),
+            tensor_parallel: identity.tensor_parallel,
+            expected_envelope: authorized.envelope_digest(),
+            publisher: publishers[0].clone(),
+            topology,
+            streams: 1,
+            stage_only: true,
+        };
+        let model_root = tempfile::tempdir().unwrap();
+        let entry = receive_rank(
+            model_root.path(),
+            &plan,
+            &relay1,
+            &StartupProgress::silent(),
+            rank,
+        )
+        .unwrap();
+        assert!(
+            entry.id().starts_with("unknown-device-tp2-"),
+            "empty platform did not produce an explicit unknown-device name: {}",
+            entry.id()
+        );
+    }
+
+    #[test]
+    fn receiver_name_uses_package_platform_or_explicit_unknown_label() {
+        let gb202 = receiver_candidate("gb202", 2).unwrap();
+        assert!(gb202.starts_with("gb202-tp2-"), "{gb202}");
+        let unknown = receiver_candidate("", 2).unwrap();
+        assert!(unknown.starts_with("unknown-device-tp2-"), "{unknown}");
+        let sm = receiver_candidate("sm120", 2).unwrap();
+        assert!(sm.starts_with("unknown-device-tp2-"), "{sm}");
+        assert!(!sm.contains("sm120"), "{sm}");
+    }
+
+    #[test]
     fn source_waits_for_receiver_file_verification() {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"payload").unwrap();
@@ -838,6 +1207,10 @@ mod tests {
                             primary: specs[rank][0].name.clone(),
                             directory: format!("export-rank{rank}"),
                             files: specs[rank].clone(),
+                            model: "fixture".into(),
+                            platform: "gb202".into(),
+                            tensor_parallel: world as u32,
+                            expected_envelope: [0; 32],
                             publisher: Publisher {
                                 name: "Fixture".into(),
                                 namespace: "local-development".into(),
@@ -904,3 +1277,6 @@ mod tests {
         assert!(source.finish().is_err());
     }
 }
+
+#[cfg(test)]
+mod cache_tests;

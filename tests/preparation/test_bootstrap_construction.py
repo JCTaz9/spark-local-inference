@@ -626,7 +626,7 @@ def test_prepare_model_constructs_real_catalog_on_meta(
         assert args["completion"].records.shape == (
             2,
             config.request_capacity,
-            8 if proposal == "ordinary" else 24,
+            24,
         )
         assert args["completion"].records.dtype == torch.int64
         pool = args["state"].pool

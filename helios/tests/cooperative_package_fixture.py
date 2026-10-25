@@ -116,11 +116,13 @@ extern "C" __global__ void ordinary(int *out, int n) { work<false>(out, n); }
     package = RuntimePackage(allocations=allocations, modules={"workers": cubin},
         kernels=[Kernel(f.value, "workers", (Argument(8), Argument(4))) for f in functions.values()])
     stage = root / "rank.json"
-    package.write(stage, graphs, sources=True)
-    from ignition.preparation.package_file import combine, read_sources, write_sources
+    from fixture_frontend import server_config
+    package.write(stage, graphs, sources=True, server=server_config(root))
+    from ignition.preparation.package_file import (
+        combine, read_sources, read_sources_record, write_sources)
     from ignition.preparation import runtime_package_pb2 as proto
 
-    index, locate = read_sources(stage)
+    index, locate, metadata = read_sources_record(stage)
     bundle = index.ranks[0]
     replacements = {}
     for graph in bundle.graphs:
@@ -155,8 +157,13 @@ extern "C" __global__ void ordinary(int *out, int n) { work<false>(out, n); }
             for source, offset, length in locate(span):
                 payload.append((cursor, source, offset, length))
                 cursor += length
+    for asset in index.assets:
+        cursor = asset.payload.offset
+        for source, offset, length in locate(asset.payload):
+            payload.append((cursor, source, offset, length))
+            cursor += length
     rewritten = root / "workers.json"
-    write_sources(rewritten, index, sorted(payload))
+    write_sources(rewritten, index, sorted(payload), **metadata)
     combine(root / "package", [rewritten], [], publisher=publisher())
     (root / "expected.json").write_text(json.dumps({"length": elements, "grids": expected}))
     cuda.call("cuCtxDestroy_v2", context)

@@ -47,7 +47,14 @@ impl NativeResources {
                     .position(|name| *name == g.name)
                     .ok_or_else(|| invalid("execution references an unknown graph"))?;
                 Ok(GraphDescriptor {
-                    draft_tokens: if g.kind == "packed_speculative" { g.draft_tokens.ok_or_else(|| invalid("packed speculative graph lacks proposal depth"))? as usize } else { 0 },
+                    confidence_width: g.confidence_width as usize,
+                    draft_tokens: if g.kind == "speculative" {
+                        g.draft_tokens.ok_or_else(|| {
+                            invalid("speculative graph lacks proposal depth")
+                        })? as usize
+                    } else {
+                        0
+                    },
                     packed_token_capacity: size(g.packed_token_capacity)?,
                     name: g.name.clone(),
                     kind: g.kind.as_str().try_into()?,

@@ -25,6 +25,7 @@ from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -49,6 +50,7 @@ from .mtp import PreparedFeedback, PreparedRound
 class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     device: int = 0
@@ -83,6 +85,31 @@ class PreparationConfig:
     def speculative_shapes(self):
         return (speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
                 if self.mtp else ())
+
+
+def _declared_weight_roots(weights):
+    """One semantic root per decoder layer: its canonical module and prepared projections.
+
+    A single `projections` payload would hold every layer's packed projections,
+    so one layer's change would rename the whole model. Each layer's prepared
+    projections are grouped with that layer instead; keys are matched by their
+    declared `layers.N.` prefix here, never by native path inference.
+    """
+    roots = {'embedding': weights.tree.embed_tokens, 'norm': weights.tree.norm,
+             'head': weights.head, 'draft': weights.draft}
+    components = {name: name for name in roots}
+    prepared = dict(weights.projections)
+    for index, layer in enumerate(weights.tree.layers):
+        prefix = f'layers.{index}.'
+        owned = {name: value for name, value in prepared.items() if name.startswith(prefix)}
+        for name in owned:
+            del prepared[name]
+        group = f'layer-{index:03d}'
+        roots[group] = (layer, owned)
+        components[group] = group
+    if prepared:
+        raise ValueError(f"unassigned prepared projections: {sorted(prepared)}")
+    return roots, components
 
 
 @torch.no_grad()
@@ -120,13 +147,14 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if config.mtp else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         coordinator = None
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],
             "contract": "qwen38-dense.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device, checkpoint=identity,
             workload_schema="qwen38-dense", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -260,7 +288,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
         speculative_shapes=shapes, graph_buffer_bytes=graph_buffers.nbytes, private_buffer_bytes=private_buffers.nbytes)
     if scoring is not None:
         memory.update(scoring.memory_report())
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
+    roots, components = _declared_weight_roots(weights)
+    return PreparedModel(rebuild_weights=declare_weights(roots, components=components, layers=()), device=config.device, graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(() if scoring is None else (scoring,)),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

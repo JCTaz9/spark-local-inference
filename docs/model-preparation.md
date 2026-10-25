@@ -3,35 +3,39 @@
 ## Runtime packages
 
 Run commands from the repository root. Ignition prepares a source checkpoint
-into a **runtime package**: a metadata-only primary `.safetensors` file and
-immutable sibling payload blobs named by their SHA-256 hashes. The primary's
-`flare.metadata` contains the signed Protobuf envelope; `flare.layout` maps its
-logical resources to the blobs. `flare.payload` is empty. Weights, embedding
-tables, graphs, kernels, and frontend assets all reside in payload blobs.
-Adjacent weight resources owned by one rank share shards up to the file-size
-limit. Graphs, kernels, and supporting resources use separate shards so changing
-them does not rewrite unchanged weight shards. Rank ownership and logical file
-boundaries remain separate for selective distribution. Export, conversion, and
-signing use the same grouping rule.
+into a **runtime package** and publishes a directory entry in
+`paths.package_cache` (default `~/.cache/flare/packages`). Its primary,
+`model.safetensors`, contains the signed `flare.manifest`, unsigned
+`flare.locations`, optional reconstruction hints, and frontend assets. Readably
+named safetensors companions hold layer weights, tuning-dependent weights,
+initial state, zstd-compressed cubins, and graph records. Cache companions hardlink
+immutable payload objects whose identities hash the payload bytes.
 
-The published payload-file limit is 64 GB (64,000,000,000 bytes), including the
-header. The reader also accepts existing payloads up to 64 GiB. `--shard-size SIZE`
-overrides `[publishing] shard_size` with a smaller positive limit. Resources
-remain contiguous; export rejects a resource that exceeds the limit. Existing
-monolithic and numbered-shard packages remain loadable.
+The first canonical form packs the package into one `.safetensors` file; the
+second is the directory form used by the cache. Export always publishes to that
+cache. `ignition convert CACHE_ENTRY --output DIRECTORY` creates a standalone
+directory; `ignition convert CACHE_ENTRY --form packed --output FILE` creates
+one exact file path. `CACHE_ENTRY` is the path printed by export. Packing and
+unpacking preserve signed payloads and require no signing key or GPU. Layer payloads are not grouped by a size threshold. Internal
+logical-resource packages use envelope 6 with monolithic, numbered-shard, or
+blob layouts. Legacy blob publication uses a fixed maximum of 64 GiB per file;
+there is no configurable shard-size threshold.
 
-Exports hardlink unchanged blobs from `paths.package_cache`. `ignition export
---no-weights` requires exact cached stored-data payloads and creates only missing
-execution-resource blobs and metadata. Preparation and weight reads still occur.
-Recipes can declare `export_repository`; without `--output`, exports use a unique
-snapshot directory under that repository's local cache namespace. See
-[package snapshots](cli-design.md#package-snapshots) for conversion and upload.
+`ignition export --no-weights` requires the exact stable and tuned weight
+payloads in the cache. Initial state and execution resources may change with
+the prepared capacities. Preparation and weight reads still occur. Successful
+exports select their cache entry as the model's default. Recipes can declare
+`export_repository` as the Hugging Face publishing target; prepared storage
+uses the shared Flare cache. Multi-host export publishes the complete entry
+in the coordinator's cache. See [package snapshots](cli-design.md#package-snapshots) for cache
+management, conversion, and upload.
 
-Tensor-parallel packages contain one resource bundle per rank.
-Final packages use a format-4 signed envelope and encrypted cubins and graph
-records. Ignition creates a per-user development signing key when `[publishing]`
-is absent. `flare run` needs the corresponding publisher profile and first-use
-acceptance. See [signing and development](cli-design.md#signing-and-local-development).
+Each tensor-parallel deployment contains independently prepared rank metadata,
+graphs, and kernels. Combining exported deployments can share or reconstruct
+byte-identical weights; it cannot create an unexported TP size. Ignition creates
+a per-user development signing key when `[publishing]` is absent. `flare run`
+needs the corresponding publisher profile and first-use acceptance. See
+[signing and development](cli-design.md#signing-and-local-development).
 Unsigned rank staging is private to preparation and cannot load in Helios.
 
 Flare loads the package files without Python. Helios is a Rust library;
@@ -172,9 +176,10 @@ Multi-host `--ranks` preparation retains its existing sharding and transport;
 
 ## Exporting runtime packages
 
-Choose an unused output filename; export appends `.safetensors` if needed and
-refuses to overwrite one. Do not
-delete an existing package merely to reuse its name. `MODEL` can also be a
+Export publishes a directory entry in the shared model cache and prints its
+path. In the examples below, replace `CACHE_ENTRY` with that path before running
+`ignition convert`. Conversion requires an unused destination and does not append
+a suffix. Do not delete an existing package merely to reuse its name. `MODEL` can also be a
 supported repository ID or a local source-checkpoint directory. Ignition
 downloads missing source weights, loads and tunes kernels, compiles forwards,
 warms and captures execution variants, writes the package, and exits.
@@ -192,8 +197,8 @@ Hugging Face hub cache (`~/.cache/huggingface/hub`), or `[paths].hub_cache` when
 ```sh
 .venv/bin/python -m ignition export nemotron-bolt-24gb --gpus 0 \
   --max-concurrency 8 --prefill-chunk-size 4096 --mtp-draft-tokens 7 \
-  --speculative-token-capacity 64 \
-  --output /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors --verbose
+  --speculative-token-capacity 64 --verbose
+.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/nemotron-bolt-images-lilicorr-c8.safetensors \
@@ -231,8 +236,8 @@ host-mapped tables or vision graphs. Prepare on the same GPU architecture as
 the serving device:
 
 ```sh
-.venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 \
-  --output /data/flare-runtime/qwen38-27b-tp1-c4.safetensors --verbose
+.venv/bin/ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1-c4.safetensors
 ```
 
 Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
@@ -250,12 +255,12 @@ Export Qwen with up to five MTP draft tokens per round:
 
 ```sh
 .venv/bin/ignition export qwen3.8-flash --gpus 2 \
-  --mtp-draft-tokens 5 --max-concurrency 32 \
-  --output /data/flare-runtime/qwen38-tp1-mtp5.safetensors --verbose
+  --mtp-draft-tokens 5 --max-concurrency 32 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-tp1-mtp5.safetensors
 
 .venv/bin/ignition export qwen3.8-flash --gpus 0,1 \
-  --mtp-draft-tokens 5 --max-concurrency 32 \
-  --output /data/flare-runtime/qwen38-tp2-mtp5.safetensors --verbose
+  --mtp-draft-tokens 5 --max-concurrency 32 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-tp2-mtp5.safetensors
 ```
 
 Qwen defaults to 32 concurrent requests, five MTP draft tokens, and 128 target-token
@@ -288,7 +293,8 @@ rank. Four image slots therefore reserve 320 MiB even with 32 active request slo
 
 N-gram tables use indirect delivery exclusively: every graph consumes compact
 GPU row buffers filled by Helios. Qwen PLE tables are stored once in the package.
-Helios reads the 26.8 GiB table from disk by default on every GPU;
+Helios reads the 26.8 GiB table from disk by default, sharing the reader and
+row cache across local GPUs;
 `flare run --embedding-table-storage ram` keeps it in resident host memory.
 The graph publishes GPU-produced lookup IDs before layer
 0 and waits for row delivery at the layer-1 consumer. Disk and RAM delivery
@@ -325,8 +331,10 @@ without padding. Attention partitions whole output groups: padding eight groups
 to nine gives each rank three groups and 24 heads. The last rank's extra group
 has zero query and output weights; all checkpoint weights and scales remain
 unchanged. Vocabulary shards contain 43136 rows each; the 128 extra gathered
-logits are excluded before sampling. Engram's 24 heads divide evenly across
-three ranks.
+logits are excluded before sampling. Engram's projection input columns divide its 24 heads evenly across three
+ranks. Every host stores full Engram tables in checkpoint row order; local ranks
+share table reads and bounded host caching. Graphs request canonical table rows,
+and each rank selects its head columns for the partial projection before reduction.
 Exports use the native DeepSeek V4.1 prompt encoder and include only the tokenizer
 asset. Vision exports bind the atomic `<｜deepseek_image｜>` token as ID 129264,
 which must agree with checkpoint `image_token_id`. Packages without explicit
@@ -418,8 +426,8 @@ Select four available GPUs explicitly:
 ```sh
 .venv/bin/python -m ignition export deepseek-v4.1-flash --gpus 0,4,6,8 \
   --max-concurrency 32 --mtp-draft-tokens 5 --prefill-chunk-size 4096 \
-  --speculative-token-capacity 128 --speculative-graph-budget 64 --expert-scale-compression csf \
-  --output /data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors --verbose
+  --speculative-token-capacity 128 --speculative-graph-budget 64 --expert-scale-compression csf --verbose
+.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/deepseek-v41-flash-1017-csf-tp4-c32-dspark5.safetensors \
@@ -503,8 +511,8 @@ Use two or four available GPUs for preparation and serving:
 
 ```sh
 .venv/bin/python -m ignition export deepseek-v4-flash --gpus 3,4,5,6 \
-  --max-concurrency 4 --mtp-draft-tokens 5 --prefill-chunk-size 4096 \
-  --output /data/flare-runtime/deepseek-v4-flash-vision-tp4-c4-dspark5.safetensors --verbose
+  --max-concurrency 4 --mtp-draft-tokens 5 --prefill-chunk-size 4096 --verbose
+.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek-v4-flash-vision-tp4-c4-dspark5.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/deepseek-v4-flash-vision-tp4-c4-dspark5.safetensors \
@@ -531,8 +539,8 @@ Select eight available GPUs:
 
 ```sh
 .venv/bin/ignition export mimo-v2.6-pro-mopd --gpus 0,1,2,3,4,5,6,7 \
-  --max-concurrency 4 --mtp-draft-tokens 7 --prefill-chunk-size 4096 \
-  --output /data/flare-runtime/mimo-v26-pro-mopd-tp8-c4-dflash7.safetensors --verbose
+  --max-concurrency 4 --mtp-draft-tokens 7 --prefill-chunk-size 4096 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-pro-mopd-tp8-c4-dflash7.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/mimo-v26-pro-mopd-tp8-c4-dflash7.safetensors \
@@ -569,8 +577,8 @@ catalog, including vision, fits on four RTX PRO 6000 Blackwell GPUs:
 ```sh
 .venv/bin/ignition export step5-preview-nvfp4 --gpus 0,1,2,3 \
   --max-concurrency 16 --mtp-draft-tokens 3 --no-mtp-adaptive-verification \
-  --speculative-token-capacity 16 --prefill-chunk-size 4096 --expert-scale-compression \
-  --output /data/flare-runtime/step5-tp4-mtp3-c16-fp8kv.safetensors --verbose
+  --speculative-token-capacity 16 --prefill-chunk-size 4096 --expert-scale-compression --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/step5-tp4-mtp3-c16-fp8kv.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/step5-tp4-mtp3-c16-fp8kv.safetensors \
@@ -646,8 +654,8 @@ kernel scratch when their execution overlaps.
 ```sh
 .venv/bin/python -m ignition export /data/models/Kimi-K3-MXFP4-CSF --gpus 0-15 \
   --max-concurrency 4 --image-concurrency 4 --mtp-draft-tokens 7 \
-  --prefill-chunk-size 4096 --compile-workers 16 --online-mxfp8 \
-  --output /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors --verbose
+  --prefill-chunk-size 4096 --compile-workers 16 --online-mxfp8 --verbose
+.venv/bin/python -m ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors
 
 ./flare/target/release/flare run \
   /data/flare-runtime/kimi-k3-mxfp4-csf-tp16-c4-images-redhat-dspark-7-mxfp8.safetensors \
@@ -714,7 +722,8 @@ weight budget for this encoding; loading reports its actual allocation.
 
 ```sh
 ignition export minimax-m3-1-flash --gpus 0-3 --language-model-only \
-  --expert-scale-compression csf --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
+  --expert-scale-compression csf
+ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0-3
 ```
 
@@ -889,7 +898,8 @@ and failures.
 Export a package, then launch the native server:
 
 ```sh
-.venv/bin/ignition export qwen3.8-flash --gpus 0,1 --output qwen.safetensors --verbose
+.venv/bin/ignition export qwen3.8-flash --gpus 0,1 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output qwen.safetensors
 flare/target/release/flare run qwen.safetensors --gpus 0,1 --port 8001
 ```
 

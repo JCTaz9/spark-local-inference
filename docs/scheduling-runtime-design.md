@@ -7,147 +7,86 @@ implementation is in `helios/src/scheduler/{policy,service,utility,cost}.rs`;
 [`scheduling-utility.md`](scheduling-utility.md) defines the utility and price
 flow. Python experiments are in `scripts/scheduling_sim/`.
 
-The native catalog supports separate prefill, decode, speculative verification,
-retained proposal, state-management, and mixed prefill/decode graphs. Mixed shape selection, native
-uploads, completion accounting, package selection, and rank-layout validation
-are implemented. With Ignition's `--mixed-prefill` flag, the Qwen recipe captures
-mixed target forwards alongside its separate inference graphs. Mixed capture is
-disabled by default. Other recipes expose their declared graph catalogs.
+The native catalog contains prefill, scored prefill, ordinary decode, complete
+speculative generation, mixed prefill/generation, vision, and state operations.
+A complete speculative graph contains proposal generation, optional confidence
+and prefix allocation, target verification, and accepted-state commit. Proposal
+and verification are internal stages, not independently scheduled operations.
+Mixed capture remains controlled by Ignition's `--mixed-prefill` flag.
 
 ## Speculative graph coverage
 
-Every recipe uses the same target-token envelope. For prepared concurrency `C`,
-maximum draft depth `D`, request bucket `B`, and verification width `W` including
-the pending input, Ignition captures width one at every power-of-two bucket
-through `next_power_of_two(C)`. Wider target graphs require `B * W <= R`, where
-`--speculative-token-capacity R` defaults to `max(next_power_of_two(C), D + 1)`.
-The rule applies to combined speculative graphs, separate verification graphs,
-and the decode side of mixed graphs. It bounds preparation without imposing a
-model-specific concurrency cutoff. The scheduler chooses among the resulting
-physical graphs using measured costs and useful output. Fixed mode uses its
-loaded width where captured; larger buckets retain width-one execution.
+A speculative physical program is identified by request capacity B, captured
+proposal depth D, per-request target capacity W including the pending token,
+and aggregate target capacity P. All four extents are explicit; rectangular
+programs declare P = B × W. W and P do not imply D. Width-one programs have D = 0
+and maintain the draft context needed to resume wider rounds. Their execution
+cost competes with wider programs at every captured request bucket.
+For learned proposals D counts produced candidate positions, including greedy
+proposals. For copy proposals it bounds the supplied prefix and contributes no
+learned-proposal draws to sampling metrics.
 
-A retained proposal catalog captures every request bucket at the full configured
-depth `D`. Every proposal dispatch executes that complete block; only verification
-prefixes and target-row budgets adapt. Proposal depth is independent of target
-verification width and is not capped by `R`. Separate width-one speculative
-graphs execute without producing a proposal and maintain draft context. With
-`C=4`, `D=7`, and `R=8`, the catalog has three proposal graphs, 14 verification
-graphs (eight at batch one, four at batch two, two at batch four), and three
-proposal-free width-one graphs, alongside ordinary execution and maintenance.
+Ignition captures power-of-two request buckets through padded concurrency.
+The `--speculative-token-capacity R` envelope bounds aggregate target rows for
+wider programs. Rectangular programs require B × W <= R; ragged programs require
+P <= R. Each recipe captures its concrete supported shapes. Load-time selection
+can reduce capacities only where those physical programs exist. Fixed selection
+supports host-allocated ragged programs; device confidence allocation requires
+adaptive selection.
 
-Packed verification planning excludes budgets larger than the smallest captured
-budget covering every offered token in the selected cohort. Such padding adds no
-useful verification work and would otherwise leave discovery waiting for a graph
-that verification dispatch prunes. Explicit funded refresh targets retain their
-physical budget.
+For each selected physical program, the prepared value source determines who
+allocates target rows. An exact `QueryLength` binding supplies host-selected
+lengths whose sum fits P. The host uses completed acceptance observations and
+measured complete-program costs, fixing those lengths before proposal draws.
+A `SpeculativePrefixLimit` binding supplies immutable lane ceilings. The GPU
+program generates its actual D proposals, evaluates causal confidence, and
+allocates within P. It cannot change the cohort or request identities. Each
+ceiling is bounded by `min(D + 1, W, request limit)`, but ceilings may sum above
+P. Reservation covers every ceiling and the declared cache draft extent.
 
-Packed joined graphs capture a fixed request bucket `B`, proposal depth `D`,
-logical verification width `W`, and physical target-row budget `P`. Before
-submission the scheduler chooses the cohort and freezes each lane's ceiling at
-`min(D + 1, W, request limit)`. The graph produces fresh confidence, allocates
-causal prefixes within `P`, and verifies them without an intermediate host
-round trip. Device allocation ranks joint prefix probabilities; request service
-prices affect host cohort utility without changing that device ordering. Cohort
-selection compares bounded alternate orderings at the complete measured graph
-cost, including padding and unused physical target rows.
+Device allocation repeatedly admits the best immediate causal frontier using
+joint prefix probability, with ties resolved by shorter prefixes and original
+request slots. Frozen host service prices rank cohorts, not the GPU's causal
+frontier. Host and device allocation both price the complete captured program,
+including unused physical rows. Neither path schedules a separate proposal
+completion or retains proposals for later verification dispatches.
 
-## Retained proposals and confidence
+## Completed confidence and acceptance
 
-A proposal occupies one bank entry per prepared request slot. The entry contains
-candidate tokens, proposal distributions, validity, request generation, consumed
-cursor, continuation-row ownership, and producer sequence. Storage is allocated
-before capture and shared across every proposal and verification shape. A
-verification graph gathers the selected rows and probability prefixes into its
-contiguous workspace; proposal and verification row orders may differ.
+For prefix-survival estimates `s_i`, expected output at width W is
+`1 + sum(s_1..s_(W-1))`, bounded by actual proposal work, output limits, and
+context capacity. Each request tracks acceptance by source. Accepted prefixes
+supply positive observations; a rejection supplies zero to longer offered
+prefixes. Termination censors the remaining suffix. Width-one rounds measure
+cost without supplying acceptance observations.
 
-Proposal submission reserves enough cache capacity to consume its results. A
-request owning retained proposals cannot be preempted and resampled. Verification
-or cancellation disposes of ownership; retirement fences protect slot reuse.
-Generation, cursor, pending token, continuation row, and producer completion are
-checked before verification can commit. Other requests' graphs may execute
-between proposal and verification. Proposal generation reserves its full draft
-RNG range once, including discarded suffixes. Verification never reserves those
-draws again.
+A confidence-producing program declares `confidence_width`, equal to its actual
+D. Its FP32 sidecar has shape `[2, request_slots, draft_capacity]`, covering every
+produced prefix. Only completed rounds update host forecasts. Rank zero's
+confidence drives host decisions; peer estimates must be valid probabilities
+but need not agree bitwise. Exact request identities, consumption, emitted
+prefixes, and committed state still agree across ranks.
 
-For prefix-survival estimates `s_i`, expected output at width `W` is
-`1 + sum(s_1..s_(W-1))`. Each request tracks the complete configured proposal
-program, including history substitutions. Copy-only programs in existing
-packages and learned-draft programs have separate curves. Accepted prefixes
-contribute one. A rejection contributes zero to every longer offered prefix. Termination inside an accepted prefix
-censors the suffix. Width-one rounds update execution costs without supplying
-acceptance observations.
+Confidence forecasts and verified acceptance remain separate observations.
+Forecasts average completed joint-prefix probabilities, starting from a
+population prior with weight one sixty-fourth. Acceptance prefixes start with
+weight two, cap at 128, and age with a half-life of 128 generated tokens.
+Unobserved suffixes retain their means. Ordinary selection uses the historical
+means; funded acceptance learning uses the bounded optimistic estimate
+`min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`.
 
-A retained or packed joined producer forecasts yield by averaging joint prefix
-probabilities computed from each proposal's conditional confidence. These forecasts remain
-separate from verification outcomes. Its population prior has an observation
-weight of one sixty-fourth; a request without forecast history starts from that
-population. Other requests start from prefix priors `0.5^depth`.
+A prepared program may also write `completion_speculative_survival`, cumulative
+products of `min(1, p(token)/q(token))` for evaluated prefixes. These replace
+binary acceptance observations at those depths. They affect future selection,
+never the proposals or allocation of the completed program.
 
-Every prefix estimate starts with weight two, caps its weight at 128, and ages
-that weight with a half-life of 128 generated tokens. Unobserved prefixes retain
-their means. Ordinary scheduling uses the means; funded learning alone uses
-`min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`, bounded by preceding prefixes.
-A shallow observation never refreshes an unobserved suffix.
-
-Prepared verification graphs may provide `completion_speculative_survival`:
-the cumulative products of `min(1, p(token)/q(token))` for the evaluated draft
-prefixes. These observations replace the corresponding binary samples. They
-update future choices only and cannot revise the proposal being verified.
-Packages without this optional output use the same controller with binary
-completion feedback.
-
-Rank zero supplies the confidence curve used for the shared scheduling decision.
-Every rank must report finite probabilities within `[0, 1]`; the root's curve is
-preserved without averaging or comparison against peer estimates. Replicated
-floating-point estimates do not select peer execution: every rank receives the
-same root-selected operation. Request identities, completion fences, and
-consumed-token counts still agree exactly.
-
-Fresh producer confidence at a position depends only on committed history and
-preceding proposals, never on the token proposed at that position. Before proposal
-submission, measured costs, service prices, and historical prefix forecasts are
-frozen. Existing finalized widths remain fixed. Each fresh proposal starts at
-width one. The scheduler considers longer continuations using fresh confidence
-only through the immediate next position and historical conditional ratios for
-the remaining suffix. A profitable continuation admits only its next position;
-the decision then repeats with the following causal frontier. This permits
-crossing a graph-cost increase without consulting a freshly sampled future
-token when deciding to admit an earlier one.
-
-Candidates include individual extensions, value-ranked equal-width cohorts,
-and the joint frontier across differing widths. Every score prices the complete
-verification packing. Packed token budgets rank each causal extension by its
-marginal token value, including the frozen request service price, when the host
-allocates retained proposals. Packed joined device allocation retains its
-probability ordering. Unknown-cost
-trials choose their width independently of fresh confidence. Fixed mode retains
-the loaded depth, limited by output, context, and sampling restrictions.
-
-Finalized widths are never shortened to make a cheaper batch. A dynamic program
-over requests sorted by width minimizes the cost of physical verification
-calls, including padding. Proposal planning evaluates bounded request counts,
-expected verification prefixes, and the complete cost of the full proposal block
-plus verification. Producer depth remains fixed for ordinary work, timing refresh,
-and acceptance learning. Once proposals are
-retained, their elapsed time has already entered service accounting and only
-remaining work is priced. Proposal completion earns no output or delivery credit.
-The dispatcher executes one operation and replans, allowing several proposal
-calls before differently grouped verification calls.
-
-GPU replay and serial host handoff have separate duration estimates. Scheduling
-uses their sum; queued completion wall time does not become a handoff sample.
-Per-operation trace measurements retain GPU and wall intervals independently.
-The enabled scheduler trace records each completion's submission fence, physical
-graph, selected cost and observation age, selection reason, refresh episode,
-and credit before dispatch and after settlement. Selected costs remain attached
-to their plans even if another observation arrives before commit. Selection and
-commit clocks are recorded separately. The bounded completion history retains
-these fields independently of the most recent dispatch shown by the dashboard.
-`flare_proposal_rounds_total` and `flare_proposal_gpu_nanoseconds_total` expose
-separate proposal work by batch capacity and draft depth. The corresponding
-`flare_speculative_*` metrics cover combined or verification graphs by batch
-capacity and verification width; their GPU duration excludes separate proposals.
+Costs use the full graph, including proposal work, allocation, verification,
+commit, collectives, and readiness stalls. GPU replay and serial host handoff
+have separate estimates; queued completion wall time does not become an isolated
+handoff sample. A trace attaches physical B/D/W/P, selected cost, observation
+age, selection reason, and exploration credit to each committed plan.
+`flare_speculative_*` counters cover complete speculative programs rather than
+separate producer and target calls.
 
 ## Useful service and selection
 
@@ -194,20 +133,26 @@ representable. `ScheduledPlan::selection_value_rate()` exposes the scaled score;
 has an optimistic work score instead of a division by zero.
 
 Every loaded physical batch capacity and selected verification width competes.
-For a fixed graph, duration and excluded-stream waiting cost do not depend on
-cohort membership, so the best cohort contains its highest additive lane values.
-Selection uses a fixed 64-entry array. Before ordinary selection, candidates for
+For a graph whose row budget does not constrain individual prefixes, duration
+and excluded-stream waiting cost do not depend on cohort membership, so the best
+cohort contains its highest additive lane values. Fixed host allocation retains
+complete prefixes, shortened only by request limits; a constrained ragged graph
+selects the highest-value cohort fitting both B and P. Adaptive ragged selection
+evaluates cohort prefixes under three bounded orderings: total lane value,
+pending-token delivery value, and value per target row. Each cohort is priced
+using its resulting causal prefix allocation. This search does not enumerate
+every possible cohort.
+
+Selection is bounded to 64 request slots. Before ordinary selection, candidates for
 the same graph kind, request cohort, and logical per-request prefixes discard any physical
 shape whose capacities are all at least as large as an alternative, with at
 least one strictly larger capacity. Mixed candidates also require the same prompt
-row and logical prompt work; proposal candidates require the same planned
-verification budget. Timing estimates cannot make redundant padding preferable.
-Split packing applies this geometry filter before retaining a cost-minimizing
-shape for each logical group.
+row and logical prompt work. Speculative candidates also require the same
+actual proposal depth. Timing estimates cannot make redundant padding preferable.
 A batch-four candidate serving three requests still competes with a batch-two
 candidate serving two requests. Bounded cost-refresh probes remain separate
 from ordinary selection. Selection does not enumerate exponentially many
-request subsets or restrict selection to heuristic acceptance groupings.
+request subsets.
 
 Each prefill capacity competes using the actual tokens it can consume. Atomic
 image spans, system boundaries, and prompt length restrict logical work. A
@@ -224,8 +169,7 @@ inefficient operations mandatory at a fixed deadline.
 ## Prerequisites and completion
 
 Initialization, restore, vision execution, and intermediate snapshots enable
-subsequent useful work. Their utility scoring compares prerequisite and inference
-pairs. When a prerequisite immediately enables inference,
+subsequent useful work. When a prerequisite immediately enables inference,
 compare every pair of prepared prerequisite and following inference shapes.
 Both cohorts are selected jointly. The first graph can also finish terminal
 requests; the following graph can include already ready requests.
@@ -274,19 +218,27 @@ nor require host caching. Existing snapshot and restore operations preserve
 partial pages and every declared continuation history.
 
 A terminal snapshot enables the visible response completion and frees the
-request's execution resources. Its service cannot depend on output-token or
-delivery utility: throughput policy assigns no value to another output burst
-when no tokens remain. Once a request needs terminal snapshotting, the scheduler
-stops refilling queued model work and drains its submitted fences. An already
-owned proposal-verification episode completes before snapshot selection.
+request's execution resources. Terminal retirement has its own value and age
+cost, independent of output-token and streaming-delivery prices. Its age starts
+when validated completion identifies termination, or when preemption initiates
+retirement. Queued work and final-token publication do not reset that clock.
+Preemption retires a resident execution request without completing its response.
 
-At the next idle scheduling opportunity, terminal snapshot work precedes new
-model work, discovery, or probe episodes. Every candidate includes the oldest
-admitted eligible terminal request. Cohorts maximize terminal completions per
-estimated graph time within the loaded capacities, and spare lanes can capture
-other ready checkpoints. Unknown costs retain ordinary discovery semantics.
-Successful snapshot completion still precedes terminal publication and resource
-release; cancellation and failed copies retain their existing fence guarantees.
+For snapshot duration `T`, terminal age `A`, and the snapshot family's existing
+batch-feasible reference interval `sigma`, the lane contributes
+`terminal_value + terminal_age_price * sigma * (A + T)`. Its age coefficient also
+enters every candidate's common waiting cost. In a two-stage sequence, a terminal
+row's age stops at its snapshot completion, including the saved waiting cost over
+the remaining sequence. Nonterminal snapshots retain prerequisite utility.
+
+Terminal work competes through the same value-per-time score, cohort selection,
+and padding rules as inference. It has no priority override or admission-order
+constraint. Unknown snapshot timings retain discovery semantics; no duration or
+reference interval is invented. Snapshot execution earns no token or streaming
+burst credit. Both balanced and throughput policies retain terminal value and
+urgency. Successful snapshot completion and cache publication precede admission
+of an immediate continuation after normal response completion. Error and
+cancellation paths preserve fenced resource ownership regardless of utility.
 
 ## Duration estimates
 
@@ -296,10 +248,9 @@ Zero means indeterminate. Physical graph kind, batch capacity, token capacity,
 proposal depth, mixed prefill capacity, and packed verification capacity identify
 a cost entry; active row count does not change its identity.
 
-Only full-block proposal producers enter the cost catalog. Shorter producers
-present in a package have no estimates, discovery candidates, timing-refresh
-targets, or acceptance probes. Candidate storage is sized from this filtered
-catalog. Verification widths and packed row budgets remain independent choices.
+Every selected complete speculative program enters the cost catalog with its
+actual B/D/W/P. A smaller captured producer is a distinct physical program;
+metadata must not relabel it as a deeper producer.
 
 The first positive device observation sets the estimate. Further valid samples
 while fresh use the median of the last nine replay observations, averaging the
@@ -350,14 +301,10 @@ the estimate fresh, and its isolated wall time still pays for the attempt.
 Ordinary winners update their costs through normal service without spending
 refresh credit.
 
-Split drafting can require a proposal before a verification shape becomes
-executable. A funded refresh includes that enabling proposal and the verification
-captures consuming its retained rows. Existing finalized prefixes stay fixed;
-fresh proposal rows use the selected verification capacity and causal allocation.
-Every physical capture in this refresh episode pays its actual duration once.
-Required verification continues through debt. Another episode cannot start
-until the first closes and credit reaches the cap again. Cancellation releases
-ownership without inventing a timing observation.
+A funded speculative refresh executes one complete captured program. It pays
+that program's actual duration once, including proposal and verification work.
+Cancellation suppresses publication without inventing a timing observation.
+Another episode requires full credit after the preceding episode closes.
 
 For credited ordinary duration `O`, refresh duration `P`, and the actual duration
 `D` of the current or last refresh episode:
@@ -383,12 +330,10 @@ episode can be active. Equal gains prefer the least-informed added prefix,
 then the shorter execution and smaller physical geometry.
 Fixed-width execution does not probe acceptance.
 
-A packed joined acceptance episode pays one complete graph interval; its
-forecast observations stop at each lane's frozen `min(D + 1, W)` ceiling.
-An acceptance episode pays the complete raw cost of its proposal and every
-verification consuming those proposals, including readiness stalls. Timing and
-acceptance ledgers never charge the same execution. Both can incur debt while
-an already-started episode finishes; another episode must wait for full credit.
+An acceptance episode pays one complete graph interval, including readiness
+stalls. Forecast observations stop at each lane's frozen `min(D + 1, W)`
+ceiling. Timing and acceptance ledgers never charge the same execution. An
+already-started episode can incur debt; another episode waits for full credit.
 Idle clears positive credit and preserves debt. For ordinary duration `O`,
 acceptance-probe duration `P`, and one episode's actual duration `D`, the bound is
 `P <= 0.01 / 0.99 * O + D`. Initial cost discovery is accounted separately.
@@ -396,7 +341,7 @@ Cost-model estimates remain median replay durations corrected for measured
 readiness stalls; exploration budgets use raw physical time.
 `flare_scheduler_execution_nanoseconds_total` and
 `flare_scheduler_executions_total` expose ordinary, discovery, timing-refresh,
-and acceptance-learning execution separately, including split continuations.
+and acceptance-learning execution separately.
 
 ## Service accounting and publication
 
@@ -443,21 +388,38 @@ resource availability, and feedback dependencies without rerunning selection.
 Cancellation stops further selection immediately; pages and state slots remain
 owned through their last submitted fence.
 
-The transport has two frame slots. Known nonterminal prefill and ordinary decode
-can use both. Speculation, unknown or stale timings, grammar, host stops, and operations
-that change the request phase require completion feedback. A finishing prefill
-therefore exposes its decoder and checkpoint operation before another decision
-is committed.
+The transport has two frame slots. Only ordinary decode and complete speculative
+generation may occupy both. Prefill, scored prefill, mixed execution, resume,
+vision, and state operations drain the window. Unknown or stale costs, grammar,
+host stops, host-fed pending tokens or committed cursors, history inputs, and
+phase transitions also require completion feedback. Dependency checks apply to the actual selected
+program. A finishing prefill exposes its decoder and checkpoint operation only
+after completion.
+
+Feedback-dependent candidates remain visible while ordinary work is queued.
+Selection uses projected prices and ages at the queue's expected end. When the
+final winner requires an empty window, the scheduler submits nothing until
+queued work drains, then replans. Lower-value queueable work cannot displace that
+winner merely because it is immediately submit-ready. This gate also applies to
+discovery and probe selections.
 
 There is no millisecond cap on either a frame or the sum of queued frames.
 Expected finish times provide the planning start time of an appended frame. An
 overrun suspends further queueing until completion supplies feedback; it does
 not make that graph ineligible in later decisions.
 
-Selection projects queued service into copies of request prices and projects
-visible output ages through the queued interval. It does not credit committed
-history speculatively. The completion measurement and validated counters remain
-the only inputs to actual service history.
+At submission, the scheduler freezes each queued generation program's expected
+token and delivery service. Selection projects that service into copies of
+request prices at the queue's expected end. A request with a queued expected
+delivery has projected age measured from that expected delivery, rather than
+from its preceding observed publication. Observed service history changes only
+from validated completions, and visible output age resets only when output is
+actually published. Projection never publishes tokens or commits sampled state.
+
+A queued speculative lane can advance by at most `min(lane ceiling, P)` tokens.
+Output limits and continuation positions account for that bound. Page reservations
+still cover the full execution ceiling and declared draft storage, and remain
+pinned through the lane's last submitted fence.
 
 ## Policy preferences
 
@@ -470,6 +432,8 @@ Defaults specify these preferences:
 | `token_fairness` | 16 | Token-rate log-utility coefficient, value/ms |
 | `delivery_fairness` | 4 | Delivery-rate log-utility coefficient, value/ms |
 | `decode_age_price` | 0.1 | Linear output-age cost coefficient, value/ms² |
+| `terminal_value` | 256 | Value per terminal retirement, in prompt-token units |
+| `terminal_age_price` | 1 | Linear terminal-wait cost coefficient, value/ms² |
 | `adaptation_ms` | 100 | Service-price adaptation time |
 | `estimate_ttl_ns` | 30,000,000,000 | Timing freshness interval |
 
@@ -481,7 +445,11 @@ which uses these coefficients. `--scheduler-policy throughput` retains token
 fairness and output-token value while setting delivery fairness and decode-age
 price to zero. It favors token throughput and can select longer output bursts.
 It changes scheduling preferences without changing captured capacities or
-sampling policy.
+sampling policy. `--scheduler-terminal-value` and `--scheduler-terminal-age-price`
+override the terminal coefficients after preset selection. Values must be finite
+and nonnegative; zero disables the corresponding preference. Disabling both
+removes terminal service value under throughput policy. These coefficients are
+preferences, not latency bounds.
 
 ## Mixed execution contract
 

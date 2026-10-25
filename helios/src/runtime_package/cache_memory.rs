@@ -274,6 +274,7 @@ mod tests {
                     alignment: alignment as usize,
                     file: None,
                     data_spans: vec![],
+                    sources: vec![],
                     relocations: vec![],
                     address: Some(plane.address),
                     memory: Memory::Device,

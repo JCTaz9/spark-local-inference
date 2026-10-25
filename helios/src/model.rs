@@ -10,7 +10,7 @@ mod prompt;
 
 use crate::{
     Result,
-    execution::{CompletionRecord, GraphKind},
+    execution::{CompletionRecord, ExecutionManifest, GraphKind},
     scheduler::{SchedulerCapabilities, SchedulerLimits},
 };
 pub use admission::Admission;
@@ -293,7 +293,6 @@ pub struct PreparedInput {
 }
 
 pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
-    use contract::{GraphOperation, ValueSource};
     SchedulerCapabilities {
         vocabulary: config.contract.vocabulary,
         page_tokens: config.contract.cache.page_tokens,
@@ -313,22 +312,8 @@ pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
             .map(|view| view.page_offset)
             .max()
             .unwrap_or(0),
-        completion_inputs: config
-            .contract
-            .graphs
-            .iter()
-            .filter(|g| g.kind == GraphOperation::Decode)
-            .flat_map(|g| &g.inputs)
-            .filter(|b| {
-                matches!(
-                    b.source,
-                    ValueSource::PendingToken | ValueSource::PromptAndPendingToken
-                )
-            })
-            .map(|b| b.buffer.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect(),
+        completion_inputs: vec![],
+        speculative_allocations: vec![],
         state_rows_per_request: Some(
             config
                 .contract
@@ -339,6 +324,38 @@ pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
                 .unwrap_or(1),
         ),
     }
+}
+
+pub fn scheduler_capabilities_with_manifest(
+    config: &ModelConfig,
+    manifest: &ExecutionManifest,
+) -> Result<SchedulerCapabilities> {
+    use contract::ValueSource;
+    let mut capabilities = scheduler_capabilities(config);
+    for graph in &manifest.graphs {
+        let semantics = config.contract.graph(&graph.name)?;
+        let inputs: Vec<_> = semantics.inputs.iter().filter(|binding|
+            matches!(binding.source, ValueSource::PendingToken | ValueSource::PromptAndPendingToken)
+                || matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative | GraphKind::Mixed)
+                    && matches!(binding.source, ValueSource::ConsumedTokens | ValueSource::SnapshotConsumedTokens))
+            .map(|binding| binding.buffer.clone()).collect();
+        if !inputs.is_empty() {
+            capabilities.completion_inputs.push(((graph.kind, graph.batch_capacity,
+                graph.draft_tokens, graph.token_capacity, graph.packed_token_capacity,
+                graph.prefill_capacity), inputs));
+        }
+        if graph.kind == GraphKind::Speculative {
+            let allocation = if semantics.inputs.iter().any(|binding|
+                binding.source == ValueSource::SpeculativePrefixLimit) {
+                crate::execution::PrefixAllocation::Gpu
+            } else {
+                crate::execution::PrefixAllocation::Host
+            };
+            capabilities.speculative_allocations.push((graph.batch_capacity,
+                graph.draft_tokens, graph.token_capacity, graph.packed_token_capacity, allocation));
+        }
+    }
+    Ok(capabilities)
 }
 
 pub fn validate_completion(
@@ -354,7 +371,7 @@ pub fn validate_completion(
                 || v.tokens
                     .iter()
                     .any(|id| *id >= config.contract.vocabulary as i64)
-                || (matches!(kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative)
+                || (matches!(kind, GraphKind::Speculative)
                     && record.status != 3
                     && v.draft_cache_consumed
                         != contract.draft_cursor.as_ref().map_or(-1, |cursor| {

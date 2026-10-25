@@ -83,10 +83,13 @@
     and exec_handover reproduces with both Python and native exporters.
 
 [ ] Qualify retained graph costs and funded remeasurement in live Helios:
-    idle/resume, concurrent decode latency, cost-change recovery, and split
-    proposal/verification transitions. Use per-fence scheduler traces and request
+    idle/resume, concurrent decode latency, cost-change recovery, and queued
+    generation transitions. Use per-fence scheduler traces and request
     latency measurements; measure GPU replay, queueing, and host planning separately.
     See scheduling-runtime-design.md#funded-timing-refresh.
+
+[ ] Extend the two-frame submission window to nonterminal prefill with
+    device-owned continuation positions and fenced cache reservations.
 
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.
@@ -112,13 +115,20 @@
     exported V4/V4.1 packages with packed context projections. Compare GLM's
     shared-expert launch order when the configured checkpoint shards are available.
 
-[ ] Pack weight payloads by recipe-declared owner and group so rebuilt packages
-    rename only executable and state blobs. See weight-payload-stability.md.
-
-[ ] Combine per-size exports into one fat package whose derived tensor-parallel
-    sizes are affine derivations of the canonical blobs, with materialization in
-    `flare download --tp` and `flare run`. See package-resharding.md.
+[ ] TP resharding is not qualified for full-model use. Export compressed Qwen
+    TP1 and native TP2 packages, complete combine and clean-cache acquisition,
+    compare materialized weights byte-for-byte against native TP2, and validate
+    native replay. Resolve the observed combine derivation-cycle failure.
+    Measure complete combine and acquisition costs against a successful baseline;
+    the required 10x speed improvement has not been demonstrated. Fixture tests
+    cover derivation replay and signed multi-host distribution, but do not
+    establish full-model TP2 correctness or performance. See package-format-design.md.
 
 [ ] Invalidate b12x preparation discovery's cached compiler context when
     Inductor selects a different libdevice in the same process. Repeated GPU
     test preparation can restore program keys for the preceding library.
+
+[ ] Investigate Nemotron repeated-image prefix reuse in
+    tests/server/test_nemotron.py::test_image_cache_identity: native serving of
+    NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
+    287-token prompt; image answers and token identity assertions pass.

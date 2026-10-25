@@ -11,7 +11,7 @@ MAX_TOP_LOGPROBS = 20
 MAX_LOGPROB_TOKEN_IDS = 128
 MAX_OUTPUT_TOKENS = 8
 COMPLETION_FRAMES = 2
-RECORD_FIELDS = 8
+RECORD_FIELDS = 24
 VECTOR_RECORD_FIELDS = 24
 TOKEN_FIELD = 4
 EMITTED_COUNT_FIELD = 8
@@ -28,7 +28,7 @@ _POOL_CHUNK_BYTES = 256 << 10
 class CompletionOutputs:
     """Own persistent outputs shared by the serial graph catalog.
 
-    ``records`` is int64 [2, slots, 8 or 24] for ABI2 or ABI3. The runtime
+    ``records`` is int64 [2, slots, 24]. The runtime
     alternates frames so readback can retain one while the next graph writes.
     ``logprobs`` is int32 [2, slots, 8, 258]: the chosen token followed by up to
     128 requested alternatives, each packed as [token ID, FP32 logprob bits]. Per-slot
@@ -48,16 +48,15 @@ class CompletionOutputs:
     @classmethod
     def allocate(cls, shape, *, device):
         frames, slots, fields = shape
-        if frames != COMPLETION_FRAMES or fields not in (RECORD_FIELDS, VECTOR_RECORD_FIELDS):
-            raise ValueError("completion records require two ABI2 or ABI3 frames")
+        if frames != COMPLETION_FRAMES or fields != VECTOR_RECORD_FIELDS:
+            raise ValueError("completion records require two 24-field frames")
         return cls(torch.zeros(shape, dtype=torch.int64, device=device),
             torch.zeros((frames, slots, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS), dtype=torch.int32, device=device),
             torch.zeros(slots, dtype=torch.int32, device=device),
             torch.zeros((slots, MAX_LOGPROB_TOKEN_IDS), dtype=torch.int32, device=device),
             torch.zeros(slots, dtype=torch.int32, device=device), GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
             GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
-            torch.full((frames, slots, MAX_OUTPUT_TOKENS - 1), -1., dtype=torch.float32, device=device)
-            if fields == VECTOR_RECORD_FIELDS else None)
+            torch.full((frames, slots, MAX_OUTPUT_TOKENS - 1), -1., dtype=torch.float32, device=device))
 
     def buffers(self):
         result = dict(completion_records=self.records, completion_logprobs=self.logprobs,

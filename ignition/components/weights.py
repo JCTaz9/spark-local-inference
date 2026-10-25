@@ -10,13 +10,112 @@ from math import prod
 import json
 import os
 import sys
+import weakref
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING
 
 from ignition.preparation.checkpoint import IndexedCheckpoint
+from ignition.preparation.rebuild_manifest import declare_container_fields
 from ignition.progress import phase
 from ignition.preparation.quantization import linear_format, projection_group_format, quantized_layers
+
+# Weight-bearing fields of b12x containers. Every other field of these types is
+# runtime state: scale-expansion scratch buffers, planner representations, cached
+# plans, and mutability counters, whose bytes are never stored as weights.
+for _container, _fields in (
+    ('b12x.moe.fused_moe.weights.PackedWeights',
+     ('w13', 'w2', 'w13_block_scales', 'w2_block_scales')),
+    ('b12x.moe.fused_moe.weights.Mxfp4CsfWeights',
+     ('w13', 'w2', 'w13_scales', 'w2_scales')),
+    ('b12x.moe.fused_moe.weights.Nvfp4CsfWeights',
+     ('packed', 'w13_scales', 'w2_scales')),
+    ('b12x.moe.fused_moe._impl.B12XFP4ExpertWeights',
+     ('a1_gscale', 'w1_fp4', 'w1_blockscale', 'w1_alphas',
+      'a2_gscale', 'w2_fp4', 'w2_blockscale', 'w2_alphas')),
+    ('b12x.moe.fused_moe.weights.PreparedExperts', ('_impl',)),
+    # Shared Ignition weight containers: only these fields hold stored weights.
+    ('ignition.components.weights.MLPWeights', ('gate_up', 'down')),
+    ('ignition.components.weights.GroupedLinearWeights', ('parts',)),
+    # Recipe weight containers reached inside a declared layer/component.
+    ('ignition.recipes.deepseek41.weights.ExpertWeights',
+     ('router', 'correction', 'experts', 'shared', 'vision_correction')),
+    ('ignition.recipes.deepseek41.weights.LayerWeights',
+     ('attention', 'experts', 'residual', 'engram')),
+    ('ignition.recipes.deepseek41.weights.DSparkWeights',
+     ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm',
+      'markov_embedding', 'markov_head', 'confidence_head', 'draft_head')),
+    ('ignition.recipes.deepseek4.weights.ExpertWeights',
+     ('router', 'correction', 'vision_correction', 'token_experts', 'experts', 'shared')),
+    ('ignition.recipes.deepseek4.weights.LayerWeights',
+     ('attention', 'experts', 'residual', 'engram')),
+    ('ignition.recipes.deepseek4.weights.DSparkWeights',
+     ('layers', 'main_projection', 'context_kv', 'main_norm', 'norm',
+      'markov_embedding', 'markov_head', 'confidence_head', 'draft_head')),
+    ('ignition.recipes.glm53.weights.LayerWeights', ('attention', 'mlp', 'residual')),
+    ('ignition.recipes.glm53.weights.MoEWeights', ('router', 'correction', 'experts', 'shared')),
+    ('ignition.recipes.glm53.weights.MTPWeights', ('attention', 'mlp', 'tensors', 'draft_head')),
+    ('ignition.recipes.qwen38.moe.QwenMoeWeights', ('router', 'experts', 'shared')),
+    ('ignition.recipes.qwen38.moe.SharedExpertWeights', ('gate_up', 'down', 'gate')),
+    ('ignition.recipes.qwen38.decoder.DecoderLayerWeights', ('attention', 'moe')),
+    # b12x packed linear weight objects hold the stored projection bytes.
+    ('b12x.gemm.blockscaled._linear.MXFP8LinearWeight', ('weight',)),
+    ('b12x.gemm.blockscaled._linear.TensorFP8LinearWeight',
+     ('values', 'scale_mma', 'block_scale', 'output_scale')),
+    ('b12x.gemm.blockscaled._linear.MXFP4LinearWeight', ('values', 'scale_mma')),
+    ('b12x.gemm.blockscaled._a16.NVFP4LinearWeight',
+     ('values', 'scale_mma', 'global_scale', 'activation_global_scale')),
+    ('b12x.gemm.blockscaled._iq2_xs.BlockQuantLinearWeight', ('values', 'metadata')),
+    ('ignition.recipes.step5.weights.LayerWeights',
+     ('qkvg', 'output', 'q_norm', 'k_norm', 'input_norm', 'post_attention_norm',
+      'mlp', 'router', 'correction', 'experts', 'indexer')),
+    ('ignition.recipes.gemma4.weights.BF16ExpertsWeight', ('gate_up_proj', 'down_proj')),
+    ('ignition.recipes.gemma4.weights.NVFP4ExpertsWeight',
+     ('gate_up_weight', 'gate_up_scale', 'gate_up_scale_2', 'down_weight', 'down_scale', 'down_scale_2')),
+    ('ignition.recipes.gemma4.weights.PLEWeights', ('embedding', 'projection', 'norm')),
+    ('ignition.recipes.gemma4.weights.DraftWeights',
+     ('pre_projection', 'post_projection', 'norm', 'head', 'layers', 'centroids', 'token_ordering')),
+    ('ignition.recipes.glm53.vision.VisionWeights', ('parameters', 'projections', 'downsample')),
+    ('ignition.recipes.kimi3.dspark_weights.DraftLayerWeights',
+     ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm', 'mlp')),
+    ('ignition.recipes.kimi3.dspark_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'embedding', 'head',
+      'markov_embedding', 'markov_head', 'layers')),
+    ('ignition.recipes.kimi3.vision.VisionWeights', ('tensors',)),
+    ('ignition.recipes.minimax_m3.draft.DraftLayerWeights',
+     ('qkv', 'output', 'query_norm', 'key_norm', 'input_norm', 'post_attention_norm', 'mlp')),
+    ('ignition.recipes.minimax_m3.draft.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'embedding', 'head',
+      'markov_embedding', 'markov_head', 'confidence_head', 'confidence_bias', 'layers')),
+    ('ignition.recipes.minimax_m3.vision.VisionWeights', ('patch', 'norm', 'layers', 'projector', 'merger')),
+    ('ignition.recipes.mimo_v2.weights.LayerWeights',
+     ('qkv', 'output', 'sink', 'input_norm', 'post_attention_norm', 'mlp',
+      'router', 'correction', 'experts')),
+    ('ignition.recipes.mimo_v2.draft_weights.DraftLayerWeights',
+     ('qkv', 'output', 'query_norm', 'key_norm', 'sink', 'input_norm',
+      'post_attention_norm', 'mlp')),
+    ('ignition.recipes.mimo_v2.draft_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'context_kv', 'norm', 'mask_embedding', 'layers')),
+    ('ignition.recipes.mimo_v2.vision_weights.VisionLayerWeights',
+     ('norm1', 'norm2', 'qkv', 'qkv_bias', 'output', 'output_bias', 'sink',
+      'mlp', 'gate_up_bias', 'down_bias')),
+    ('ignition.recipes.mimo_v2.vision_weights.VisionWeights',
+     ('patch', 'layers', 'norm', 'merge_up', 'merge_down')),
+    ('ignition.recipes.minimax_m3.weights.LayerWeights',
+     ('qkv_index', 'output', 'q_norm', 'k_norm', 'index_q_norm', 'index_k_norm',
+      'input_norm', 'post_attention_norm', 'mlp', 'router', 'correction', 'experts')),
+    ('ignition.recipes.nemotron_h.vision.VisionWeights', ('tensors', 'patch')),
+    ('ignition.recipes.nemotron_h.draft_weights.DraftWeights',
+     ('projection', 'hidden_norm', 'norm', 'context_kv', 'layers', 'lattice')),
+    ('ignition.recipes.qwen38.vision.VisionWeights', ('parameters', 'projections')),
+    ('ignition.recipes.qwen38.mtp_weights.MTPWeights',
+     ('module', 'attention', 'moe', 'embedding', 'lm_head', 'draft_head')),
+    ('ignition.recipes.qwen38_dense.weights.MTPWeights',
+     ('layer', 'embedding_norm', 'hidden_norm', 'norm', 'fc')),
+    ('ignition.recipes.step5.vision_weights.VisionWeights',
+     ('patch', 'position', 'norm', 'layers', 'first', 'second', 'projector')),
+):
+    declare_container_fields(_container, _fields)
 
 if TYPE_CHECKING:
     import torch
@@ -121,9 +220,417 @@ class SharedColumnReads:
         self.peer_storage.cudaFree(self.pointer)
 
 
+def _record_nvfp4_linear_provenance(values, prefix, *, r0, r1, c0, c1):
+    """Record the packed NVFP4 linear owner's exact checkpoint source range.
+
+    The checkpoint tensor and the prepared owner both address packed byte
+    columns (K/2), so the logical column range is halved. The pre-swizzle scale
+    tensor is discarded by `pack_weight` and is never recorded.
+    """
+    from ignition.preparation import provenance
+
+    provenance.record_sources(
+        values,
+        [dict(tensor=f"{prefix}.weight", ranges=((r0, r1), (c0 // 2, c1 // 2)))],
+        packing="nvfp4", statistics_domain="tensor",
+        packing_parameters=dict(format="nvfp4", group_size=16))
+
+
 def fp4_down_staging_bytes(hidden_size, intermediate_size, group):
     """Bytes one whole packed FP4 down projection and its block scales occupy in shared staging."""
     return -(-(hidden_size * (intermediate_size // 2 + intermediate_size // group)) // 4096) * 4096
+
+
+def _snapshot_fp4_sources(sources, names):
+    """Keep only immutable source addressing metadata for deferred recording."""
+    return {name: dict(element_size=sources[name].element_size(),
+                       shape=tuple(sources[name].shape),
+                       stride=tuple(sources[name].stride()))
+            for name in names}
+
+
+def _source_element_size(source):
+    return source['element_size'] if isinstance(source, dict) else source.element_size()
+
+
+def _record_iq2_expert_provenance(prepared, *, prefixes, sources, projection_names,
+                                  weight_name, first, last, hidden_size, local, codec):
+    """Record IQ2 tiled descriptor and metadata-plane coordinates."""
+    import torch
+    from b12x._lib.quant.block_codec import block_codec
+    from ignition.preparation import provenance
+
+    if codec not in ('iq2_xs', 'iq2_xxs'):
+        return
+    spec = block_codec(codec)
+    block = spec.block_weights
+    block_bytes = spec.block_bytes
+    up_name, down_name = projection_names
+    count = len(prefixes)
+    if hasattr(prepared, 'w13'):
+        w13, w13_meta = prepared.w13, prepared.w13_scale
+        w2, w2_meta = prepared.w2, prepared.w2_scale
+    else:
+        impl = prepared._impl
+        w13, w13_meta = impl.w1_fp4, impl.w1_blockscale
+        w2, w2_meta = impl.w2_fp4, impl.w2_blockscale
+    if any(tensor is None or tensor.element_size() not in (1, 4) for tensor in (w13, w2, w13_meta, w2_meta)):
+        return
+    if first % block or local % block or hidden_size % block:
+        return
+    nt13, kt13 = local // 64, hidden_size // 128
+    nt2, kt2 = hidden_size // 64, local // 128
+    kb13, kb2 = hidden_size // block, local // block
+    # Descriptor tile is 512 int32 = 2048 bytes; metadata base blocks are two bytes;
+    # XS scale-pair tiles are 512 bytes per K block.
+    desc = 'iq2_%s_desc_n64_k128_v1' % codec.removeprefix('iq2_')
+    base_enc = 'iq2_%s_base_k256_v1' % codec.removeprefix('iq2_')
+    scale_enc = 'iq2_%s_scale_n64_k256_v1' % codec.removeprefix('iq2_')
+    w13_sources, w2_sources, w13_meta_sources, w2_meta_sources = [], [], [], []
+    for index, prefix in enumerate(prefixes):
+        src13 = sources[f'{prefix}.{up_name}.{weight_name}']
+        src2 = sources[f'{prefix}.{down_name}.{weight_name}']
+        ranges13 = ((first, last), (0, hidden_size // block), (0, block_bytes))
+        ranges2 = ((0, hidden_size), (first // block, last // block), (0, block_bytes))
+        base13 = kb13 * local * 2
+        base2 = kb2 * hidden_size * 2
+        meta_scale13 = 0 if codec == 'iq2_xxs' else nt13 * kb13 * 512
+        meta_scale2 = 0 if codec == 'iq2_xxs' else nt2 * kb2 * 512
+        # w13 descriptor: owner tile grid [local/64, hidden/128]
+        w13_sources.append(dict(tensor=f'{prefix}.{up_name}.{weight_name}', ranges=ranges13,
+            piece_encoding=desc,
+            pieces=(dict(source_offset=(first // 64) * kt13 * 2048,
+                         destination_offset=index * (nt13 * kt13 * 2048),
+                         contiguous_bytes=2048, extents=(nt13, kt13),
+                         source_strides=(kt13 * 2048, 2048),
+                         destination_strides=(kt13 * 2048, 2048)),)))
+        w13_meta_sources.append(dict(tensor=f'{prefix}.{up_name}.{weight_name}', ranges=ranges13,
+            piece_encoding=base_enc,
+            pieces=(dict(source_offset=first * 2, destination_offset=index * base13,
+                         contiguous_bytes=2, extents=(kb13, local),
+                         source_strides=((src13.shape[0] * 2), 2),
+                         destination_strides=((local * 2), 2)),)))
+        if codec != 'iq2_xxs':
+            w13_meta_sources.append(dict(tensor=f'{prefix}.{up_name}.{weight_name}', ranges=ranges13,
+                piece_encoding=scale_enc,
+                pieces=(dict(source_offset=(first // 64) * kb13 * 512,
+                             destination_offset=count * base13 + index * meta_scale13,
+                             contiguous_bytes=kb13 * 512, extents=(nt13,),
+                             source_strides=(kb13 * 512,), destination_strides=(kb13 * 512,)),)))
+        source_k = src2.shape[1] * block
+        full_kt = source_k // 128
+        w2_sources.append(dict(tensor=f'{prefix}.{down_name}.{weight_name}', ranges=ranges2,
+            piece_encoding=desc,
+            pieces=(dict(source_offset=(first // 128) * 2048,
+                         destination_offset=index * (nt2 * kt2 * 2048),
+                         contiguous_bytes=2048, extents=(nt2, kt2),
+                         source_strides=(full_kt * 2048, 2048),
+                         destination_strides=(kt2 * 2048, 2048)),)))
+        w2_meta_sources.append(dict(tensor=f'{prefix}.{down_name}.{weight_name}', ranges=ranges2,
+            piece_encoding=base_enc,
+            pieces=(dict(source_offset=(first // block) * hidden_size * 2,
+                         destination_offset=index * base2,
+                         contiguous_bytes=base2, extents=(), source_strides=(), destination_strides=()),)))
+        if codec != 'iq2_xxs':
+            w2_meta_sources.append(dict(tensor=f'{prefix}.{down_name}.{weight_name}', ranges=ranges2,
+                piece_encoding=scale_enc,
+                pieces=(dict(source_offset=(first // block) * 512,
+                             destination_offset=count * base2 + index * meta_scale2,
+                             contiguous_bytes=512, extents=(nt2, kb2),
+                             source_strides=(full_kt // 2 * 512, 512),
+                             destination_strides=(kb2 * 512, 512)),)))
+    params = dict(format=codec, block_size=block, group_size=block)
+    if w13_sources:
+        provenance.record_sources(w13, w13_sources, packing=codec, statistics_domain='tensor', packing_parameters=params)
+    if w2_sources:
+        provenance.record_sources(w2, w2_sources, packing=codec, statistics_domain='tensor', packing_parameters=params)
+    if w13_meta_sources:
+        provenance.record_sources(w13_meta, w13_meta_sources, packing=codec, statistics_domain='tensor', packing_parameters=params)
+    if w2_meta_sources:
+        provenance.record_sources(w2_meta, w2_meta_sources, packing=codec, statistics_domain='tensor', packing_parameters=params)
+
+
+def _source_shape(source):
+    return source['shape'] if isinstance(source, dict) else tuple(source.shape)
+
+
+def _source_stride(source, axis):
+    return source['stride'][axis] if isinstance(source, dict) else source.stride(axis)
+
+
+def _record_fp4_expert_owner_provenance(prepared, *, prefixes, sources, projection_names,
+                                        weight_name, scale_name, first, last, hidden_size,
+                                        local, group, format, scale_compression=None,
+                                        w13_layout=None):
+    """Record affine byte maps for retained native FP4 expert owners.
+
+    Only unchanged bytes are mapped. Padded or re-blocked scale owners remain
+    unprovenanced rather than claiming a copy that did not happen. FC1 half
+    order follows the retained storage after any b12x w31 normalization.
+    """
+    import torch
+    from ignition.preparation import provenance
+
+    impl = getattr(prepared, '_impl', None)
+    if impl is None:
+        return
+    w13 = getattr(impl, 'w1_fp4', None)
+    w2 = getattr(impl, 'w2_fp4', None)
+    s13 = getattr(impl, 'w1_blockscale', None)
+    s2 = getattr(impl, 'w2_blockscale', None)
+    eligible = lambda tensor: (tensor is not None and tensor.element_size() == 1
+                               and tensor.dim() == 3)
+    w13_ok, w2_ok, s13_ok, s2_ok = (eligible(tensor) for tensor in (w13, w2, s13, s2))
+    count = len(prefixes)
+    half = hidden_size // 2
+    local_half = local // 2
+    scale_columns = hidden_size // group
+    local_scale_columns = local // group
+    first_name, second_name, down_name = projection_names
+
+    transforms = {getattr(transform, 'value', str(transform))
+                 for transform in getattr(getattr(impl, 'plan', None), 'transforms', ())}
+    transformed = bool(transforms & {'w4a16_packed', 'w4a8_qmma'})
+    flipped = False
+    if w13_ok and s13_ok:
+        try:
+            from b12x.moe.fused_moe._impl import _W13_NORMALIZED_STORAGES
+            flipped = (w13.data_ptr(), s13.data_ptr()) in _W13_NORMALIZED_STORAGES
+        except ImportError:
+            flipped = False
+    # An unflipped w31 owner may be normalized later by graph execution; its
+    # provenance would then describe bytes that no longer exist.
+    gate_first = str(w13_layout).lower() in ('w31', 'gate_up')
+    w13_stable = transformed or not gate_first or flipped
+    if flipped:
+        first_name, second_name = second_name, first_name
+
+    if 'w4a16_packed' in transforms:
+        layout = 'w4a16_mma_packed'
+    elif 'w4a8_qmma' in transforms:
+        layout = 'w4a8_qmma'
+    else:
+        layout = f'{format}_native'
+    w13_parameters = dict(format=layout, group_size=group)
+    w2_parameters = dict(format=layout, group_size=group)
+    s13_parameters = dict(format=layout, group_size=group)
+    s2_parameters = dict(format=layout, group_size=group)
+    if 'w4a16_packed' in transforms:
+        rotation = local if str(w13_layout).lower() in ('w13', 'up_gate') else 0
+        w13_parameters['row_rotation'] = rotation
+        s13_parameters['row_rotation'] = rotation
+    elif 'w4a8_qmma' in transforms:
+        rotation = local if str(w13_layout).lower() in ('w31', 'gate_up') else 0
+        w13_parameters['row_rotation'] = rotation
+
+    w13_native = (w13_ok and w13_stable
+                  and tuple(w13.shape) == (count, 2 * local, half)
+                  and w13.stride(2) == 1)
+    w2_native = (w2_ok
+                 and tuple(w2.shape) == (count, hidden_size, local_half)
+                 and w2.stride(2) == 1)
+    w13_sources = []
+    w2_sources = []
+    for index, prefix in enumerate(prefixes):
+        if w13 is not None and w13_stable:
+            rotation = local if not gate_first else 0
+            first_half = 1 if rotation else 0
+            w4a16_tiles = (transformed and 'w4a16_packed' in transforms
+                           and hidden_size % 64 == 0 and local % 64 == 0
+                           and first % 64 == 0 and w13.dtype == torch.int32
+                           and tuple(w13.shape) == (count, hidden_size // 16,
+                                                   (2 * local // 64) * 128))
+            qmma13_tiles = (transformed and 'w4a8_qmma' in transforms
+                            and hidden_size % 128 == 0 and local % 256 == 0
+                            and first % 256 == 0 and w13.dtype == torch.int32
+                            and tuple(w13.shape) == (count, 2 * local // 256,
+                                                    hidden_size // 128, 4, 8, 32, 4))
+            for offset, (projection, project_half) in enumerate((
+                    (first_name, first_half), (second_name, 1 - first_half))):
+                source = sources[f'{prefix}.{projection}.{weight_name}']
+                rows = offset * local
+                entry = dict(tensor=f'{prefix}.{projection}.{weight_name}',
+                             ranges=((first, last), (0, half)))
+                if (w13_native and _source_element_size(source) == 1
+                        and _source_stride(source, 1) == 1):
+                    entry['pieces'] = (dict(
+                        source_offset=first * _source_stride(source, 0),
+                        destination_offset=index * w13.stride(0) + rows * w13.stride(1),
+                        contiguous_bytes=half,
+                        extents=(local,), source_strides=(_source_stride(source, 0),),
+                        destination_strides=(w13.stride(1),)),)
+                elif w4a16_tiles:
+                    full_ntiles = _source_shape(source)[0] // 64
+                    n_tiles = local // 64
+                    entry['piece_encoding'] = 'w4a16_mma_k16_n64_v1'
+                    entry['pieces'] = (dict(
+                        source_offset=(first // 64) * 512,
+                        destination_offset=index * w13.stride(0) * 4 + (
+                            project_half * (local // 64) * 512),
+                        contiguous_bytes=512,
+                        extents=(hidden_size // 16, n_tiles),
+                        source_strides=(full_ntiles * 512, 512),
+                        destination_strides=(w13.stride(1) * 4, 512)),)
+                elif qmma13_tiles:
+                    full_ntiles = (_source_shape(source)[0] + 255) // 256
+                    k_tiles = hidden_size // 128
+                    n_tiles = local // 256
+                    qmma_half = ((1 - offset) if gate_first else offset) * n_tiles
+                    entry['piece_encoding'] = 'w4a8_qmma_n256_k128_v1'
+                    entry['pieces'] = (dict(
+                        source_offset=(first // 256) * k_tiles * 16384,
+                        destination_offset=index * w13.stride(0) * 4 + (
+                            qmma_half * k_tiles * 16384),
+                        contiguous_bytes=16384,
+                        extents=(k_tiles, n_tiles),
+                        source_strides=(16384, k_tiles * 16384),
+                        destination_strides=(16384, k_tiles * 16384)),)
+                w13_sources.append(entry)
+        if w2 is not None:
+            source = sources[f'{prefix}.{down_name}.{weight_name}']
+            entry = dict(tensor=f'{prefix}.{down_name}.{weight_name}',
+                         ranges=((0, hidden_size), (first // 2, last // 2)))
+            if (w2_native and _source_element_size(source) == 1
+                    and _source_stride(source, 1) == 1):
+                entry['pieces'] = (dict(
+                    source_offset=first // 2,
+                    destination_offset=index * w2.stride(0),
+                    contiguous_bytes=local_half,
+                    extents=(hidden_size,),
+                    source_strides=(_source_stride(source, 0),),
+                    destination_strides=(w2.stride(1),)),)
+            elif (transformed and 'w4a16_packed' in transforms
+                  and hidden_size % 64 == 0 and local % 16 == 0 and first % 16 == 0
+                  and w2.dtype == torch.int32
+                  and tuple(w2.shape) == (count, local // 16, (hidden_size // 64) * 128)):
+                full_ntiles = hidden_size // 64
+                entry['piece_encoding'] = 'w4a16_mma_k16_n64_v1'
+                entry['pieces'] = (dict(
+                    source_offset=(first // 16) * full_ntiles * 512,
+                    destination_offset=index * w2.stride(0) * 4,
+                    contiguous_bytes=512,
+                    extents=(local // 16, full_ntiles),
+                    source_strides=(full_ntiles * 512, 512),
+                    destination_strides=(w2.stride(1) * 4, 512)),)
+            elif (transformed and 'w4a8_qmma' in transforms
+                  and hidden_size % 256 == 0 and local % 128 == 0 and first % 128 == 0
+                  and w2.dtype == torch.int32
+                  and tuple(w2.shape) == (count, hidden_size // 256,
+                                          local // 128, 4, 8, 32, 4)):
+                full_ktiles = _source_shape(source)[1] * 2 // 128
+                n_tiles = hidden_size // 256
+                k_tiles = local // 128
+                entry['piece_encoding'] = 'w4a8_qmma_n256_k128_v1'
+                entry['pieces'] = (dict(
+                    source_offset=(first // 128) * 16384,
+                    destination_offset=index * w2.stride(0) * 4,
+                    contiguous_bytes=16384,
+                    extents=(k_tiles, n_tiles),
+                    source_strides=(16384, full_ktiles * 16384),
+                    destination_strides=(16384, k_tiles * 16384)),)
+            w2_sources.append(entry)
+
+    if w13_sources:
+        provenance.record_sources(w13, w13_sources, packing=layout,
+                                  statistics_domain='tensor',
+                                  packing_parameters=w13_parameters)
+    if w2_sources:
+        provenance.record_sources(w2, w2_sources, packing=layout,
+                                  statistics_domain='tensor',
+                                  packing_parameters=w2_parameters)
+
+    if scale_compression is not None:
+        return
+    s13_sources = []
+    s2_sources = []
+    swizzled = format == 'nvfp4'
+    scale_native = (scale_compression is None and swizzled
+                    and first % 128 == 0 and local % 128 == 0
+                    and (first // group) % 4 == 0 and local_scale_columns % 4 == 0)
+    if s13 is not None and w13_stable:
+        for index, prefix in enumerate(prefixes):
+            for projection, _rows in ((first_name, 0), (second_name, local)):
+                source = sources[f'{prefix}.{projection}.{scale_name}']
+                entry = dict(tensor=f'{prefix}.{projection}.{scale_name}',
+                             ranges=((first, last), (0, scale_columns)))
+                if (scale_native and s13_ok
+                        and tuple(s13.shape) == (count, 2 * local, scale_columns)
+                        and s13.stride(2) == 1
+                        and _source_element_size(source) == 1 and _source_stride(source, 1) == 1):
+                    expert13 = index * s13.stride(0)
+                    rows = 0 if projection == first_name else local
+                    origin = expert13 + rows * s13.stride(1)
+                    extents = (local // 128, 4, 32, scale_columns // 4)
+                    source_strides = (128 * _source_stride(source, 0), 32 * _source_stride(source, 0),
+                                      _source_stride(source, 0), 4)
+                    destination_strides = (128 * s13.stride(1), 4, 16, 512)
+                    entry['pieces'] = (dict(
+                        source_offset=first * _source_stride(source, 0),
+                        destination_offset=origin, contiguous_bytes=4,
+                        extents=extents, source_strides=source_strides,
+                        destination_strides=destination_strides),)
+                s13_sources.append(entry)
+    if s2 is not None:
+        for index, prefix in enumerate(prefixes):
+            source = sources[f'{prefix}.{down_name}.{scale_name}']
+            entry = dict(tensor=f'{prefix}.{down_name}.{scale_name}',
+                         ranges=((0, hidden_size), (first // group, last // group)))
+            if (scale_native and s2_ok
+                    and tuple(s2.shape) == (count, hidden_size, local_scale_columns)
+                    and s2.stride(2) == 1
+                    and _source_element_size(source) == 1 and _source_stride(source, 1) == 1):
+                extents = (hidden_size // 128, 4, 32, local_scale_columns // 4)
+                source_strides = (128 * _source_stride(source, 0), 32 * _source_stride(source, 0),
+                                  _source_stride(source, 0), 4)
+                destination_strides = (128 * s2.stride(1), 4, 16, 512)
+                entry['pieces'] = (dict(
+                    source_offset=(first // group) * _source_stride(source, 1),
+                    destination_offset=index * s2.stride(0), contiguous_bytes=4,
+                    extents=extents, source_strides=source_strides,
+                    destination_strides=destination_strides),)
+            s2_sources.append(entry)
+    scale_domain = 'shard' if 'w4a16_packed' in transforms else 'tensor'
+    if s13_sources:
+        provenance.record_sources(s13, s13_sources, packing=layout,
+                                  statistics_domain=scale_domain,
+                                  packing_parameters=s13_parameters)
+    if s2_sources:
+        provenance.record_sources(s2, s2_sources, packing=layout,
+                                  statistics_domain=scale_domain,
+                                  packing_parameters=s2_parameters)
+
+_FP4_DEFERRED_PROVENANCE = {}
+
+
+def _defer_fp4_expert_provenance(prepared, recorder):
+    try:
+        reference = weakref.ref(
+            prepared, lambda _ref, key=id(prepared): _FP4_DEFERRED_PROVENANCE.pop(key, None))
+    except TypeError:
+        return False
+    _FP4_DEFERRED_PROVENANCE[id(prepared)] = (reference, recorder)
+    return True
+
+
+def record_final_fp4_expert_provenance(prepared):
+    """Record retained-owner provenance after preparation binds/normalizes storage."""
+    entry = _FP4_DEFERRED_PROVENANCE.pop(id(prepared), None)
+    if entry is None:
+        return
+    reference, recorder = entry
+    if reference() is prepared:
+        recorder(prepared)
+
+
+def record_final_fp4_expert_provenance_all():
+    """Flush deferred records during the post-warmup export catalog traversal."""
+    for key, (reference, recorder) in list(_FP4_DEFERRED_PROVENANCE.items()):
+        prepared = reference()
+        if prepared is None:
+            _FP4_DEFERRED_PROVENANCE.pop(key, None)
+        else:
+            _FP4_DEFERRED_PROVENANCE.pop(key, None)
+            recorder(prepared)
 
 
 def _checkpoint_read_mode(paths):
@@ -314,6 +821,7 @@ class DirectWeightLoader:
         weight = pack_weight(values, swizzle_block_scale(scales), recipe="nvfp4",
                              global_scale=gain, global_scale_kind="multiplier",
                              activation_global_scale=activation_scale)
+        _record_nvfp4_linear_provenance(values, prefix, r0=r0, r1=r1, c0=c0, c1=c1)
         return replace(weight, in_features=logical_k)
 
     def _selected_names(self):
@@ -345,6 +853,12 @@ class DirectWeightLoader:
             if not bool((torch.isfinite(scale) & (scale > 0)).all()):
                 raise ValueError(f"{prefix}.{suffix} must be a positive finite FP32 scalar")
         weight_scale, input_scale = scales
+        from ignition.preparation import provenance
+
+        provenance.record_sources(
+            values,
+            [dict(tensor=f"{prefix}.weight", ranges=((r0, r1), (c0, c1)))],
+            packing="tensor_fp8", statistics_domain="tensor")
         packed = pack_weight(values, weight_scale * input_scale, recipe="tensor_fp8")
         return TensorFP8Weight(packed, input_scale)
 
@@ -494,6 +1008,12 @@ class DirectWeightLoader:
             source = source[extent]
         target = torch.empty(source.shape, dtype=source.dtype if dtype is None else dtype, device=self.device)
         self._copy(target, source)
+        from ignition.preparation import provenance
+
+        provenance.record(
+            target, tensor_name=name,
+            ranges=provenance.ranges_of(extent, self._sources[name].shape),
+            packing=str(target.dtype).removeprefix("torch."))
         return target
 
     def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, scale_name="weight_scale"):
@@ -537,7 +1057,20 @@ class DirectWeightLoader:
             if any(value.shape[1] != values[0].shape[1] for value in values):
                 raise ValueError("packed projections must share input width")
             self._session.flush()
-            values = torch.cat(values) if len(values) > 1 else values[0]
+            if len(values) > 1:
+                from ignition.preparation import provenance
+
+                parts = [provenance.lookup(value) for value in values]
+                combined = torch.cat(values)
+                if all(parts):
+                    provenance.record_sources(
+                        combined,
+                        [source for part in parts for source in part['sources']],
+                        packing=fmt, concatenation_axis=0,
+                        statistics_domain='tensor')
+                values = combined
+            else:
+                values = values[0]
             return values if not scales else BlockFP8Weight(values, torch.cat(scales) if len(scales) > 1 else scales[0])
         if fmt == "tensor_fp8":
             (rows,) = tuple(row_ranges)
@@ -651,7 +1184,11 @@ class DirectWeightLoader:
         plan = moe.plan_weights(source=moe.PackedSource(format=fmt),
             activation=moe.ActivationSpec(mode=mode, nonlinearity=activation, io_dtype=torch.bfloat16),
             geometry=moe.MoEGeometry(num_experts=len(prefixes), hidden_size=hidden_size, intermediate_size=local))
-        return moe.prepare_weights(plan=plan, weights=moe.BlockQuantWeights(w1, w2, codec=fmt))
+        prepared = moe.prepare_weights(plan=plan, weights=moe.BlockQuantWeights(w1, w2, codec=fmt))
+        _record_iq2_expert_provenance(prepared, prefixes=prefixes, sources=self._sources,
+            projection_names=projection_names, weight_name='weight', first=first, last=last,
+            hidden_size=hidden_size, local=local, codec=fmt)
+        return prepared
 
     def load_bf16_experts_as_nvfp4(
         self, prefix, *, num_experts, hidden_size, intermediate_size,
@@ -685,6 +1222,8 @@ class DirectWeightLoader:
         first, last = _aligned_range(intermediate_range, intermediate_size, 16)
         local = last - first
         padded = (local + 127) // 128 * 128
+        # BF16 experts quantized here are a numerical repack: they stay
+        # unprovenanced rather than claiming checkpoint equivalence.
         plan = moe.plan_weights(
             source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
             activation=moe.ActivationSpec(mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16,
@@ -892,7 +1431,20 @@ class DirectWeightLoader:
             w13_block_scales=swizzle_block_scale(s13) if format == "nvfp4" else s13,
             w2_block_scales=swizzle_block_scale(s2) if format == "nvfp4" else s2, **gains)
         del s13, s2, blocks
-        return moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scale_scratch)
+        prepared = moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scale_scratch)
+        source_metadata = _snapshot_fp4_sources(self._sources, tuple(
+            f'{prefix}.{projection}.{name}'
+            for prefix in prefixes for projection in projection_names
+            for name in (weight_name, scale_name)))
+        recorder = lambda value: _record_fp4_expert_owner_provenance(
+            value, prefixes=prefixes, sources=source_metadata,
+            projection_names=projection_names, weight_name=weight_name,
+            scale_name=scale_name, first=first, last=last, hidden_size=hidden_size,
+            local=local, group=group, format=format,
+            scale_compression=scale_compression, w13_layout=w13_layout)
+        recorder(prepared)
+        _defer_fp4_expert_provenance(prepared, recorder)
+        return prepared
 
     def load_mxfp4_experts(
         self, prefixes, *, hidden_size, intermediate_size, scale_scratch,
@@ -998,9 +1550,16 @@ class DirectWeightLoader:
             activation=moe.ActivationSpec(mode=activation_mode, nonlinearity=activation, io_dtype=torch.bfloat16,
                                           swiglu_limit=swiglu_limit),
             geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local))
-        return moe.prepare_weights(plan=plan, weights=moe.Mxfp4CsfWeights(
+        prepared = moe.prepare_weights(plan=plan, weights=moe.Mxfp4CsfWeights(
             w13=w13, w2=w2, w13_scales=scales13, w2_scales=scales2,
             w13_scale_scratch=scale_scratch[0], w2_scale_scratch=scale_scratch[1]))
+        _record_fp4_expert_owner_provenance(
+            prepared, prefixes=prefixes, sources=self._sources,
+            projection_names=(gate, up, down), weight_name=weight_name,
+            scale_name=scale_name, first=first, last=last, hidden_size=hidden_size,
+            local=local, group=32, format='mxfp4', scale_compression='csf',
+            w13_layout='w31')
+        return prepared
 
     def load_nvfp4_experts(
         self, prefixes, *, hidden_size, intermediate_size, scale_vectors,
@@ -1092,6 +1651,10 @@ class DirectWeightLoader:
             block_scales = expanded
         else:
             block_scales = scale_scratch
+        # A multi-expert buffer concatenates experts on axis 0 and up/gate on
+        # axis 1; the package schema's single concatenation axis cannot express
+        # both, so these buffers stay unprovenanced rather than claim a mapping
+        # the consumer would misread.
         plan = moe.plan_weights(
             source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
             activation=moe.ActivationSpec(mode=activation_mode, nonlinearity="silu", io_dtype=torch.bfloat16,
@@ -1105,9 +1668,17 @@ class DirectWeightLoader:
             immutable_input_scales=True,
         )
         if expand:
-            return moe.prepare_weights(plan=plan, weights=packed)
-        return moe.prepare_weights(plan=plan, weights=moe.Nvfp4CsfWeights(
-            packed=packed, w13_scales=scales13, w2_scales=scales2))
+            prepared = moe.prepare_weights(plan=plan, weights=packed)
+        else:
+            prepared = moe.prepare_weights(plan=plan, weights=moe.Nvfp4CsfWeights(
+                packed=packed, w13_scales=scales13, w2_scales=scales2))
+        _record_fp4_expert_owner_provenance(
+            prepared, prefixes=prefixes, sources=self._sources,
+            projection_names=('up_proj', 'gate_proj', 'down_proj'),
+            weight_name='weight', scale_name='weight_scale', first=first, last=last,
+            hidden_size=hidden_size, local=local, group=16, format='nvfp4',
+            scale_compression='csf', w13_layout='w13')
+        return prepared
 
     def _queue_csf_sources(self, prefixes, *, rows, columns, quantization="nvfp4", **selection):
         from b12x.loader._csf_source import stage_csf_sources

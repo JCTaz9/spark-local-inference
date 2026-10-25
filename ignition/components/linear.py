@@ -171,7 +171,12 @@ class QuantizedProjection:
         self.weight = weight
         self.output = output
         self.activation_scale = getattr(weight, "activation_global_scale", None)
-        if isinstance(weight, NVFP4LinearWeight) and self.activation_scale is None:
+        native = activation_mode == "auto" and getattr(session, "native_dense_activations", False)
+        if native:
+            activation_mode = "quantized"
+            if isinstance(weight, NVFP4LinearWeight) and self.activation_scale is None:
+                raise ValueError(f"{name}: native NVFP4 dense activations require an activation global scale")
+        elif isinstance(weight, NVFP4LinearWeight) and self.activation_scale is None:
             activation_mode = "a16"
         self.activation_mode = activation_mode
         self.bias = bias
@@ -181,8 +186,11 @@ class QuantizedProjection:
             # b12x targets SM120/SM121; SM103 runs FlashInfer's native GEMMs under the same preparation.
             from b12x.gemm.blockscaled._a16 import _weight_parts as parts
 
-            self.plan = sm103_projection.plan(sm103_projection.query_for(
-                source, weight, output, workspace_form="owned" if workspace is None else "provided"),
+            query = sm103_projection.query_for(
+                source, weight, output, workspace_form="owned" if workspace is None else "provided")
+            if native and query.mode != "quantized":
+                raise ValueError(f"{name}: native dense activations are unsupported for this SM103 projection")
+            self.plan = sm103_projection.plan(query,
                 weight=parts(weight)[:2])
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,

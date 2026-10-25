@@ -4,7 +4,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.resume import PreparedResumeState
-from ignition.components.sampling import PreparedCompletion, PreparedSampling
+from ignition.components.sampling import PreparedSampling
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.scratch import bind_scratch
 
@@ -74,23 +74,14 @@ class PreparedResume:
             frame,
             sequence,
         )
-        self.replicated_sampling = weights.draft is not None
-        # Shared forward artifacts require identical pool layouts on sampling and consuming ranks.
         sampling_workspace = None if buffers is None else bind_scratch(
             PreparedSampling.scratch_layout(rows, requests.vocab_size),
             device=self.logits.device, workspace=buffers)
-        self.completion = (
-            PreparedSampling(self.logits, *args, workspace=sampling_workspace)
-            if weights.shard.rank == 0 or self.replicated_sampling
-            else PreparedCompletion(*args)
-        )
+        self.completion = PreparedSampling(self.logits, *args, workspace=sampling_workspace)
         self.completion.prepare()
-        if self.replicated_sampling:
-            self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
-                coordinator=coordinator, name=name + ".sampling", buffers=buffers)
-        self.compilation_variant = (
-            "sample" if weights.shard.rank == 0 or self.replicated_sampling else "consume"
-        )
+        self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+            coordinator=coordinator, name=name + ".sampling", buffers=buffers)
+        self.compilation_variant = "sample"
 
     def __call__(self):
         self.validation(self.state.validate())

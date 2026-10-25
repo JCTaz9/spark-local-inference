@@ -53,12 +53,6 @@ struct RoundMetrics {
     accepted: AtomicU64,
 }
 
-#[derive(Default)]
-struct ProposalMetrics {
-    rounds: AtomicU64,
-    gpu_ns: AtomicU64,
-}
-
 /// Point-in-time serving counters and gauges for dashboards.
 ///
 /// `GET /metrics?format=json` serializes this structure with its field names as
@@ -74,7 +68,7 @@ pub struct Snapshot {
     pub generated_tokens: u64,
     /// Draft positions run by the learned drafter; zero for models without one.
     pub draft_steps: u64,
-    /// Completed speculative or verification graphs, including terminal no-op rounds.
+    /// Completed speculative generation graphs, including terminal no-op rounds.
     pub verify_steps: u64,
     /// Draft positions allocated for progressing request rounds, including rejected drafts.
     pub verification_drafts: u64,
@@ -228,10 +222,9 @@ pub(super) struct Metrics {
     replay_gpu_ns: AtomicU64,
     replay_readiness_wait_ns: AtomicU64,
     replay_readiness_samples: AtomicU64,
-    launches: [AtomicU64; 12],
+    launches: [AtomicU64; 9],
     sampling_launches: [AtomicU64; 5],
     speculative: [[RoundMetrics; 8]; 7],
-    proposals: [[ProposalMetrics; 7]; 7],
     draft_sources: [[[AtomicU64; 2]; 2]; 7],
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
@@ -370,16 +363,13 @@ impl Metrics {
             GraphKind::Snapshot => 6,
             GraphKind::Speculative => 7,
             GraphKind::Mixed => 8,
-            GraphKind::Proposal => 9,
-            GraphKind::Verification => 10,
-            GraphKind::PackedSpeculative => 11,
         };
         self.launches[index].fetch_add(1, Ordering::Relaxed);
         let sampling_index = match kind {
             GraphKind::Prefill | GraphKind::ScoredPrefill => 0,
             GraphKind::Decode => 1,
             GraphKind::Resume => 2,
-            GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative => 3,
+            GraphKind::Speculative => 3,
             GraphKind::Mixed => 4,
             _ => return,
         };
@@ -388,15 +378,13 @@ impl Metrics {
 
     pub fn speculative_completed(
         &self,
-        kind: GraphKind,
         batch: usize,
         width: usize,
+        drafts: usize,
         elapsed_ns: u64,
         records: &[CompletionRecord],
     ) {
-        if kind == GraphKind::Speculative {
-            self.learned_draft_steps.fetch_add(width.saturating_sub(1) as u64, Ordering::Relaxed);
-        }
+        self.learned_draft_steps.fetch_add(drafts as u64, Ordering::Relaxed);
         let counters = &self.speculative[batch.trailing_zeros() as usize][width - 1];
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
@@ -421,19 +409,6 @@ impl Metrics {
                 }
             }
         }
-    }
-
-    pub fn packed_speculative_completed(&self, batch: usize, width: usize, drafts: usize,
-        elapsed_ns: u64, records: &[CompletionRecord]) {
-        self.learned_draft_steps.fetch_add(drafts as u64, Ordering::Relaxed);
-        self.speculative_completed(GraphKind::PackedSpeculative, batch, width, elapsed_ns, records);
-    }
-
-    pub fn proposal_completed(&self, batch: usize, width: usize, elapsed_ns: u64) {
-        self.learned_draft_steps.fetch_add(width.saturating_sub(1) as u64, Ordering::Relaxed);
-        let counters = &self.proposals[batch.trailing_zeros() as usize][width - 2];
-        counters.rounds.fetch_add(1, Ordering::Relaxed);
-        counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
     }
 
     pub fn constrained_submission(&self, outstanding: usize, mixed_decode: bool) {
@@ -627,7 +602,7 @@ impl Metrics {
 
         for (name, help, counts) in [
             ("execution_nanoseconds_total", "Raw execution time by scheduler selection reason, including readiness stalls and isolated host handoff.", &self.scheduler_trace.execution_ns),
-            ("executions_total", "Completed physical executions by scheduler selection reason; split proposal and verification each count once.", &self.scheduler_trace.executions),
+            ("executions_total", "Completed physical executions by scheduler selection reason; each generation round counts once.", &self.scheduler_trace.executions),
         ] {
             let _ = writeln!(text, "# HELP flare_scheduler_{name} {help}\n# TYPE flare_scheduler_{name} counter");
             for (reason, count) in ["ordinary", "discovery", "timing_refresh", "acceptance_learning"].into_iter().zip(counts) {
@@ -680,11 +655,11 @@ impl Metrics {
         for (metric, help) in [
             (
                 "rounds_total",
-                "Completed combined speculative or verification graphs, including terminal no-op rounds.",
+                "Completed speculative generation programs, including terminal no-op rounds.",
             ),
             (
                 "gpu_nanoseconds_total",
-                "CUDA event duration of combined speculative or verification graphs; excludes separate proposal graphs and transport.",
+                "CUDA event duration of complete speculative generation programs, including proposal and verification work; excludes transport.",
             ),
             (
                 "emitted_tokens_total",
@@ -720,18 +695,6 @@ impl Metrics {
                         text,
                         "flare_speculative_{metric}{{batch=\"{batch}\",width=\"{width}\"}} {value}"
                     );
-                }
-            }
-        }
-        for (metric, help) in [
-            ("rounds_total", "Completed separate proposal graphs by prepared batch and draft depth."),
-            ("gpu_nanoseconds_total", "CUDA event duration of separate proposal graphs; excludes transport and verification."),
-        ] {
-            let _ = writeln!(text, "# HELP flare_proposal_{metric} {help}\n# TYPE flare_proposal_{metric} counter");
-            for (batch, depths) in crate::execution::BATCH_CAPACITIES.into_iter().zip(&self.proposals) {
-                for (depth, counts) in (1..=7).zip(depths) {
-                    let value = (if metric == "rounds_total" { &counts.rounds } else { &counts.gpu_ns }).load(Ordering::Relaxed);
-                    let _ = writeln!(text, "flare_proposal_{metric}{{batch=\"{batch}\",depth=\"{depth}\"}} {value}");
                 }
             }
         }
@@ -936,9 +899,6 @@ impl Metrics {
             "snapshot",
             "speculative",
             "mixed",
-            "proposal",
-            "verification",
-            "packed_speculative",
         ]
         .into_iter()
         .zip(&self.launches)
@@ -1251,7 +1211,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        metrics.speculative_completed(GraphKind::Speculative, 1, 8, 1000, &records);
+        metrics.speculative_completed(1, 8, 7, 1000, &records);
         for learned in [false, true] {
             let snapshot = metrics.snapshot(learned);
             assert_eq!(snapshot.verify_steps, 1);
@@ -1272,18 +1232,15 @@ mod tests {
     }
 
     #[test]
-    fn separate_proposals_keep_their_shape_and_cost_after_narrow_verification() {
+    fn complete_round_metrics_count_actual_draft_depth_once() {
         let metrics = Metrics::default();
-        metrics.proposal_completed(4, 8, 700);
-        metrics.speculative_completed(GraphKind::Verification, 2, 3, 300, &[]);
-        metrics.speculative_completed(GraphKind::Verification, 2, 1, 100, &[]);
+        metrics.speculative_completed(2, 8, 5, 300, &[]);
+        metrics.speculative_completed(2, 1, 0, 100, &[]);
         let snapshot = metrics.snapshot(true);
-        assert_eq!(snapshot.draft_steps, 7);
+        assert_eq!(snapshot.draft_steps, 5);
         assert_eq!(snapshot.verify_steps, 2);
         let text = metrics.render();
-        assert!(text.contains("flare_proposal_rounds_total{batch=\"4\",depth=\"7\"} 1"));
-        assert!(text.contains("flare_proposal_gpu_nanoseconds_total{batch=\"4\",depth=\"7\"} 700"));
-        assert!(text.contains("flare_speculative_gpu_nanoseconds_total{batch=\"2\",width=\"3\"} 300"));
+        assert!(text.contains("flare_speculative_gpu_nanoseconds_total{batch=\"2\",width=\"8\"} 300"));
     }
 
     #[test]
@@ -1427,7 +1384,7 @@ mod tests {
             text.lines()
                 .filter(|line| line.starts_with("flare_graph_launches_total{"))
                 .count(),
-            12
+            9
         );
     }
 }

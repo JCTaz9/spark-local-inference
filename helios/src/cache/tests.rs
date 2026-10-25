@@ -488,6 +488,52 @@ fn compacted_pending_child_retains_parent_pages_until_cancellation_completes() {
 }
 
 #[test]
+fn snapshot_pressure_thins_history_without_discarding_endpoints_or_pages() {
+    let mut cache = cache();
+    let history = history(8, 0);
+    let mut parent = None;
+    let mut checkpoints = Vec::new();
+    for index in 0..8 {
+        let id = created(
+            &mut cache,
+            &history,
+            &proposal(parent, u64::from(index + 1) * 64, &[index], index, 0),
+        );
+        checkpoints.push(id);
+        parent = Some(id);
+    }
+    let report = cache.evict(EvictionTarget { pages: 0, snapshots: 4 });
+    assert_eq!(report.pages_scheduled, 0);
+    assert_eq!(report.snapshots_scheduled, 4);
+    assert_eq!(
+        report.retired.iter().map(|r| r.checkpoint).collect::<Vec<_>>(),
+        [checkpoints[1], checkpoints[3], checkpoints[5], checkpoints[6]]
+    );
+    for index in [0, 2, 4, 7] {
+        assert!(cache.checkpoint(checkpoints[index]).is_ok());
+    }
+    assert_eq!(cache.lookup(&history).unwrap().consumed_tokens, 512);
+    assert_eq!(cache.page_chain(checkpoints[7]).unwrap(), (0..8).map(PageId).collect::<Vec<_>>());
+    let reclaimed = cache.advance_completed(Fence(0)).unwrap().reusable;
+    assert!(reclaimed.pages.is_empty());
+    assert_eq!(reclaimed.snapshots.len(), 4);
+}
+
+#[test]
+fn snapshot_pressure_removes_a_dense_recent_checkpoint_before_a_sparse_older_one() {
+    let mut cache = cache();
+    let history = history(5, 0);
+    let root = created(&mut cache, &history, &proposal(None, 64, &[0], 0, 0));
+    let sparse = created(&mut cache, &history, &proposal(Some(root), 256, &[1, 2, 3], 1, 0));
+    let dense = created(&mut cache, &history, &proposal(Some(sparse), 272, &[], 2, 0));
+    let end = created(&mut cache, &history, &proposal(Some(dense), 288, &[], 3, 0));
+    let report = cache.evict(EvictionTarget { pages: 0, snapshots: 1 });
+    assert_eq!(report.retired[0].checkpoint, dense);
+    assert_eq!(cache.checkpoint(end).unwrap().parent(), Some(sparse));
+    assert!(cache.checkpoint(root).is_ok());
+}
+
+#[test]
 fn eviction_uses_leaf_lru_and_honors_separate_snapshot_pressure() {
     let mut cache = cache();
     let first_history = history(1, 0);

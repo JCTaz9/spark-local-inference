@@ -101,46 +101,20 @@ impl Fixture {
     }
 
     fn worker_for(&self, receiver: mpsc::Receiver<Vec<Incoming>>) -> Worker<'_> {
+        let manifest = crate::model::testing::manifest(&self.config);
         let mut scheduler = RequestScheduler::new(
             self.config.identity,
             self.config.limits,
-            crate::model::scheduler_capabilities(&self.config),
-        )
-        .unwrap();
-        let mut graphs = Vec::new();
-        for batch in [1, 2, 4] {
-            for kind in [
-                GraphKind::Init,
-                GraphKind::Restore,
-                GraphKind::Snapshot,
-                GraphKind::Resume,
-                GraphKind::Decode,
-                GraphKind::Speculative,
-                GraphKind::Prefill,
-            ] {
-                for width in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                    graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0,
-                        packed_token_capacity: 0,
-                        name: format!("{kind:?}-{batch}-{width}"),
-                        kind,
-                        sampling_mode: crate::execution::SamplingMode::General,
-                        handle: 1,
-                        batch_capacity: batch,
-                        token_capacity: if kind == GraphKind::Prefill {
-                            64
-                        } else {
-                            width
-                        },
-                        prefill_capacity: 0,
-                        estimated_duration_ns: 1000,
-                        input_bindings: vec![],
-                    });
-                }
-            }
+            crate::model::scheduler_capabilities_with_manifest(&self.config, &manifest).unwrap(),
+        ).unwrap();
+        let mut graphs = manifest.graphs.clone();
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = 1000;
         }
         scheduler.measured_graph_durations(&graphs).unwrap();
         if self.config.history_drafts
-            || self.config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Copy
+            || self.config.speculative_proposal_source
+                == crate::scheduler::speculation::ProposalSource::Copy
         {
             scheduler.enable_history_drafts().unwrap();
         }
@@ -434,7 +408,10 @@ fn worker_observes_prefill_decode_and_prerequisite_timings() {
         assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(619));
         let metrics = fixture.metrics.snapshot(false);
         assert_eq!(metrics.verification_drafts, 0);
-        assert_eq!(metrics.verification_rounds, u64::from(kind == GraphKind::Decode));
+        assert_eq!(
+            metrics.verification_rounds,
+            u64::from(kind == GraphKind::Decode)
+        );
     }
 }
 
@@ -923,7 +900,10 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
         let metrics = fixture.metrics.snapshot(!copy);
         assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 4));
         assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (2, 1));
-        assert_eq!((metrics.verification_drafts, metrics.verification_rounds), (3, 1));
+        assert_eq!(
+            (metrics.verification_drafts, metrics.verification_rounds),
+            (3, 1)
+        );
         assert_eq!(metrics.verify_steps, 1);
         assert_eq!(metrics.draft_steps, if copy { 0 } else { 3 });
     }
@@ -937,30 +917,48 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
     let mut manifest = crate::model::testing::manifest(&fixture.config);
     let name = "Speculative-4-8";
     let graph = manifest.graphs.iter_mut().find(|g| g.name == name).unwrap();
-    graph.kind = GraphKind::PackedSpeculative;
+    graph.kind = GraphKind::Speculative;
     graph.draft_tokens = 7;
+    graph.confidence_width = 7;
     graph.packed_token_capacity = 9;
-    let contract = fixture.config.contract.graphs.iter_mut().find(|g| g.graph == name).unwrap();
-    contract.kind = GraphOperation::PackedSpeculative;
+    let contract = fixture
+        .config
+        .contract
+        .graphs
+        .iter_mut()
+        .find(|g| g.graph == name)
+        .unwrap();
+    contract.kind = GraphOperation::Speculative;
     for input in &mut contract.inputs {
         if input.source == ValueSource::QueryLength {
             input.source = ValueSource::SpeculativePrefixLimit;
         }
     }
-    let mut scheduler = RequestScheduler::new(fixture.config.identity, fixture.config.limits,
-        crate::model::scheduler_capabilities(&fixture.config)).unwrap();
-    let graphs: Vec<_> = manifest.graphs.iter().filter(|g|
-        g.kind != GraphKind::Speculative || g.token_capacity == 1).cloned().map(|mut g| {
-            g.estimated_duration_ns = match g.kind {
-                GraphKind::Speculative | GraphKind::Decode => 100_000,
-                GraphKind::PackedSpeculative => 10_000,
-                _ => 100,
+    let mut scheduler = RequestScheduler::new(
+        fixture.config.identity,
+        fixture.config.limits,
+        crate::model::scheduler_capabilities_with_manifest(&fixture.config, &manifest).unwrap(),
+    )
+    .unwrap();
+    let graphs: Vec<_> = manifest
+        .graphs
+        .iter()
+        .filter(|g| g.kind != GraphKind::Speculative || g.token_capacity == 1 || g.name == name)
+        .cloned()
+        .map(|mut g| {
+            g.estimated_duration_ns = if g.name == name { 10_000 } else {
+                match g.kind {
+                    GraphKind::Speculative | GraphKind::Decode => 100_000,
+                    _ => 100,
+                }
             };
             g
-        }).collect();
+        })
+        .collect();
     scheduler.measured_graph_durations(&graphs).unwrap();
-    scheduler.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
-    scheduler.split_speculation(8).unwrap();
+    scheduler
+        .enable_speculation(&(1..=8).collect::<Vec<_>>())
+        .unwrap();
     let (sender, receiver) = mpsc::channel();
     let mut generations = Vec::new();
     for token in 0..3 {
@@ -968,8 +966,15 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         sender.send(vec![incoming]).unwrap();
         generations.push(generation);
     }
-    let mut worker = Worker::new(&fixture.config, &fixture.frontend, &fixture.stop,
-        &fixture.metrics, scheduler, receiver, 4);
+    let mut worker = Worker::new(
+        &fixture.config,
+        &fixture.frontend,
+        &fixture.stop,
+        &fixture.metrics,
+        scheduler,
+        receiver,
+        4,
+    );
     worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let mut sequence = 0;
@@ -979,25 +984,44 @@ fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
         let (plan, _) = worker.plan(0).unwrap();
         let step = plan.unwrap();
         worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
-        if step.kind == GraphKind::PackedSpeculative { break step; }
-        let frame = completion(&worker, &step, sequence, step.kind.is_prefill().then_some(0));
+        if step.kind == GraphKind::Speculative {
+            break step;
+        }
+        let frame = completion(
+            &worker,
+            &step,
+            sequence,
+            step.kind.is_prefill().then_some(0),
+        );
         worker.complete(step.kind, frame).unwrap();
     };
-    assert_eq!((step.batch_capacity, step.token_capacity, step.lanes.len()), (4, 8, 3));
+    assert_eq!(
+        (step.batch_capacity, step.token_capacity, step.lanes.len()),
+        (4, 8, 3)
+    );
     let mut frame = completion(&worker, &step, sequence, Some(1));
     frame.proposal_confidence = Some([[0.5; 7]; crate::execution::REQUEST_LANES]);
     for (lane, offered) in step.lanes.iter().zip([5, 1, 0]) {
         let record = &mut frame.records[lane.request.slot as usize];
         record.consumed_tokens = lane.start_position as i64 + 1;
         record.vector = Some(crate::execution::TokenVector {
-            emitted_count: 1, offered_drafts: offered, accepted_drafts: 0,
-            verification_width: 8, draft_cache_consumed: lane.start_position as i64,
-            tokens: [1, -1, -1, -1, -1, -1, -1, -1], ..Default::default()
+            emitted_count: 1,
+            offered_drafts: offered,
+            accepted_drafts: 0,
+            verification_width: 8,
+            draft_cache_consumed: lane.start_position as i64,
+            tokens: [1, -1, -1, -1, -1, -1, -1, -1],
+            ..Default::default()
         });
     }
-    worker.complete(GraphKind::PackedSpeculative, frame).unwrap();
+    worker
+        .complete(GraphKind::Speculative, frame)
+        .unwrap();
     let metrics = fixture.metrics.snapshot(true);
-    assert_eq!((metrics.verification_drafts, metrics.verification_rounds), (6, 3));
+    assert_eq!(
+        (metrics.verification_drafts, metrics.verification_rounds),
+        (6, 3)
+    );
     assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (0, 2));
     assert_eq!((metrics.draft_steps, metrics.verify_steps), (7, 1));
     let start = std::time::Instant::now();
@@ -1018,8 +1042,12 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         fixture.config.speculative_proposal_source = source;
         fixture.config.history_drafts = source == ProposalSource::Mtp;
         for graph in &mut fixture.config.contract.graphs {
-            if graph.kind != GraphOperation::Speculative { continue; }
-            if source == ProposalSource::Copy { graph.draft_cursor = None; }
+            if graph.kind != GraphOperation::Speculative {
+                continue;
+            }
+            if source == ProposalSource::Copy {
+                graph.draft_cursor = None;
+            }
             for (name, value) in [
                 ("copy_ids", ValueSource::CopyTokenIds),
                 ("copy_count", ValueSource::CopyTokenCount),
@@ -1028,7 +1056,13 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 ("copy_masks", ValueSource::CopyGrammarMask),
                 ("copy_mask_count", ValueSource::CopyGrammarCount),
             ] {
-                graph.inputs.push(crate::model::testing::binding(name, value, InputIndexing::RequestRow, 0, 0));
+                graph.inputs.push(crate::model::testing::binding(
+                    name,
+                    value,
+                    InputIndexing::RequestRow,
+                    0,
+                    0,
+                ));
             }
         }
         let (sender, receiver) = mpsc::channel();
@@ -1055,7 +1089,11 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
                 offered_drafts: step.lanes[0].tokens as i64 - 1,
                 emitted_count: 1,
                 accepted_drafts: 0,
-                draft_cache_consumed: if source == ProposalSource::Copy { -1 } else { record.consumed_tokens - 1 },
+                draft_cache_consumed: if source == ProposalSource::Copy {
+                    -1
+                } else {
+                    record.consumed_tokens - 1
+                },
                 tokens: [i64::from(token), -1, -1, -1, -1, -1, -1, -1],
                 ..Default::default()
             });
@@ -1074,12 +1112,25 @@ fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion
         let live = worker.scheduler.request(step.lanes[0].request).unwrap();
         let uploads = worker.inputs.as_ref().unwrap().uploads();
         let bytes = |name| uploads.iter().find(|u| u.buffer == name).unwrap().bytes;
-        assert_eq!(i32::from_le_bytes(bytes("copy_count").try_into().unwrap()), 2);
-        assert_eq!(bytes("copy_ids").chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(),
-            [4, 2, -1, -1, -1, -1, -1]);
-        assert_eq!(i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()), live.consumed_tokens as i64);
-        assert_eq!(i64::from_le_bytes(bytes("copy_generation").try_into().unwrap()), live.handle.generation as i64);
+        assert_eq!(
+            i32::from_le_bytes(bytes("copy_count").try_into().unwrap()),
+            2
+        );
+        assert_eq!(
+            bytes("copy_ids")
+                .chunks_exact(8)
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [4, 2, -1, -1, -1, -1, -1]
+        );
+        assert_eq!(
+            i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()),
+            live.consumed_tokens as i64
+        );
+        assert_eq!(
+            i64::from_le_bytes(bytes("copy_generation").try_into().unwrap()),
+            live.handle.generation as i64
+        );
     }
 }
 
@@ -2126,7 +2177,8 @@ async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_
         if hidden {
             request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
         }
-        let (response, mut incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let (response, mut incoming) =
+            http_generation_request("/v1/chat/completions", request).await;
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
             .unwrap()
@@ -2326,6 +2378,60 @@ async fn http_disconnect_while_waiting_cancels_queued_generation() {
 }
 
 #[tokio::test]
+async fn ollama_discovery_uses_bearer_auth_without_generation_admission() {
+    use std::io::{Read, Write};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, Some("serving-key".into()));
+    let permits = state
+        .ingress_slots
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state, &["discovery-model".into()], 1024);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let result = tokio::task::spawn_blocking(move || {
+        for (method, path, body) in [
+            ("GET", "/api/tags", ""),
+            ("POST", "/api/show", r#"{"model":"discovery-model"}"#),
+        ] {
+            for (auth, expected) in [
+                ("", 401),
+                ("Authorization: Bearer wrong-key\r\n", 401),
+                ("x-api-key: serving-key\r\n", 401),
+                ("Authorization: Bearer serving-key\r\n", 200),
+            ] {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                write!(stream,
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                let (head, body) = response.split_once("\r\n\r\n").unwrap();
+                let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+                assert_eq!(status, expected, "{path}: {body}");
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                if status == 200 {
+                    if path == "/api/tags" {
+                        assert_eq!(value["models"][0]["model"], "discovery-model");
+                    } else {
+                        assert_eq!(value["model_info"]["general.name"], "discovery-model");
+                    }
+                }
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+    }).await;
+    server.abort();
+    drop(permits);
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
@@ -2409,9 +2515,8 @@ fn described_image(
         patches: 64,
         tokens: 16,
     };
-    let processor = Arc::new(
-        ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap(),
-    );
+    let processor =
+        Arc::new(ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap());
     PreparedImageInput::new(
         ImageInput {
             description: ImageDescription {
@@ -2629,9 +2734,8 @@ fn prepared_image_window_stays_global_until_pack_or_cancellation() {
     )
     .unwrap()
     .frontend;
-    let processor = Arc::new(
-        ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap(),
-    );
+    let processor =
+        Arc::new(ImageProcessor::load(ImageSettings::Moonvit {}, ImageLimits::default()).unwrap());
     let pixels = Arc::new(RgbImage::new(112, 112, vec![42; 112 * 112 * 3]).unwrap());
     let descriptor = PreparedImageInput::new(
         ImageInput {
@@ -2670,17 +2774,20 @@ fn prepared_image_window_stays_global_until_pack_or_cancellation() {
     }
     assert!(worker.active[0].is_none());
     assert_eq!(processor.preparation_counts().prepared_images, 2);
-    assert_eq!(worker.preparing_image, Some(worker.active[1].as_ref().unwrap().request));
+    assert_eq!(
+        worker.preparing_image,
+        Some(worker.active[1].as_ref().unwrap().request)
+    );
 }
 
 #[test]
 fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampling() {
+    use crate::execution::{BufferDescriptor, Dtype, GraphDescriptor, InputBinding, SamplingMode};
     use crate::frontend::images::{
         ImageInput, ImageLimits, ImageProcessor, ImageSettings, ImageSource, PreparedImageInput,
         QwenImageSettings, RgbImage,
     };
     use crate::model::contract::{GraphContract, GraphOperation, InputIndexing, ValueSource};
-    use crate::execution::{Dtype, GraphDescriptor, InputBinding, BufferDescriptor, SamplingMode};
     let mut fixture = Fixture::new();
     fixture.config.limits.max_sequence_tokens = 512;
     fixture.config.prepared_sequence_tokens = 512;
@@ -2751,7 +2858,9 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         embedding_tables: vec![],
         pending_token: None,
     });
-    manifest.graphs.push(GraphDescriptor { draft_tokens: 0,
+    manifest.graphs.push(GraphDescriptor {
+        confidence_width: 0,
+        draft_tokens: 0,
         name: "Vision-1-256".into(),
         kind: GraphKind::Vision,
         handle: 1,
@@ -2905,8 +3014,16 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
     assert!(crate::model::admission::validate_prompt(config, &incoming.prompt).is_err());
     incoming.prompt.prompt_logprobs = true;
     crate::model::admission::validate_prompt(config, &incoming.prompt).unwrap();
-    let mut admission = crate::model::Admission::from_prompt(config, RequestHandle { slot: 0, generation: 1 },
-        &incoming.prompt, false).unwrap();
+    let mut admission = crate::model::Admission::from_prompt(
+        config,
+        RequestHandle {
+            slot: 0,
+            generation: 1,
+        },
+        &incoming.prompt,
+        false,
+    )
+    .unwrap();
     admission.prompt_logprobs = false;
     assert!(admission.validate(config).is_err());
 }

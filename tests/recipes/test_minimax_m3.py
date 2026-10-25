@@ -162,7 +162,7 @@ def test_rectangular_verification_is_retained_for_explicit_diagnostics():
     from ignition.recipes.minimax_m3.bootstrap import PreparationConfig
 
     config = PreparationConfig(max_active=4, speculative_widths=tuple(range(1, 9)),
-        speculative_token_capacity=32, diagnostic_graphs=("verification4x8",), speculative_fixed_width=8)
+        speculative_token_capacity=32, diagnostic_graphs=("speculative4x8",), speculative_fixed_width=8)
     assert config.packed_speculative_shapes == ()
     assert set(config.speculative_shapes) == {(batch, width) for batch in (1, 2, 4) for width in range(1, 9)}
 
@@ -199,6 +199,7 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
 
     rendezvous = SimpleNamespace(hosts=("rank0", "rank1", "rank2", "rank3"))
     plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="high", tuning_replica=None,
+        native_dense_activations=True,
         image_concurrency=4, language_model_only=False, world_size=4, roce_ring=False,
         context=1048576, concurrency=4, prefill_chunk=4096, snapshots=4,
         costs=RECIPE.ranks[4], headroom_bytes=8 << 30, reserve_bytes=4 << 30,
@@ -219,15 +220,15 @@ def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypat
     assert result["config"].prefill_chunk_size == 4096
     assert result["config"].speculative_token_capacity == 32
     assert result["config"].autotune_effort == "high"
+    assert result["config"].native_dense_activations
     assert result["config"].packed_verification
     assert result["config"].draft_prefix_selection == "gpu"
     assert result["config"].speculative_graph_budget == 64
 
 
 @pytest.mark.parametrize("vision", [False, True])
-def test_contract_preserves_every_cache_plane_and_request_owned_proposals(vision):
+def test_contract_preserves_cache_planes_and_complete_round_bindings(vision):
     from google.protobuf.json_format import ParseDict
-    from ignition.components.split_draft import PreparedProposalStorage
     from ignition.preparation import contract as c, runtime_package_pb2 as p
     from ignition.preparation.execution import GraphSignature
     from ignition.recipes.minimax_m3.contract import prepare
@@ -235,14 +236,12 @@ def test_contract_preserves_every_cache_plane_and_request_owned_proposals(vision
     from types import SimpleNamespace
 
     pool = ContinuationPool.for_model(ModelConfig.from_dict(configuration()), TensorParallelShard(0, 4), 3, 2, "cpu")
-    requests = SimpleNamespace(capacity=4, generation=torch.zeros(4, dtype=torch.int64), vocab_size=512)
-    retained = PreparedProposalStorage(SimpleNamespace(requests=requests), 7)
-    buffers = dict(retained.buffers(), proposal_confidence=torch.empty((4, 7)))
-    signatures = {kind: GraphSignature(kind, 4, 8, tuple(c.text_inputs(kind)), speculation_enabled=True)
-        for kind in ("proposal", "verification", "speculative")}
-    signatures["packed_speculative"] = GraphSignature("packed_speculative", 4, 6,
-        tuple(c.text_inputs("packed_speculative")), speculation_enabled=True,
-        packed_token_capacity=10, draft_tokens=5)
+    buffers = {"proposal_confidence": torch.empty((2, 4, 7))}
+    signatures = {"speculative": GraphSignature("speculative", 4, 8,
+        tuple(c.text_inputs("speculative")), speculation_enabled=True)}
+    signatures["ragged"] = GraphSignature("speculative", 4, 6,
+        tuple(field for field in c.text_inputs("speculative") if field != "query_lengths") + ("speculative_prefix_limits",),
+        speculation_enabled=True, packed_token_capacity=10, draft_tokens=5)
     if vision:
         signatures["vision"] = GraphSignature("vision", 1, 256, ("vision_pixel_values", "vision_slot"))
     value = ParseDict(prepare(signatures, buffers, pool, vocabulary=512, frontend=FRONTEND,
@@ -251,14 +250,11 @@ def test_contract_preserves_every_cache_plane_and_request_owned_proposals(vision
     assert len(value.cache.regions) == 7
     assert sum(region.kind == p.PAGED_LATENT for region in value.cache.regions) == 2
     for graph in value.graphs:
-        if graph.kind in (p.PROPOSAL, p.VERIFICATION, p.PACKED_SPECULATIVE):
-            views = [state.view for state in graph.state if state.view.buffer.startswith("proposal_")]
-            assert len(views) == len(retained.buffers()) + 1
-            assert all(view.nbytes == view.stride for view in views)
-        if graph.kind in (p.SPECULATIVE, p.PACKED_SPECULATIVE):
+        assert all(not state.view.buffer.startswith("proposal_") for state in graph.state)
+        if graph.kind == p.SPECULATIVE:
             assert graph.draft_cursor.lag_tokens == 0
             assert graph.state_rows_per_request == 1
-        if graph.kind == p.PACKED_SPECULATIVE:
+        if graph.graph == "ragged":
             sources = {binding.buffer: binding.source for binding in graph.inputs}
             assert sources["speculative_prefix_limits"] == p.SPECULATIVE_PREFIX_LIMIT
             assert p.QUERY_LENGTH not in sources.values()

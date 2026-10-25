@@ -86,6 +86,38 @@ def test_model_discovery_and_lookup(clients):
             assert denied.status_code == 401
 
 
+def test_ollama_model_discovery(clients):
+    _, _, http = clients
+    card = http.get("/v1/models").json()["data"][0]
+    listed = http.get("/api/tags")
+    listed.raise_for_status()
+    models = listed.json()["models"]
+    assert len(models) == 1
+    model = models[0]
+    assert model["name"] == model["model"] == card["id"]
+    assert model["details"]["format"] == "flare"
+    assert len(model["digest"]) == 64
+    shown = http.post("/api/show", json={"model": model["model"]})
+    shown.raise_for_status()
+    info = shown.json()
+    assert info["details"] == model["details"]
+    assert info["model_info"]["flare.context_length"] == card["max_model_len"]
+    assert info["model_info"]["flare.vocab_size"] == card["flare"]["vocab_size"]
+    assert "completion" in info["capabilities"]
+    assert ("vision" in info["capabilities"]) == ("image" in card["flare"]["input_modalities"])
+    assert http.post("/api/show", json={"model": card["root"], "verbose": True}).json() == info
+    assert http.get("/api/tags").json() == listed.json()
+    for body, status in [({}, 400), ({"model": ""}, 400),
+                         ({"model": "__flare_missing_model__"}, 404)]:
+        response = http.post("/api/show", json=body)
+        assert response.status_code == status
+        assert isinstance(response.json()["error"], str)
+    if os.environ.get("FLARE_API_TEST_KEY"):
+        headers = {"Authorization": "Bearer " + os.environ["FLARE_API_TEST_KEY"] + "-invalid"}
+        assert http.get("/api/tags", headers=headers).status_code == 401
+        assert http.post("/api/show", json={"model": card["id"]}, headers=headers).status_code == 401
+
+
 def test_sdk_buffered_and_streaming_text(clients):
     o, a, _ = clients
     chat = o.chat.completions.create(model="local", messages=USER, max_tokens=32, extra_body=EXTRA)
@@ -694,18 +726,25 @@ def test_generation_logprobs_single_token_continuation(clients, streaming):
             'stream': streaming}
     if streaming:
         entries = []
+        stream_events = []
         with http.stream('POST', '/v1/chat/completions', json=body) as response:
             assert response.status_code == 200, response.read()
             for line in response.iter_lines():
                 if line.startswith('data: ') and line != 'data: [DONE]':
                     data = json.loads(line[6:])
+                    stream_events.append(data)
                     for choice in data.get('choices', []):
                         entries.extend((choice.get('logprobs') or {}).get('content', []))
+        observed = json.dumps(stream_events, indent=2)
     else:
         response = http.post('/v1/chat/completions', json=body)
         assert response.status_code == 200, response.text
         entries = response.json()['choices'][0]['logprobs']['content']
-    assert len(entries) == 1
+        observed = response.text
+    assert len(entries) == 1, (
+        f'expected one continuation logprob entry, got {len(entries)}; '
+        f'streaming={streaming}; response={observed}'
+    )
     _check_logprob_entry(entries[0], 20)
 
 

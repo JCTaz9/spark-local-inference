@@ -1,4 +1,4 @@
-"""Native replay delivers interleaved head rows from sealed resident planes."""
+"""Native replay delivers canonical full-table rows from sealed resident planes."""
 
 import os
 import time
@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 @pytest.mark.parametrize("rank", range(4))
 @torch.no_grad()
-def test_native_replay_reads_balanced_head_segments_without_checkpoint_files(tmp_path, rank):
+def test_native_replay_reads_full_tables_without_checkpoint_files(tmp_path, rank):
     device = torch.device("cuda:0")
     geometry = engram.build_geometry(layer_ids=(1,), base_table_size=101, compressed_vocab_size=32)
     rows, tokens = geometry.num_embeddings[0], 4
@@ -43,7 +43,7 @@ def test_native_replay_reads_balanced_head_segments_without_checkpoint_files(tmp
     count = torch.full((1,), tokens, dtype=torch.int32, device=device)
     source = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
-    records = torch.zeros((2, 4, 8), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
     mailbox = MappedHostAllocation((tokens * 24 + 1,), torch.int64, device)
     mailbox.host_view.zero_()
     worker = graph = None
@@ -69,8 +69,7 @@ def test_native_replay_reads_balanced_head_segments_without_checkpoint_files(tmp
             with session.capture(), torch.cuda.graph(graph):
                 compiled()
             tables = Tables(geometry, tuple(range(32)), {1: tuple(sources)}, {1: inputs}, {1: mailbox},
-                            sequence, TensorParallelShard(rank, 4), {}, None)
-            partition = tables.partition(0, rank)
+                            sequence, TensorParallelShard(rank, 4), None)
             execution = PreparedExecution(device=0, graphs={"decode": graph},
                 buffers=dict(tables.buffers(), output=output, live_count=count, frame_index=frame,
                     submission_sequence=sequence, completion_records=records),
@@ -87,16 +86,13 @@ def test_native_replay_reads_balanced_head_segments_without_checkpoint_files(tmp
             worker = flare_heliopause.GraphExecutor(execution, manifest)
             for generation, live in enumerate((4, 2, 0, 4), 1):
                 canonical = torch.full((tokens, 24), -1, dtype=torch.int64)
-                local = canonical.clone()
-                for head in partition.heads:
-                    first, last, destination = partition.row_mapping[head]
+                for head, (first, last) in enumerate(zip(geometry.offsets[0], (*geometry.offsets[0][1:], rows), strict=True)):
                     relative = (torch.arange(tokens) * 19 + generation) % (last - first)
                     canonical[:live, head] = first + relative[:live]
-                    local[:live, head] = destination + relative[:live]
                 output.fill_(float("nan"))
                 torch.cuda.synchronize()
                 allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
-                fence = worker.submit(0, [("engram_1_hashes", 0, local.numpy().tobytes()),
+                fence = worker.submit(0, [("engram_1_hashes", 0, canonical.numpy().tobytes()),
                     ("live_count", 0, torch.tensor([live], dtype=torch.int32).numpy().tobytes())])
                 deadline = time.monotonic() + 30
                 completion = worker.poll()

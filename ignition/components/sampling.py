@@ -331,13 +331,12 @@ def _write_completion(Records, Frame, Sequence, slot, epoch, consumed, generated
     value = tl.where(fields == 4, tl.where(active, token, -1), value)
     value = tl.where(fields == 5, tl.where(active, status, 0), value)
     value = tl.where(fields == 6, tl.where(active, error, 0), value)
-    if RECORD_FIELDS == 24:
-        value = tl.where(fields == 8, (active & (token >= 0)).to(tl.int64), value)
-        value = tl.where(fields == 12, -1, value)
-        value = tl.where(fields == 13, tl.where(active, tl.maximum(consumed - 1, 0), 0), value)
-        value = tl.where(fields == 15, 1, value)
-        value = tl.where(fields >= 16, -1, value)
-        value = tl.where(fields == 16, tl.where(active, token, -1), value)
+    value = tl.where(fields == 8, (active & (token >= 0)).to(tl.int64), value)
+    value = tl.where(fields == 12, -1, value)
+    value = tl.where(fields == 13, tl.where(active, tl.maximum(consumed - 1, 0), 0), value)
+    value = tl.where(fields == 15, 1, value)
+    value = tl.where(fields >= 16, -1, value)
+    value = tl.where(fields == 16, tl.where(active, token, -1), value)
     tl.store(Records + (tl.load(Frame) * SLOTS + slot) * RECORD_FIELDS + fields,
              value, fields < RECORD_FIELDS)
 
@@ -406,8 +405,8 @@ def _check_tensor(tensor, shape, dtype, device, name, *, contiguous=True):
 
 
 def _completion_fields(records, device, capacity=4):
-    if records.ndim != 3 or records.shape[:2] != (2, capacity) or records.shape[2] not in (8, 24):
-        raise ValueError("completion_records requires ABI2 [2,capacity,8] or ABI3 [2,capacity,24]")
+    if records.ndim != 3 or records.shape[:2] != (2, capacity) or records.shape[2] != 24:
+        raise ValueError("completion_records requires [2,capacity,24]")
     _check_tensor(records, records.shape, torch.int64, device, "completion_records")
     return records.shape[2]
 

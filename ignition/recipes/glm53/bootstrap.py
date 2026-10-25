@@ -21,6 +21,7 @@ from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from .contract import prepare as prepare_contract
 from ignition.preparation.contract import history_region
+from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -67,6 +68,7 @@ _KV_ALLOCATION_MARGIN = 64 << 20
 class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    native_dense_activations: bool = False
     autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1)
@@ -310,7 +312,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         commands = StateCommands.allocate(device, capacity=slots)
         frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
-        completion = CompletionOutputs.allocate((2, slots, 24 if config.mtp else 8), device=device)
+        completion = CompletionOutputs.allocate((2, slots, 24), device=device)
         # One rank holds whole sums and vocabularies: it prepares no collectives.
         coordinator = CollectivePreparation(group) if group is not None else None
         ipc = None if package_storage is None else package_storage.peer_storage
@@ -354,6 +356,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            native_dense_activations=config.native_dense_activations,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -481,7 +484,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                                           pages=pool.memory_capacity[1:], shards=shards,
                         validate_prefill=vision_state.validate_prefill if vision_state is not None and mode == "prefill" else None)
                     forward = PreparedGeneration(decoders[name], batch, completion, frame, sequence,
-                        pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation", replicated_sampling=enabled)
+                        pool=pool, runtime=collective, coordinator=coordinator, session=session, name=f"{name}.generation")
                     if enabled:
                         from .speculative import PreparedPrefill
 
@@ -504,7 +507,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 name = f"resume{capacity}" + suffix
                 resume = PreparedResume(weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name, replicated_sampling=enabled)
+                    coordinator=coordinator, session=session, name=name)
                 add(name, resume, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix
@@ -660,7 +663,14 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         vision_state, vision_inputs, vision_prefill, vision_storage, vision_owners)
     from .export import disposable_ranges
 
-    return PreparedModel(rebuild_weights={"weights": weights}, device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    return PreparedModel(rebuild_weights=declare_weights(weights, components={
+        'tree.model.language_model.embed_tokens': 'embedding',
+        'tree.model.language_model.norm': 'norm',
+        'tree.lm_head': 'head',
+        'head': 'head',
+        'mtp': 'mtp',
+        'vision': 'vision',
+    }), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, resources=resources, session=session,
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

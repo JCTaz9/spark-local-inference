@@ -1,7 +1,7 @@
 """Compose a GLM rank's text forward, request consumption, and completion."""
 
 from ignition.components.collectives import PreparedAllReduce
-from ignition.components.sampling import PreparedCompletion, PreparedSampling
+from ignition.components.sampling import PreparedSampling
 from ignition.components.state import save_hidden
 
 from .batch import PreparedBatch
@@ -9,14 +9,14 @@ from .stack import PreparedDecoder
 
 
 class PreparedGeneration:
-    """One captured rank step; rank zero samples and peers record consumption.
+    """Gather GPU-owned tokens and commit root-broadcast sampling results on every rank.
 
-    All ranks receive identical token uploads before replay. Native execution
-    must wait for every rank before retiring a step or reusing its cache pages.
+    Native execution waits for every rank before retiring a step or reusing its
+    cache pages.
     """
 
     def __init__(self, decoder: PreparedDecoder, batch: PreparedBatch, completion,
-                 frame_index, submission_sequence, *, pool, runtime, coordinator, session, name, replicated_sampling=False):
+                 frame_index, submission_sequence, *, pool, runtime, coordinator, session, name):
         if decoder.metadata is not batch.metadata or decoder.weights.shard != batch.shard:
             raise ValueError("GLM generation requires the decoder's metadata and rank")
         if decoder.state is not pool.decoder:
@@ -27,14 +27,12 @@ class PreparedGeneration:
         b, rows = batch.inputs, batch.rows
         arguments = (batch.requests, b.row_slot_ids[:rows], b.row_generations[:rows], b.live_rows,
                      completion, frame_index, submission_sequence)
-        self.completion = PreparedCompletion(*arguments) if decoder.weights.shard.rank != 0 and not replicated_sampling else PreparedSampling(
+        self.completion = PreparedSampling(
             decoder.scratch.logits, *arguments, sample_enabled=b.sample_enabled[:rows])
         self.completion.prepare()
-        if replicated_sampling:
-            self.completion.prepare_broadcast(runtime=decoder.lm_head.gather.runtime, session=session,
-                coordinator=coordinator, name=name + ".sampling")
-        self.compilation_variant = "sample" if decoder.weights.shard.rank == 0 or replicated_sampling else "consume"
-        self.replicated_sampling = replicated_sampling
+        self.completion.prepare_broadcast(runtime=decoder.lm_head.gather.runtime, session=session,
+            coordinator=coordinator, name=name + ".sampling")
+        self.compilation_variant = "sample"
 
     def rebind_pages(self, pages):
         self.decoder.rebind_pages()

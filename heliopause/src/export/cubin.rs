@@ -1,7 +1,7 @@
 //! ELF transformations that preserve CUDA section and symbol indices.
 
 use super::{ExportResult, invalid};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 struct Section {
@@ -224,145 +224,6 @@ pub(crate) fn global_symbols(image: &[u8]) -> ExportResult<Vec<String>> {
     Ok(result.into_iter().collect())
 }
 
-pub(crate) fn redact_symbols(image: &[u8]) -> ExportResult<(Vec<u8>, BTreeMap<String, String>)> {
-    let elf = Elf::parse(image)?;
-    let symbols = elf.symbols(true)?;
-    let mut existing: BTreeSet<Vec<u8>> = symbols.iter().map(|s| s.2.to_vec()).collect();
-    let mut aliases: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-    for (_, _, name, kind, index, _, _) in &symbols {
-        if !matches!(kind, 1 | 2)
-            || *index == 0
-            || *index >= elf.sections.len()
-            || name.is_empty()
-            || [b".nv.".as_slice(), b"__nv_", b"__cuda"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            || aliases.contains_key(*name)
-        {
-            continue;
-        }
-        let mut alias = format!("_f{}", aliases.len()).into_bytes();
-        while existing.contains(&alias) {
-            alias.insert(0, b'_');
-        }
-        existing.insert(alias.clone());
-        aliases.insert(name.to_vec(), alias);
-    }
-    let renamed = |name: &[u8]| -> Vec<u8> {
-        if let Some(alias) = aliases.get(name) {
-            return alias.clone();
-        }
-        for (i, b) in name.iter().enumerate() {
-            if *b == b'.' {
-                if let Some(alias) = aliases.get(&name[i + 1..]) {
-                    let mut value = name[..i + 1].to_vec();
-                    value.extend(alias);
-                    return value;
-                }
-            }
-        }
-        name.to_vec()
-    };
-    let mut tables: BTreeMap<usize, (Vec<u8>, BTreeMap<Vec<u8>, usize>)> = BTreeMap::new();
-    fn intern(
-        tables: &mut BTreeMap<usize, (Vec<u8>, BTreeMap<Vec<u8>, usize>)>,
-        table: usize,
-        value: Vec<u8>,
-    ) -> usize {
-        let (data, entries) = tables
-            .entry(table)
-            .or_insert_with(|| (vec![0], BTreeMap::from([(vec![], 0)])));
-        *entries.entry(value.clone()).or_insert_with(|| {
-            let offset = data.len();
-            data.extend(value);
-            data.push(0);
-            offset
-        })
-    }
-    let mut table_order = vec![elf.names];
-    for symbol in &symbols {
-        if !table_order.contains(&symbol.1) {
-            table_order.push(symbol.1);
-        }
-    }
-    let mut result = image.to_vec();
-    for (i, s) in elf.sections.iter().enumerate() {
-        let index = intern(
-            &mut tables,
-            elf.names,
-            renamed(elf.string(elf.names, s.name)?),
-        );
-        put(&mut result, elf.offset + i * 64, index as u64, 4);
-    }
-    for (p, table, name, kind, _, _, _) in symbols {
-        let index = intern(
-            &mut tables,
-            table,
-            if kind == 4 { vec![] } else { renamed(name) },
-        );
-        put(&mut result, p, index as u64, 4);
-    }
-    let program = number(image, 32, 8)? as usize;
-    let stride = number(image, 54, 2)? as usize;
-    let count = number(image, 56, 2)? as usize;
-    if count > 0
-        && (stride != 56
-            || program
-                .checked_add(count * stride)
-                .is_none_or(|end| end > image.len()))
-    {
-        return Err(invalid("invalid cubin program table"));
-    }
-    for index in table_order {
-        let (data, _) = tables.remove(&index).unwrap();
-        let s = &elf.sections[index];
-        if s.flags & 2 != 0 {
-            return Err(invalid(
-                "cannot redact a device-allocated cubin string table",
-            ));
-        }
-        if overlap(s.offset, s.size, elf.offset, elf.sections.len() * 64) {
-            return Err(invalid("cubin string table overlaps section headers"));
-        }
-        if s.offset < 64 || overlap(s.offset, s.size, program, count * stride) {
-            return Err(invalid("cubin string table overlaps ELF headers"));
-        }
-        for (i, t) in elf.sections.iter().enumerate() {
-            if i != index && t.kind != 8 && overlap(s.offset, s.size, t.offset, t.size) {
-                return Err(invalid("cubin string table overlaps another section"));
-            }
-        }
-        for i in 0..count {
-            let p = program + i * stride;
-            if number(image, p, 4)? == 1
-                && overlap(
-                    s.offset,
-                    s.size,
-                    number(image, p + 8, 8)? as usize,
-                    number(image, p + 32, 8)? as usize,
-                )
-            {
-                return Err(invalid("cannot redact a loadable cubin string table"));
-            }
-        }
-        result[s.offset..s.offset + s.size].fill(0);
-        let end = result.len();
-        put(&mut result, elf.offset + index * 64 + 24, end as u64, 8);
-        put(
-            &mut result,
-            elf.offset + index * 64 + 32,
-            data.len() as u64,
-            8,
-        );
-        result.extend(data);
-    }
-    let aliases = aliases
-        .into_iter()
-        .map(|(key, value)| Ok((String::from_utf8(key)?, String::from_utf8(value)?)))
-        .collect::<ExportResult<_>>()?;
-    Ok((result, aliases))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,60 +296,22 @@ mod tests {
         image
     }
     #[test]
-    fn redaction_preserves_executable_layout_and_removes_source_names() {
+    fn debug_stripping_preserves_executable_layout_and_symbol_names() {
         let original = cubin();
-        let stripped = strip_debug(&original).unwrap();
-        let (clean, aliases) = redact_symbols(&stripped).unwrap();
-        assert_eq!(
-            aliases,
-            BTreeMap::from([
-                ("descriptive_kernel".into(), "_f0".into()),
-                ("weight_layout".into(), "_f1".into())
-            ])
-        );
-        for secret in [
-            b"descriptive_kernel".as_slice(),
-            b"weight_layout",
-            b"/private/",
-        ] {
-            assert!(!clean.windows(secret.len()).any(|w| w == secret));
+        let clean = strip_debug(&original).unwrap();
+        for name in [b"descriptive_kernel".as_slice(), b"weight_layout"] {
+            assert!(clean.windows(name.len()).any(|bytes| bytes == name));
         }
-        assert_eq!(
-            global_symbols(&clean).unwrap(),
-            vec![".nv.reservedSmem.offset0", "_f1"]
-        );
+        assert_eq!(global_symbols(&clean).unwrap(), vec![".nv.reservedSmem.offset0", "weight_layout"]);
         let before = Elf::parse(&original).unwrap();
         let after = Elf::parse(&clean).unwrap();
-        for i in [3, 5, 7] {
+        for i in [1, 2, 3, 4, 5, 7] {
             assert_eq!(before.contents(i).unwrap(), after.contents(i).unwrap());
             assert_eq!(before.sections[i].offset, after.sections[i].offset);
         }
         assert_eq!(after.sections[6].size, 0);
-        assert!(
-            clean[before.sections[6].offset..before.sections[6].offset + before.sections[6].size]
-                .iter()
-                .all(|b| *b == 0)
-        );
-        assert_eq!(after.sections[4].offset, original.len());
-        assert!(after.sections[1].offset > after.sections[4].offset);
-    }
-    #[test]
-    fn redaction_rejects_tables_that_overlap_executable_data() {
-        let original = cubin();
-        let elf = Elf::parse(&original).unwrap();
-        let mut image = original.clone();
-        put(
-            &mut image,
-            64 + 64 + 32,
-            (elf.sections[1].size + 1) as u64,
-            8,
-        );
-        assert!(
-            redact_symbols(&image)
-                .unwrap_err()
-                .to_string()
-                .contains("overlaps another section")
-        );
+        assert!(clean[before.sections[6].offset..before.sections[6].offset + before.sections[6].size]
+            .iter().all(|byte| *byte == 0));
     }
     #[test]
     fn debug_stripping_redacts_embedded_assertion_filenames() {

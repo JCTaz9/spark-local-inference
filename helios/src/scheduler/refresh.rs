@@ -1,5 +1,5 @@
-use super::{Fence, RequestHandle, ScheduledStep, cost};
-use crate::{Result, execution::{ExecutionTiming, GraphKind, REQUEST_LANES}};
+use super::{Fence, ScheduledStep, cost};
+use crate::{Result, execution::ExecutionTiming};
 
 pub(super) const CREDIT_CAP_NS: f64 = 5_000_000.0;
 const INCOME_RATE: f64 = 0.002 / 0.998;
@@ -11,9 +11,7 @@ pub(super) enum PlanOrigin {
     Ordinary,
     Discovery,
     RefreshStart(cost::Key),
-    RefreshContinuation(u64),
     AcceptanceStart,
-    AcceptanceContinuation(u64),
 }
 
 impl PlanOrigin {
@@ -22,43 +20,7 @@ impl PlanOrigin {
     }
 
     pub fn is_acceptance(self) -> bool {
-        matches!(self, Self::AcceptanceStart | Self::AcceptanceContinuation(_))
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Owner {
-    pub handle: RequestHandle,
-    pub consumed: u64,
-    pub fence: Fence,
-}
-
-pub(super) struct Episode {
-    pub id: u64,
-    pub target: Option<cost::Key>,
-    pub owners: [Option<Owner>; REQUEST_LANES],
-    inflight: usize,
-}
-
-impl Episode {
-    pub fn continuation(&self) -> PlanOrigin {
-        if self.target.is_some() { PlanOrigin::RefreshContinuation(self.id) }
-        else { PlanOrigin::AcceptanceContinuation(self.id) }
-    }
-
-    pub fn owns(&self, handle: RequestHandle, consumed: u64, fence: Fence) -> bool {
-        self.owners.get(handle.slot as usize).and_then(|owner| *owner)
-            .is_some_and(|owner| owner.handle == handle && owner.consumed == consumed && owner.fence == fence)
-    }
-
-    pub fn owns_handle(&self, handle: RequestHandle) -> bool {
-        self.owners.get(handle.slot as usize).and_then(|owner| *owner)
-            .is_some_and(|owner| owner.handle == handle)
-    }
-
-    pub fn owned_mask(&self) -> u64 {
-        self.owners.iter().enumerate().filter(|(_, owner)| owner.is_some())
-            .fold(0, |mask, (slot, _)| mask | (1 << slot))
+        matches!(self, Self::AcceptanceStart)
     }
 }
 
@@ -66,58 +28,31 @@ impl Episode {
 pub(super) struct RefreshState {
     pub credit_ns: f64,
     pub acceptance_credit_ns: f64,
-    active: Option<Episode>,
+    active: bool,
 }
 
 impl RefreshState {
+    #[cfg(test)]
+    pub(super) fn active(&self) -> bool { self.active }
+
     pub fn ready(&self) -> bool {
-        self.active.is_none() && self.credit_ns >= CREDIT_CAP_NS
+        !self.active && self.credit_ns >= CREDIT_CAP_NS
     }
 
     pub fn acceptance_ready(&self) -> bool {
-        self.active.is_none() && self.acceptance_credit_ns >= CREDIT_CAP_NS
-    }
-
-    pub fn episode(&self) -> Option<&Episode> {
-        self.active.as_ref()
+        !self.active && self.acceptance_credit_ns >= CREDIT_CAP_NS
     }
 
     pub fn validate(&self, origin: PlanOrigin) -> Result<()> {
         match origin {
             PlanOrigin::RefreshStart(_) if !self.ready() => Err("refresh requires full credit and no active episode".into()),
             PlanOrigin::AcceptanceStart if !self.acceptance_ready() => Err("acceptance learning requires full credit and no active episode".into()),
-            PlanOrigin::RefreshContinuation(_) | PlanOrigin::AcceptanceContinuation(_)
-                if self.active.as_ref().is_none_or(|episode| episode.continuation() != origin) =>
-                Err("probe continuation does not own the active episode".into()),
             _ => Ok(()),
         }
     }
 
-    pub fn commit(&mut self, origin: PlanOrigin, fence: Fence, step: &ScheduledStep) {
-        match origin {
-            PlanOrigin::RefreshStart(_) | PlanOrigin::AcceptanceStart => {
-                let target = match origin { PlanOrigin::RefreshStart(target) => Some(target), _ => None };
-                let mut owners = [None; REQUEST_LANES];
-                if step.kind == GraphKind::Proposal {
-                    for lane in &step.lanes {
-                        owners[lane.request.slot as usize] = Some(Owner {
-                            handle: lane.request, consumed: lane.start_position, fence,
-                        });
-                    }
-                }
-                self.active = Some(Episode { id: fence.0, target, owners, inflight: 1 });
-            }
-            PlanOrigin::RefreshContinuation(_) | PlanOrigin::AcceptanceContinuation(_) => {
-                let episode = self.active.as_mut().unwrap();
-                episode.inflight += 1;
-                for lane in &step.lanes {
-                    if episode.owns_handle(lane.request) {
-                        episode.owners[lane.request.slot as usize] = None;
-                    }
-                }
-            }
-            _ => {}
-        }
+    pub fn commit(&mut self, origin: PlanOrigin, _fence: Fence, _step: &ScheduledStep) {
+        if origin.is_probe() { self.active = true; }
     }
 
     pub fn validate_completion(&self, origin: PlanOrigin, timing: ExecutionTiming) -> Result<()> {
@@ -141,24 +76,8 @@ impl RefreshState {
                 let duration = cost::observed_duration_ns(timing).unwrap_or(timing.wall_ns);
                 if origin.is_acceptance() { self.acceptance_credit_ns -= duration as f64; }
                 else { self.credit_ns -= duration as f64; }
-                self.active.as_mut().unwrap().inflight -= 1;
-                self.close_resolved();
+                self.active = false;
             }
-        }
-    }
-
-    pub fn retain_owners(&mut self, keep: &[bool; REQUEST_LANES]) {
-        if let Some(episode) = &mut self.active {
-            for (owner, &keep) in episode.owners.iter_mut().zip(keep) {
-                if !keep { *owner = None; }
-            }
-        }
-        self.close_resolved();
-    }
-
-    fn close_resolved(&mut self) {
-        if self.active.as_ref().is_some_and(|episode| episode.inflight == 0 && episode.owned_mask() == 0) {
-            self.active = None;
         }
     }
 
@@ -168,7 +87,7 @@ impl RefreshState {
     }
 
     pub fn abort(&mut self) {
-        self.active = None;
+        self.active = false;
         self.idle();
     }
 }

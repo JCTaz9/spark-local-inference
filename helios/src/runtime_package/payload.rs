@@ -12,12 +12,118 @@ use std::{
 
 use super::{
     NativeResources,
+    archive::PayloadFile,
     driver::{Driver, Handle},
     format::{Memory, Package, invalid},
+    protobuf::wire,
 };
 use crate::{Result, startup::Phase};
 
+/// Graph-body record stream. Concrete variants keep the loader statically dispatched: the legacy
+/// archive reader and a payload slice reader share one length-prefixed framing.
+pub(super) enum RecordReader<'a> {
+    Archive(super::archive::Records),
+    Slice {
+        bytes: Vec<u8>,
+        position: usize,
+    },
+    /// Streaming plaintext, used for graph bodies that may be far larger than one buffer.
+    Stream(Box<dyn std::io::Read + 'a>),
+}
+
+impl RecordReader<'_> {
+    pub fn read<T: prost::Message + Default>(&mut self) -> crate::Result<T> {
+        match self {
+            RecordReader::Archive(records) => records.read(),
+            RecordReader::Stream(reader) => {
+                use std::io::Read as _;
+                let mut prefix = [0u8; 4];
+                reader
+                    .read_exact(&mut prefix)
+                    .map_err(|e| invalid(format!("truncated graph record: {e}")))?;
+                let size = u32::from_le_bytes(prefix) as usize;
+                if size > MAX_RECORD {
+                    return Err(invalid("invalid graph record size"));
+                }
+                let mut body = vec![0u8; size];
+                reader
+                    .read_exact(&mut body)
+                    .map_err(|e| invalid(format!("truncated graph record: {e}")))?;
+                T::decode(body.as_slice()).map_err(|_| invalid("invalid graph record"))
+            }
+            RecordReader::Slice { bytes, position } => {
+                let start = *position;
+                let prefix = bytes
+                    .get(start..start + 4)
+                    .ok_or_else(|| invalid("truncated graph record"))?;
+                let size = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
+                if size > MAX_RECORD {
+                    return Err(invalid("invalid graph record size"));
+                }
+                let body = bytes
+                    .get(start + 4..start + 4 + size)
+                    .ok_or_else(|| invalid("truncated graph record"))?;
+                *position = start + 4 + size;
+                T::decode(body).map_err(|_| invalid("invalid graph record"))
+            }
+        }
+    }
+    pub fn finish(mut self) -> crate::Result<()> {
+        match self {
+            RecordReader::Archive(records) => records.finish(),
+            RecordReader::Stream(ref mut reader) => {
+                use std::io::Read as _;
+                let mut extra = [0u8; 1];
+                match reader.read(&mut extra) {
+                    Ok(0) => Ok(()),
+                    Ok(_) => Err(invalid("trailing graph record bytes")),
+                    Err(error) => Err(invalid(format!("read graph record: {error}"))),
+                }
+            }
+            RecordReader::Slice { bytes, position } => {
+                if position == bytes.len() {
+                    Ok(())
+                } else {
+                    Err(invalid("trailing graph record bytes"))
+                }
+            }
+        }
+    }
+}
+
+/// The read surface the loader needs from whatever opened a package: the legacy archive or a
+/// payload-format source over pinned reader files. Both resolve a resource key to one container
+/// range, so the upload path is shared.
+pub(super) trait Files: Sync {
+    fn span<'a>(&self, package: &'a Package, key: &str) -> crate::Result<&'a wire::Span>;
+    fn source(&self, span: &wire::Span) -> crate::Result<(&PayloadFile, u64)>;
+    fn read(&self, package: &Package, key: &str) -> crate::Result<Vec<u8>>;
+    fn records<'a>(&'a self, package: &Package, key: &str) -> crate::Result<RecordReader<'a>>;
+    fn path(&self) -> &std::path::Path;
+    /// Index of the container holding `span` in this source's pinned-file order.
+    fn source_index(&self, span: &wire::Span) -> crate::Result<usize>;
+    /// A filesystem path a child process or Windows API can open for this resource.
+    fn asset_path(&self, span: &wire::Span) -> crate::Result<std::path::PathBuf>;
+    fn release_page_cache(&self);
+    /// Files whose unbuffered read exclusion must outlive the model.
+    fn retained_files(&self) -> crate::Result<Vec<std::sync::Arc<std::fs::File>>>;
+    /// Direct-I/O handles for this source's containers, used by embedding readers.
+    fn direct_files(
+        &self,
+    ) -> Box<dyn Iterator<Item = crate::Result<std::sync::Arc<std::fs::File>>> + '_>;
+    fn validate(&self, package: &Package) -> crate::Result<()>;
+    /// Streaming plaintext of one resource: decompressed for executables, direct for stored bytes.
+    /// Inspection digests through this so a resource is never materialized.
+    #[cfg_attr(not(any(test, feature = "test-tools")), allow(dead_code))]
+    fn resource_reader<'a>(
+        &'a self,
+        package: &Package,
+        key: &str,
+    ) -> crate::Result<Box<dyn std::io::Read + 'a>>;
+}
+
 const CHUNK: usize = 4 << 20;
+const MAX_RECORD: usize = 1 << 20;
 const SLOTS: usize = 4;
 const READERS: usize = 4;
 const BLOCK: usize = 4096;
@@ -117,9 +223,9 @@ impl Chunk {
 }
 
 /// The owner's mapped allocations must be live and unused by graph execution.
-pub(super) unsafe fn load(
+pub(super) unsafe fn load<F: Files>(
     owner: &NativeResources,
-    archive: &super::archive::Archive,
+    files: &F,
     package: &Package,
     phase: &Phase,
     ranks: usize,
@@ -127,11 +233,36 @@ pub(super) unsafe fn load(
     let chunk_bytes = CHUNK / ranks;
     let mut chunks = Vec::new();
     for allocation in &package.allocations {
+        if allocation.is_payload_bound() {
+            // Every span names the payload resource that supplies it, so initializations that draw
+            // from several payloads stay exact: no ordering or contiguity is assumed across spans.
+            for (source, [offset, nbytes]) in allocation.sources.iter().zip(allocation.spans()) {
+                let span = files.span(package, &source.resource)?;
+                let (file, base) = files.source(span)?;
+                let file = file.direct()?;
+                let mut file_offset = base
+                    .checked_add(source.offset)
+                    .ok_or_else(|| invalid("allocation source offset overflow"))?;
+                for start in (0..nbytes).step_by(chunk_bytes) {
+                    let nbytes = chunk_bytes.min(nbytes - start);
+                    chunks.push(Chunk {
+                        file: file.clone(),
+                        file_offset,
+                        destination: owner.allocations[&allocation.name].address
+                            + (offset + start) as u64,
+                        nbytes,
+                        memory: allocation.memory,
+                    });
+                    file_offset += nbytes as u64;
+                }
+            }
+            continue;
+        }
         let Some(file) = &allocation.file else {
             continue;
         };
-        let span = archive.span(package, file)?;
-        let (source, mut file_offset) = archive.source(span)?;
+        let span = files.span(package, file)?;
+        let (source, mut file_offset) = files.source(span)?;
         let file = source.direct()?;
         for [offset, nbytes] in allocation.spans() {
             for start in (0..nbytes).step_by(chunk_bytes) {
@@ -169,8 +300,13 @@ pub(super) unsafe fn load(
         let available = Arc::new(Mutex::new(available));
         let (ready, finished) = mpsc::sync_channel(count);
         for index in 0..READERS.min(count) {
-            let (available, chunks, buffers, ready) =
-                (available.clone(), &chunks, &buffers, ready.clone());
+            let (available, chunks, buffers, ready, path) = (
+                available.clone(),
+                &chunks,
+                &buffers,
+                ready.clone(),
+                files.path().to_path_buf(),
+            );
             thread::Builder::new()
                 .name(format!("flare-reader-{index}"))
                 .spawn_scoped(scope, move || {
@@ -190,7 +326,7 @@ pub(super) unsafe fn load(
                             let bytes = chunk.read(&chunk.file, destination).map_err(|error| {
                                 invalid(format!(
                                     "read {} at {}: {error}",
-                                    archive.path.display(),
+                                    path.display(),
                                     chunk.file_offset
                                 ))
                             })?;

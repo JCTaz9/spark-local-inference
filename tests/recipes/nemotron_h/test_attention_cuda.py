@@ -11,11 +11,14 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                 reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("width,mode,batch", [(1, "decode", 1), (1, "decode", 4), (1, "decode", 8),
-    (8, "verify", 1), (8, "verify", 4), (8, "verify", 8), (129, "prefill", 1), (4096, "prefill", 1)])
+@pytest.mark.parametrize("width,mode,batch,packed,autotune", [(1, "decode", 1, None, False), (1, "decode", 4, None, False), (1, "decode", 8, None, False),
+    (8, "verify", 1, None, False), (8, "verify", 4, None, False), (8, "verify", 8, None, False),
+    (129, "prefill", 1, None, False), (4096, "prefill", 1, None, False),
+    pytest.param(8, "verify", 4, 9, False, id="ragged-p9-w8-notune"),
+    pytest.param(8, "verify", 4, 9, True, id="ragged-p9-w8-tune")])
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.no_grad()
-def test_checkpoint_paged_attention(width, mode, batch, kv_dtype):
+def test_checkpoint_paged_attention(width, mode, batch, packed, autotune, kv_dtype):
     from b12x.preparation import PreparationSession
     from b12x.testing.q8_0_reference import dequantize_blocks
     from ignition.components.paged_batch import Metadata
@@ -38,7 +41,7 @@ def test_checkpoint_paged_attention(width, mode, batch, kv_dtype):
                               prefixes=("language_model.backbone.layers.7.",)) as loader:
         weights, config = loader.load_layer(7), loader.config
     torch.manual_seed(19)
-    tokens = width * batch
+    tokens = width * batch if packed is None else packed
     source = torch.randn((tokens, config.hidden), device="cuda", dtype=torch.bfloat16) * .2
     start, heads, groups, dim = 127, 32, 2, 128
     length = start + width
@@ -46,16 +49,16 @@ def test_checkpoint_paged_attention(width, mode, batch, kv_dtype):
     key, value = (torch.randn((batch * pages, 128, groups, dim), device="cuda").mul_(.2).to(kv_dtype) for _ in range(2))
     initial_key, initial_value = key.clone(), value.clone()
     scale = torch.ones(1, device="cuda") if kv_dtype == torch.float8_e4m3fn else None
-    m = Metadata.allocate(tokens, batch, pages, source.device)
+    m = Metadata.allocate(tokens, batch, pages, source.device, max_query_tokens=width)
     starts = torch.full((batch,), start, device="cuda", dtype=torch.int64)
-    lengths = torch.tensor([width] if batch == 1 else [width, max(1, width // 2), 0, width] * (batch // 4),
-                           device="cuda", dtype=torch.int32)
+    sizes = ([width] if batch == 1 else [width, max(1, width // 2), 0, width] * (batch // 4)) if packed is None else [6, 1, 0, 2]
+    lengths = torch.tensor(sizes, device="cuda", dtype=torch.int32)
     rows = torch.arange(1, batch + 1, device="cuda", dtype=torch.int64)
     tables = torch.arange(batch * pages, device="cuda", dtype=torch.int32).view(batch, pages)
     ids = torch.zeros((batch, width), device="cuda", dtype=torch.int64)
     live = torch.tensor([batch], device="cuda", dtype=torch.int32)
     m.set(starts, lengths, rows, tables, ids, live)
-    with PreparationSession(device="cuda:0", autotune=False) as session:
+    with PreparationSession(device="cuda:0", autotune=autotune) as session:
         arena, buffers = ScratchArena("cuda:0"), GraphBufferPool("cuda:0")
         cursor = buffers.cursor()
         cache_metadata = PagedAttentionMetadata(m, page_tokens=128, buffers=cursor)

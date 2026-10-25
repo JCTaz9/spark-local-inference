@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import gc
-import hashlib
 import json
 import math
 import os
@@ -19,7 +18,8 @@ import re
 import shutil
 import subprocess
 import sys
-import time
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import weakref
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,18 +30,14 @@ from ignition.preparation.qwen38 import (
 )
 
 SNAPSHOT = Path.home() / ".cache/huggingface/hub" / (
-    "models--local-inference-lab--Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD"
+    "models--" + MODEL_ID.replace("/", "--")
 ) / "snapshots" / REVISION
-ABI_VERSION = 2
+ABI_VERSION = 4
 GRAPH_CAPACITIES = {
     **{kind: ((1, 1), (2, 1), (4, 1)) for kind in ("init", "restore", "snapshot", "resume", "decode")},
     "prefill": tuple((1, n) for n in (128, 256, 512)),
     "vision": tuple((1, n) for n in (256, 1024, 4096, 16384)),
 }
-
-
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def save(path, value):
@@ -50,12 +46,20 @@ def save(path, value):
 
 def fixture(snapshot):
     """Return shape-valid metadata for the declared native Qwen contract."""
+    import torch
+    from ignition.components.state import StateLayout
+
+    layout = StateLayout.from_specs((("consumed_tokens", (1,), torch.int64),))
     vocabulary, context = 248320, 262144
     descriptions = [
         ("row_slot_ids", "int32", [4]),
         ("row_generations", "int64", [4]),
         ("live_rows", "int32", [1]),
         ("query_lengths", "int32", [4]),
+        ("request_state_rows", "int64", [4, 8]),
+        ("request_pending_token", "int64", [4]),
+        ("state_pool", "uint8", [9, layout.row_bytes]),
+        ("memory_capacity", "int64", [2]),
         ("token_ids", "int64", [512]),
         ("prefill_positions", "int64", [512, 3]),
         ("page_tables", "int32", [4, context // 64]),
@@ -71,6 +75,7 @@ def fixture(snapshot):
         ("vision_slot", "int32", [1]),
         ("vision_generation", "int64", [1]),
         ("vision_feature_offset", "int32", [1]),
+        ("vision_feature_slot", "int32", [1]),
         ("admission_count", "int32", [1]),
         ("admission_slots", "int32", [4]),
         ("admission_generations", "int64", [4]),
@@ -92,44 +97,60 @@ def fixture(snapshot):
         ("state_num_ops", "int32", [1]),
         ("frame_index", "int32", [1]),
         ("submission_sequence", "int64", [1]),
-        ("completion_records", "int64", [2, 4, 8]),
+        ("completion_records", "int64", [2, 4, 24]),
     ]
     buffers, bindings = [], []
     address, host = 0x10000, 0
     for name, dtype, shape in descriptions:
-        nbytes = math.prod(shape) * (8 if dtype == "int64" else 4)
+        nbytes = math.prod(shape) * {"int64": 8, "uint8": 1}.get(dtype, 4)
         buffers.append({"name": name, "address": address, "nbytes": nbytes,
             "dtype": dtype, "shape": shape,
             "strides": [math.prod(shape[i + 1:]) for i in range(len(shape))]})
         address += (nbytes + 7) & ~7
-        if name != "completion_records":
+        if name not in ("completion_records", "request_pending_token", "state_pool", "memory_capacity"):
             bindings.append({"buffer_name": name, "host_offset": host, "nbytes": nbytes})
             host += (nbytes + 7) & ~7
-    graphs = []
+    from ignition.preparation.execution import GraphSignature
+    from ignition.preparation.contract import text_inputs
+    from ignition.recipes.qwen38.contract import prepare
+
+    graphs, signatures = [], {}
     for kind, capacities in GRAPH_CAPACITIES.items():
         for batch, tokens in capacities:
-            graphs.append({"name": f"{kind}-{batch}-{tokens}", "kind": kind,
+            name = f"{kind}-{batch}-{tokens}"
+            selected = ({b["buffer_name"] for b in bindings if b["buffer_name"].startswith("vision_")
+                         and b["buffer_name"] != "vision_token_indices"} if kind == "vision" else set(text_inputs(kind)))
+            if kind in ("init", "restore", "snapshot"):
+                selected.update(("state_qsa_slots", "state_accepted_tokens"))
+            if kind == "resume":
+                selected.update(("sample_enabled", "page_tables"))
+            fields = tuple(b["buffer_name"] for b in bindings if b["buffer_name"] in selected)
+            signatures[name] = GraphSignature(kind, batch, tokens, fields)
+            graphs.append({"name": name, "kind": kind,
                 "sampling_mode": "general", "handle": len(graphs) + 1, "estimated_duration_ns": 1000,
                 "batch_capacity": batch, "token_capacity": tokens,
-                "input_bindings": deepcopy(bindings)})
+                "prefill_capacity": 0, "confidence_width": 0,
+                "input_bindings": [deepcopy(b) for b in bindings if b["buffer_name"] in
+                                   (*signatures[name].inputs, "frame_index", "submission_sequence")]})
     manifest = {"abi_version": ABI_VERSION, "context": 1, "device": 0, "max_active": 4,
         "input_frame_bytes": host, "buffers": buffers, "graphs": graphs}
-    from ignition.preparation.frontend import prepare_frontend
+    from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
     from ignition.recipes.qwen38.recipe import RECIPE
 
-    assets = {"tokenizer": ("tokenizer.json", FRONTEND_SHA256["tokenizer.json"]),
-        "chat_template": ("chat_template.jinja", FRONTEND_SHA256["chat_template.jinja"])}
+    pool = SimpleNamespace(layout=layout)
+    contract = prepare(signatures, dict.fromkeys(item["name"] for item in buffers), pool,
+        page_tokens=64, draft_lag=None)
     config = {"model_id": MODEL_ID, "identity": "01" * 32, "max_sequence_tokens": context,
         "prefill_chunk_size": 512,
-        "pages": 4096, "snapshots": 4,
+        "pages": 4096, "snapshots": 4, "state_rows": 9, "page_tokens": 64,
         "frontend": prepare_frontend(snapshot, eos_token_ids=[248046, 248044], image_profile="qwen"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
-        "model_contract": {"schema": "qwen4exp.graph-inputs.v2", "vocabulary": vocabulary,
-            "vision": {"features_per_request": 16384, "max_images": 4,
-                "patches_per_feature": 4, "patch_capacities": [256, 1024, 4096, 16384]}},
+        "model_contract": contract,
         "bind": "127.0.0.1:0",
-        "assets": {key: {"path": str((snapshot / filename).resolve(strict=True)), "sha256": sha}
-            for key, (filename, sha) in assets.items()}}
+        "assets": {"tokenizer": {"path": str((snapshot / "tokenizer.json").resolve(strict=True)),
+            "sha256": FRONTEND_SHA256["tokenizer.json"]},
+            "chat_template": annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
+                ROOT / "ignition/recipes/qwen38/assets/chat_template.jinja")}}
     return manifest, config
 
 
@@ -145,12 +166,12 @@ def cases(snapshot):
     def buffer(m, name):
         return next(item for item in m["buffers"] if item["name"] == name)
 
-    add("abi-version", "unsupported execution ABI version", lambda m, c: m.update(abi_version=4))
+    add("abi-version", "unsupported execution ABI version", lambda m, c: m.update(abi_version=2))
     add("null-context", "nonnull context", lambda m, c: m.update(context=0))
     add("overlapping-buffers", "overlap", lambda m, c:
         buffer(m, "row_generations").update(address=buffer(m, "row_slot_ids")["address"]))
     add("completion-layout", "required buffer layout", lambda m, c:
-        buffer(m, "completion_records").update(shape=[4, 2, 8], strides=[16, 8, 1]))
+        buffer(m, "completion_records").update(shape=[4, 2, 24], strides=[48, 24, 1]))
     add("missing-resume4", "lacks Resume/General graph with batch 4, tokens 1", lambda m, c:
         m.update(graphs=[g for g in m["graphs"] if g["name"] != "resume-4-1"]))
     add("missing-prefill512", "lacks Prefill/General graph with batch 1, tokens 512", lambda m, c:
@@ -163,6 +184,10 @@ def cases(snapshot):
         graph = deepcopy(next(g for g in m["graphs"] if g["name"] == "prefill-1-512"))
         graph.update(name="duplicate-prefill-1-512", handle=len(m["graphs"]) + 1)
         m["graphs"].append(graph)
+        contract = deepcopy(next(g for g in c["model_contract"]["graphs"]
+                                 if g["graph"] == "prefill-1-512"))
+        contract["graph"] = graph["name"]
+        c["model_contract"]["graphs"].append(contract)
 
     add("ambiguous-graph-capacity", "ambiguous prepared model graph capacity", ambiguous_variant)
 
@@ -171,10 +196,18 @@ def cases(snapshot):
         graph["input_bindings"] = [b for b in graph["input_bindings"]
             if b["buffer_name"] != "vision_token_indices"]
 
-    add("missing-semantic-input", "lacks required input vision_token_indices", missing_input)
-    add("wrong-page-table-layout", "semantic buffer page_tables", lambda m, c:
-        buffer(m, "page_tables").update(shape=[2, 8192], strides=[8192, 1]))
-    add("invalid-model-context", "invalid prepared Qwen4Exp model configuration", lambda m, c:
+    add("missing-semantic-input", "semantic input must have one graph transport binding", missing_input)
+    add("wrong-page-table-layout", "buffer page_tables must be contiguous row-major", lambda m, c:
+        buffer(m, "page_tables").update(strides=[1, 4]))
+    add("state-view-extent", "persistent state view exceeds its prepared storage", lambda m, c:
+        c["model_contract"]["cache"]["regions"][0]["storage"].update(
+            nbytes=c["model_contract"]["cache"]["regions"][0]["storage"]["stride"] + 1))
+    def pending_consumer(m, c):
+        graph = next(g for g in c["model_contract"]["graphs"] if g["graph"] == "init-1-1")
+        graph["pending_token"] = dict(buffer="request_pending_token", offset=0, stride=8, nbytes=8)
+
+    add("write-only-pending-consumer", "pending token requires a declared device-state read", pending_consumer)
+    add("invalid-model-context", "invalid prepared model configuration", lambda m, c:
         c.update(max_sequence_tokens=262145))
     add("valid-shapes-reach-asset-validation", "assets must contain verified frontend descriptors",
         lambda m, c: c.pop("assets"))
@@ -220,73 +253,43 @@ def child(path):
 
 
 def run(args):
-    import flare_heliopause
-
     if not shutil.which("strace"):
-        raise RuntimeError("strace is required for startup syscall evidence")
-    args.artifacts.mkdir(parents=True, exist_ok=False)
-    extension = next(Path(flare_heliopause.__file__).parent.glob("*.so"))
-    sources = [Path(__file__).resolve(), ROOT / "ignition/preparation/qwen38.py",
-        *sorted((ROOT / "helios/src").rglob("*.rs")), ROOT / "helios/Cargo.toml", ROOT / "helios/Cargo.lock"]
-    receipt = {"schema": "flare-helios-startup-validation-v1", "scope":
-        "Installed constructor rejects invalid synthetic manifest/config metadata before CUDA or networking; no prepared model or GPU graph is created.",
-        "extension": {"path": str(extension), "sha256": digest(extension)},
-        "abi_version": ABI_VERSION,
-        "graph_capacities": GRAPH_CAPACITIES,
-        "python": sys.version, "executable": sys.executable, "checkpoint_assets": str(args.snapshot),
-        "reference_revision": REVISION, "sources_before": {str(p): digest(p) for p in sources},
-        "strace_version": subprocess.check_output(["strace", "-V"], text=True).splitlines()[0], "cases": []}
-    save(args.artifacts / "receipt.json", receipt)
-    for case in cases(args.snapshot):
-        prefix = args.artifacts / case["name"]
-        save(prefix.with_suffix(".input.json"), case)
-        trace = prefix.with_suffix(".strace")
-        command = ["strace", "-f", "-qq", "-s", "512", "-o", str(trace),
-            "-e", "trace=network,open,openat,ioctl,clone,clone3",
-            "-e", "inject=socket:error=EPERM", "-e", "inject=bind:error=EPERM",
-            "-e", "inject=listen:error=EPERM", "-e", "inject=ioctl:error=EPERM",
-            sys.executable, "-c",
-            'import runpy, sys; runpy.run_path(sys.argv.pop(1), run_name="__main__")',
-            str(Path(__file__).resolve()), "--child", str(prefix.with_suffix(".input.json"))]
-        started = time.monotonic()
-        process = subprocess.run(command, env={**os.environ, "CUDA_VISIBLE_DEVICES": "",
-            "PYTHONDONTWRITEBYTECODE": "1"}, text=True, capture_output=True, timeout=60)
-        prefix.with_suffix(".stdout").write_text(process.stdout)
-        prefix.with_suffix(".stderr").write_text(process.stderr)
-        try:
-            observed = json.loads(process.stdout)
-        except (json.JSONDecodeError, ValueError):
-            observed = {"name": case["name"], "passed": False, "error": "child output was not JSON"}
-        text = trace.read_text()
-        network = [line for line in text.splitlines() if re.search(r"\b(?:socket|bind|listen|connect)\(", line)]
-        cuda = [line for line in text.splitlines() if re.search(r"libcuda(?:rt)?[./]|/dev/nvidia", line)]
-        threads = [line for line in text.splitlines() if re.search(r"\bclone(?:3)?\(", line)]
-        observed.update(returncode=process.returncode, elapsed_seconds=time.monotonic() - started,
-            command=command, network_attempts=network, cuda_open_attempts=cuda,
-            thread_creation_attempts=len(threads), trace_sha256=digest(trace),
-            input_sha256=digest(prefix.with_suffix(".input.json")))
-        observed["passed"] = bool(observed["passed"] and process.returncode == 0 and not network and not cuda)
-        receipt["cases"].append(observed)
-        save(args.artifacts / "receipt.json", receipt)
-        print(json.dumps({key: observed[key] for key in ("name", "passed", "error", "elapsed_seconds")}), flush=True)
-    receipt["sources_after"] = {str(p): digest(p) for p in sources}
-    receipt["sources_unchanged"] = receipt["sources_before"] == receipt["sources_after"]
-    receipt["extension_unchanged"] = receipt["extension"]["sha256"] == digest(extension)
-    receipt["passed"] = all(case["passed"] for case in receipt["cases"]) and receipt["sources_unchanged"] and receipt["extension_unchanged"]
-    save(args.artifacts / "receipt.json", receipt)
-    return 0 if receipt["passed"] else 1
+        raise RuntimeError("strace is required to reject CUDA and networking attempts")
+    passed = True
+    with TemporaryDirectory(prefix="flare-startup-validation-") as directory:
+        for case in cases(args.snapshot):
+            path = Path(directory) / (case["name"] + ".json")
+            save(path, case)
+            command = ["strace", "-f", "-qq", "-s", "512",
+                "-e", "trace=network,open,openat,ioctl",
+                "-e", "inject=socket:error=EPERM", "-e", "inject=bind:error=EPERM",
+                "-e", "inject=listen:error=EPERM", "-e", "inject=ioctl:error=EPERM",
+                sys.executable, "-c",
+                'import runpy, sys; runpy.run_path(sys.argv.pop(1), run_name="__main__")',
+                str(Path(__file__).resolve()), "--child", str(path)]
+            process = subprocess.run(command, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+                text=True, capture_output=True, timeout=60)
+            try:
+                observed = json.loads(process.stdout)
+            except ValueError:
+                raise AssertionError(f"{case['name']}: child did not return JSON: {process.stdout}\n{process.stderr}")
+            network = re.search(r"\b(?:socket|bind|listen|connect)\(", process.stderr)
+            cuda = re.search(r"libcuda(?:rt)?[./]|/dev/nvidia", process.stderr)
+            observed["passed"] &= process.returncode == 0 and not network and not cuda
+            print(json.dumps(observed), flush=True)
+            if not observed["passed"]:
+                print(process.stderr, file=sys.stderr)
+                passed = False
+    return 0 if passed else 1
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--snapshot", type=Path, default=SNAPSHOT)
     parser.add_argument("--child", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.child is not None:
         return child(args.child)
-    if args.artifacts is None:
-        parser.error("--artifacts is required")
     return run(args)
 
 

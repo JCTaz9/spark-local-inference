@@ -5,11 +5,15 @@ fn scheduler(snapshots: u32, mtp: bool) -> RequestScheduler {
 }
 
 fn scheduler_with_pages(snapshots: u32, mtp: bool, page_tokens: usize) -> RequestScheduler {
+    scheduler_with_concurrency(snapshots, mtp, page_tokens, 4)
+}
+
+fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, active: usize) -> RequestScheduler {
     let mut s = RequestScheduler::new(
         [9; 32],
         SchedulerLimits {
             request_slots: 4,
-            max_active: 4,
+            max_active: active,
             max_sequence_tokens: 8192,
             prefill_chunk_size: 512,
             pages: 256,
@@ -27,6 +31,7 @@ fn scheduler_with_pages(snapshots: u32, mtp: bool, page_tokens: usize) -> Reques
             },
             draft_pages_per_request: 1,
             completion_inputs: vec![],
+            speculative_allocations: vec![],
             state_rows_per_request: None,
         },
     )
@@ -124,6 +129,49 @@ fn finish(s: &mut RequestScheduler, h: RequestHandle) -> CheckpointId {
 }
 
 #[test]
+fn checkpoint_targets_follow_token_distance_and_exclude_reused_prefixes() {
+    assert_eq!(
+        checkpoint_boundaries(vec![10, 11, 12, 240, 510, 760, 990], 0, 1000, 3),
+        [240, 510, 760]
+    );
+    assert_eq!(
+        checkpoint_boundaries(vec![10, 400, 410, 420, 421, 550, 690, 850, 950, 1000], 400, 1000, 2),
+        [550, 850]
+    );
+    assert_eq!(checkpoint_boundaries(vec![1, 2, 3, 4, 999], 0, 1000, 3), [4, 999]);
+    assert!(checkpoint_boundaries(vec![100, 1000], 1000, 1000, 3).is_empty());
+    assert!(checkpoint_boundaries(vec![10], 0, 100, 0).is_empty());
+}
+
+#[test]
+fn small_snapshot_shares_prioritize_endpoints_and_allow_completion() {
+    for snapshots in [0, 1, 2, 4, 8, 12] {
+        for output in [1, 3] {
+            let mut s = scheduler(snapshots, false);
+            let mut request = spec(None, 700, output);
+            request.message_boundaries = (1..=700).collect();
+            let handle = s.admit(request).unwrap();
+            for _ in 0..50 {
+                if s.request(handle).unwrap().phase == RequestPhase::Finishing {
+                    break;
+                }
+                run_step(&mut s);
+            }
+            assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Finishing);
+            assert_eq!(s.request(handle).unwrap().generated_tokens, output);
+            s.finish(handle).unwrap();
+            let budget = if snapshots == 0 { 0 } else { (snapshots / 4).max(1) };
+            assert!(s.stats().snapshot_publications <= u64::from(budget));
+            if budget == 1 {
+                assert_eq!(s.stats().prompt_checkpoints, 0);
+                assert_eq!(s.stats().message_checkpoints, 0);
+                assert_eq!(s.stats().snapshot_publications, 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn duplicate_finished_boundary_needs_no_terminal_snapshot() {
     let mut s = scheduler(2, false);
     let a = s.admit(spec(Some(70), 70, 1)).unwrap();
@@ -170,7 +218,7 @@ fn exact_system_prompt_terminal_endpoints_and_partial_restore_pages() {
     for page_tokens in [64, 256] {
         for system in [1, 2, 3, 10, 15, 63, 64, 65, 66, 67, 127, 255, 256, 257, 511] {
             for mtp in [false, true] {
-                let mut s = scheduler_with_pages(8, mtp, page_tokens);
+                let mut s = scheduler_with_concurrency(8, mtp, page_tokens, 2);
                 let prompt = system + 67;
                 let h = s.admit(spec(Some(system), prompt, 3)).unwrap();
                 stop_at_capture(&mut s, h, system as u64);
@@ -274,7 +322,7 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
     assert_eq!(s.free_snapshot_count(), 2);
     assert_eq!(s.stats().active_requests, 1);
     finish(&mut s, h);
-    let mut s = scheduler(3, false);
+    let mut s = scheduler_with_concurrency(3, false, 64, 1);
     let h = s.admit(spec(Some(10), 70, 3)).unwrap();
     assert_eq!(s.free_snapshot_count(), 3);
     stop_at_capture(&mut s, h, 10);
@@ -300,7 +348,7 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
 
 #[test]
 fn duplicate_boundary_publication_does_not_remap_live_partial_pages() {
-    let mut s = scheduler(6, false);
+    let mut s = scheduler_with_concurrency(6, false, 64, 2);
     let a = s.admit(spec(Some(10), 70, 2)).unwrap();
     let b = s.admit(spec(Some(10), 70, 2)).unwrap();
     stop_at_capture(&mut s, a, 10);
@@ -318,7 +366,7 @@ fn duplicate_boundary_publication_does_not_remap_live_partial_pages() {
 
 #[test]
 fn failed_boundary_copy_is_not_published_and_all_reservations_retire() {
-    let mut s = scheduler(3, false);
+    let mut s = scheduler_with_concurrency(3, false, 64, 1);
     let h = s.admit(spec(Some(3), 70, 3)).unwrap();
     stop_at_capture(&mut s, h, 3);
     let step = s.plan().unwrap();
@@ -460,13 +508,13 @@ fn empty_atomic_spans_preserve_text_chunking() {
 }
 
 #[test]
-fn message_and_prompt_checkpoints_evict_complete_page_chains_under_pressure() {
+fn snapshot_pressure_retains_complete_conversations_until_endpoint_eviction() {
     for capacity in [2usize, 3, 16, 17] {
-        let mut s = scheduler(capacity as u32, false);
+        let mut s = scheduler_with_concurrency(capacity as u32, false, 64, 1);
         let turns = capacity + 3;
         let mut lengths = Vec::new();
         for turn in 0..turns {
-            let length = 160 + 64 * turn;
+            let length = 160 + 8 * turn;
             let mut request = spec(Some(length - 10), length, 1);
             request.prompt[0] = (turn + 1) as u32;
             let handle = s.admit(request).unwrap();
@@ -476,11 +524,9 @@ fn message_and_prompt_checkpoints_evict_complete_page_chains_under_pressure() {
             s.finish(handle).unwrap();
             lengths.push(length);
         }
-        let pairs = capacity / 2;
-        let mut pages: usize = lengths[lengths.len() - pairs..].iter().map(|n| n / 64).sum();
-        if capacity % 2 != 0 {
-            pages += (lengths[lengths.len() - pairs - 1] - 10) / 64;
-        }
+        // The final request pins its message checkpoint until its terminal snapshot is published.
+        let retained = capacity - 1;
+        let pages: usize = lengths[lengths.len() - retained..].iter().map(|n| n / 64).sum();
         assert_eq!(s.stats().cached_checkpoints, capacity);
         assert_eq!(s.stats().cached_pages, pages);
         assert_eq!(s.stats().snapshot_publications, (2 * turns) as u64);
@@ -492,7 +538,7 @@ fn every_message_endpoint_can_restore_after_a_changed_following_turn() {
     let endpoints = vec![1, 7, 63, 64, 65, 129, 300, 514, 700];
     for page_tokens in [64, 128, 256, 2048] {
         for mtp in [false, true] {
-            let mut s = scheduler_with_pages(16, mtp, page_tokens);
+            let mut s = scheduler_with_concurrency(16, mtp, page_tokens, 1);
             let mut request = spec(None, 901, 3);
             request.message_boundaries = endpoints.clone();
             let handle = s.admit(request).unwrap();
@@ -519,6 +565,62 @@ fn every_message_endpoint_can_restore_after_a_changed_following_turn() {
             }
         }
     }
+}
+
+#[test]
+fn message_checkpoint_churn_preserves_idle_conversation_endpoints() {
+    for page_tokens in [64, 128, 256, 2048] {
+        let mut s = scheduler_with_pages(256, false, page_tokens);
+        let mut conversations = Vec::new();
+        for conversation in 0..4 {
+            let mut request = spec(None, 1024, 1);
+            request.prompt[1..].fill(1000 + conversation);
+            request.message_boundaries = (1..1024).step_by(4).collect();
+            conversations.push(request.clone());
+            let handle = s.admit(request).unwrap();
+            for _ in 0..600 {
+                if s.request(handle).unwrap().phase == RequestPhase::Finishing {
+                    break;
+                }
+                run_step(&mut s);
+            }
+            assert_eq!(s.request(handle).unwrap().phase, RequestPhase::Finishing);
+            s.finish(handle).unwrap();
+        }
+        assert_eq!(s.stats().snapshot_evictions, 0);
+        assert!(s.stats().snapshot_publications <= 256);
+        assert!(s.free_page_count() > 128);
+        for request in conversations {
+            let handle = s.admit(request).unwrap();
+            assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), 1024);
+            s.cancel(handle).unwrap();
+        }
+    }
+}
+
+#[test]
+fn branch_saturation_reclaims_old_endpoints_without_stalling() {
+    let mut s = scheduler(256, false);
+    let mut idle = spec(None, 1024, 2);
+    idle.prompt[1..].fill(1000);
+    let handle = s.admit(idle.clone()).unwrap();
+    finish(&mut s, handle);
+    for turn in 0..180 {
+        let mut request = spec(None, 1024 + turn * 8, 2);
+        request.prompt[1..].fill(1001);
+        let handle = s.admit(request).unwrap();
+        finish(&mut s, handle);
+    }
+    assert!(s.free_page_count() > 128);
+    let handle = s.admit(idle).unwrap();
+    assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), 0);
+    s.cancel(handle).unwrap();
+    let mut recent = spec(None, 1024 + 179 * 8, 2);
+    recent.prompt[1..].fill(1001);
+    let expected = recent.prompt.len() as u64;
+    let handle = s.admit(recent).unwrap();
+    assert_eq!(s.request(handle).unwrap().reused_prompt_tokens(), expected);
+    s.cancel(handle).unwrap();
 }
 
 #[test]

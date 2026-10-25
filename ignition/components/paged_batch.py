@@ -120,6 +120,7 @@ class PreparedBatch:
         shard,
         pool,
         verification_width=1,
+        target_token_capacity=None,
         input_vocabulary=None,
         validate_prefill=None,
         page_tokens=PAGE_TOKENS,
@@ -129,11 +130,12 @@ class PreparedBatch:
         self.rows, self.tokens, self.mode = metadata.starts.numel(), metadata.token_ids.numel(), mode
         if mode not in ("prefill", "decode") or mode == "prefill" and self.rows != 1:
             raise ValueError("Paged prefill requires one packed sequence")
-        self.accept_unsampled = shard.rank != 0
         self.pool = pool
         self.page_tokens = page_tokens
         self.verification_width = verification_width
-        self.device_pending = shard.world_size == 1 and verification_width == 1
+        self.target_token_capacity = self.rows * verification_width if target_token_capacity is None else target_token_capacity
+        if not self.rows <= self.target_token_capacity <= self.rows * verification_width:
+            raise ValueError("target token capacity must fit the request rows and verification width")
         self.input_vocabulary = requests.vocab_size if input_vocabulary is None else input_vocabulary
         self.validate_prefill = validate_prefill
         device, capacity = metadata.token_ids.device, requests.capacity
@@ -173,6 +175,9 @@ class PreparedBatch:
         end = position + lengths
         capacity = self.tokens if self.mode == "prefill" else self.verification_width
         valid = ~duplicate & (b.live_rows <= self.rows) & (lengths > 0) & (lengths <= capacity)
+        if self.mode == "decode":
+            offered = torch.where(resident & (r.status[safe] == RUNNING), lengths, 0)
+            valid &= offered.sum() <= self.target_token_capacity
         valid &= (position >= 0) & (end <= b.page_tables.shape[1] * self.page_tokens)
         pages = b.page_tables[safe]
         valid &= (
@@ -188,11 +193,7 @@ class PreparedBatch:
             if self.validate_prefill is not None:
                 valid &= self.validate_prefill(tokens, lengths)
         else:
-            if self.device_pending:
-                valid &= (pending >= 0) & (pending < r.vocab_size)
-            else:
-                valid &= (tokens >= 0) & (tokens < r.vocab_size)
-                valid &= (pending == tokens) | (self.accept_unsampled & (pending < 0))
+            valid &= (pending >= 0) & (pending < r.vocab_size)
         present = resident & (r.status[safe] == RUNNING)
         bad = present & ~valid
         bad_slots = ((self.slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
@@ -233,11 +234,8 @@ class PreparedBatch:
         m.positions.copy_(torch.where(live, t.positions[request] + self.token_offsets - starts[request], -1))
         if self.mode == "prefill":
             tokens = b.token_ids[:self.tokens]
-        elif self.device_pending:
-            # Queued single-rank decode consumes tokens before their completion reaches the host.
-            tokens = t.pending_tokens[request]
         else:
-            tokens = b.token_ids[request]
+            tokens = t.pending_tokens[request]
         m.token_ids.copy_(torch.where(live, tokens, 0))
 
     def finish(self):

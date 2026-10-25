@@ -3,7 +3,7 @@
 use crate::{
     Result,
     execution::{
-        BATCH_CAPACITIES, ExecutionManifest, GraphKind, SPECULATIVE_ABI_VERSION, SamplingMode,
+        BATCH_CAPACITIES, ExecutionManifest, GraphKind, ABI_VERSION, SamplingMode,
     },
     model::ModelConfig,
     scheduler::speculation,
@@ -34,36 +34,6 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         return Err("sampling top_k range exceeds the prepared vocabulary".into());
     }
     config.limits.validate_prefill()?;
-    let proposals: Vec<_> = manifest
-        .graphs
-        .iter()
-        .filter(|g| g.kind == GraphKind::Proposal)
-        .collect();
-    let split = !proposals.is_empty();
-    let packed_round = manifest.graphs.iter().any(|g| g.kind == GraphKind::PackedSpeculative);
-    if packed_round && (config.history_drafts
-        || config.speculative_proposal_source != speculation::ProposalSource::Mtp) {
-        return Err("packed speculative rounds require learned fresh proposals".into());
-    }
-    if config.speculative_fixed_width.is_some() && manifest.graphs.iter().any(|g| g.packed_token_capacity != 0) {
-        return Err("packed verification catalogs require adaptive prefix selection".into());
-    }
-    if split {
-        let maximum = proposals.iter().map(|g| g.token_capacity).max().unwrap();
-        if config.history_drafts
-            || config.speculative_proposal_source != speculation::ProposalSource::Mtp
-            || config.speculative_widths != (1..=*config.speculative_widths.last().unwrap_or(&0)).collect::<Vec<_>>()
-            || maximum > *config.speculative_widths.last().unwrap_or(&0)
-        {
-            return Err("retained proposal catalogs require contiguous prefix widths and proposal-free width-one execution".into());
-        }
-    } else if manifest
-        .graphs
-        .iter()
-        .any(|g| g.kind == GraphKind::Verification)
-    {
-        return Err("verification graphs require a retained proposal graph".into());
-    }
     let page_tokens = crate::model::scheduler_capabilities(config).page_tokens;
     if config.model_id.is_empty()
         || config.limits.max_active == 0
@@ -94,8 +64,8 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         return Err("invalid prepared model configuration".into());
     }
     speculation::validate_widths(&config.speculative_widths)?;
-    if config.speculative_widths.last().is_some_and(|w| config.speculative_token_capacity < *w) {
-        return Err("speculative token capacity must cover the maximum verification width".into());
+    if !config.speculative_widths.is_empty() && config.speculative_token_capacity == 0 {
+        return Err("speculative token capacity must be positive".into());
     }
     if config
         .speculative_fixed_width
@@ -109,8 +79,8 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         if config.speculative_proposal_source == speculation::ProposalSource::Copy {
             return Err("copy proposal source requires speculative graphs".into());
         }
-    } else if manifest.abi_version != SPECULATIVE_ABI_VERSION {
-        return Err("speculative catalog requires ABI3".into());
+    } else if manifest.abi_version != ABI_VERSION {
+        return Err("speculative catalog requires ABI4".into());
     }
     for graph in &manifest.graphs {
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)
@@ -187,47 +157,14 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
     }
     if !config.speculative_widths.is_empty() {
         for batch in batches(config) {
-            if split {
-                let proposal_width = proposals.iter().filter(|g| g.batch_capacity == batch)
-                    .map(|g| g.token_capacity).max()
-                    .ok_or_else(|| format!("retained proposal catalog lacks batch {batch}"))?;
-                select(config, manifest, GraphKind::Proposal, batch,
-                    proposal_width, 0, SamplingMode::General)?;
-                select(config, manifest, GraphKind::Speculative, batch, 1, 0, SamplingMode::General)?;
+            if !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
+                && graph.batch_capacity == batch && graph.token_capacity == 1) {
+                return Err(format!("prepared model lacks width-one speculative graph for batch {batch}").into());
             }
-            if packed_round && !split {
-                select(config, manifest, GraphKind::Speculative, batch, 1, 0, SamplingMode::General)?;
-                if batch * 2 <= config.speculative_token_capacity
-                    && !manifest.graphs.iter().any(|g| g.kind == GraphKind::PackedSpeculative && g.batch_capacity == batch) {
-                    return Err(format!("packed speculative catalog lacks batch {batch}").into());
-                }
-                continue;
-            }
-            for &width in &config.speculative_widths {
-                if speculative_shape(config, batch, width) {
-                    select(config, manifest, if split { GraphKind::Verification } else { GraphKind::Speculative }, batch,
-                        width, 0, SamplingMode::General)?;
-                }
-            }
-        }
-    }
-    if !config.speculative_widths.is_empty() {
-        for batch in batches(config) {
-            if packed_round && !split {
-                continue;
-            }
-            if !manifest.graphs.iter().any(|graph| {
-                graph.kind
-                    == if split {
-                        GraphKind::Verification
-                    } else {
-                        GraphKind::Speculative
-                    }
-                    && graph.batch_capacity == batch
-            }) {
-                return Err(
-                    format!("prepared model lacks speculative graphs for batch {batch}").into(),
-                );
+            if batch * 2 <= config.speculative_token_capacity
+                && !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
+                    && graph.batch_capacity == batch && graph.token_capacity > 1) {
+                return Err(format!("prepared model lacks speculative graph for batch {batch}").into());
             }
         }
     }
@@ -257,15 +194,17 @@ pub fn select(
     prefill: usize,
     mode: SamplingMode,
 ) -> Result<usize> {
-    if kind == GraphKind::Verification {
-        if let Some((index, _)) = manifest.graphs.iter().enumerate()
-            .filter(|(_, graph)| graph.kind == kind && graph.batch_capacity == batch
-                && graph.token_capacity >= tokens && graph.packed_token_capacity >= batch.saturating_mul(tokens)
-                && graph.prefill_capacity == prefill && graph.sampling_mode == mode)
-            .min_by_key(|(_, graph)| graph.packed_token_capacity) {
-            return Ok(index);
+    if kind == GraphKind::Speculative {
+        let mut matching = manifest.graphs.iter().enumerate().filter(|(_, graph)|
+            graph.kind == kind && graph.batch_capacity == batch && graph.token_capacity == tokens
+                && graph.prefill_capacity == prefill && graph.sampling_mode == mode);
+        let (index, _) = matching.next().ok_or_else(|| format!("prepared model lacks speculative graph for batch {batch}, width {tokens}"))?;
+        if matching.next().is_some() {
+            return Err("speculative graph selection requires explicit draft and target-row capacities".into());
         }
+        return Ok(index);
     }
+
     select_shape(config, manifest, kind, batch, tokens, prefill, 0, mode)
 }
 
@@ -302,22 +241,12 @@ pub fn select_shape_with_drafts(
             GraphKind::Vision => {
                 batch == 1 && config.contract.vision.patch_capacities.contains(&tokens)
             }
-            GraphKind::PackedSpeculative => {
+            GraphKind::Speculative => {
                 config.speculative_widths.contains(&tokens)
-                    && drafts > 0 && drafts + 1 <= tokens
+                    && drafts <= 7
                     && packed >= batch && packed <= batch.saturating_mul(tokens)
-                    && packed <= config.speculative_token_capacity
+                    && (tokens == 1 || packed <= config.speculative_token_capacity)
             }
-            GraphKind::Speculative | GraphKind::Verification => {
-                if packed != 0 && kind == GraphKind::Verification {
-                    config.speculative_widths.contains(&tokens)
-                        && packed <= config.speculative_token_capacity
-                        && packed >= batch && packed <= batch.saturating_mul(tokens)
-                } else {
-                    speculative_shape(config, batch, tokens)
-                }
-            }
-            GraphKind::Proposal => tokens > 1 && config.speculative_widths.contains(&tokens),
             _ => tokens == 1,
         };
     if !declared || (kind != GraphKind::Mixed && prefill != 0) {

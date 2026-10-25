@@ -477,7 +477,7 @@ fn enum_values_and_unknown_contract_fields_fail_closed() {
 #[test]
 fn host_feedback_is_derived_from_inputs_without_model_identity() {
     let mut config = config();
-    assert!(scheduler_capabilities(&config).completion_inputs.is_empty());
+    assert!(scheduler_capabilities_with_manifest(&config, &manifest(&config)).unwrap().completion_inputs.is_empty());
     for graph in &mut config.contract.graphs {
         if graph.kind == GraphOperation::Decode {
             graph.inputs.push(testing::binding(
@@ -491,13 +491,19 @@ fn host_feedback_is_derived_from_inputs_without_model_identity() {
         }
     }
     assert_eq!(
-        scheduler_capabilities(&config).completion_inputs,
-        ["sampled_ids"]
+        scheduler_capabilities_with_manifest(&config, &manifest(&config)).unwrap().completion_inputs,
+        config.contract.graphs.iter().filter(|graph| graph.kind == GraphOperation::Decode).map(|graph| {
+            let descriptor = manifest(&config).graphs.into_iter().find(|descriptor| descriptor.name == graph.graph).unwrap();
+            ((GraphKind::Decode, descriptor.batch_capacity, 0, 1, 0, 0), vec!["sampled_ids".to_owned()])
+        }).collect::<Vec<_>>()
     );
     config.model_id = "unregistered-family".into();
     assert_eq!(
-        scheduler_capabilities(&config).completion_inputs,
-        ["sampled_ids"]
+        scheduler_capabilities_with_manifest(&config, &manifest(&config)).unwrap().completion_inputs,
+        config.contract.graphs.iter().filter(|graph| graph.kind == GraphOperation::Decode).map(|graph| {
+            let descriptor = manifest(&config).graphs.into_iter().find(|descriptor| descriptor.name == graph.graph).unwrap();
+            ((GraphKind::Decode, descriptor.batch_capacity, 0, 1, 0, 0), vec!["sampled_ids".to_owned()])
+        }).collect::<Vec<_>>()
     );
 }
 
@@ -1052,7 +1058,7 @@ fn mixed_manifest(config: &mut ModelConfig, width: usize) -> crate::execution::E
             -1,
         ));
         config.contract.graphs.push(semantics);
-        manifest.graphs.push(GraphDescriptor { draft_tokens: 0,
+        manifest.graphs.push(GraphDescriptor { confidence_width: 0, draft_tokens: 0,
             packed_token_capacity: 0,
             name,
             kind: GraphKind::Mixed,
@@ -1238,165 +1244,6 @@ fn vision_upload_selects_source_image_independently_of_destination_feature_offse
     }
 }
 
-#[test]
-fn retained_proposal_catalog_requires_prefix_coverage_and_proposal_free_decode() {
-    let mut config = config();
-    config.limits.max_active = 1;
-    config.limits.request_slots = 1;
-    config.history_drafts = false;
-    config.speculative_widths = (1..=8).collect();
-    config
-        .contract
-        .graphs
-        .retain(|g| g.graph.split('-').nth(1) == Some("1"));
-    let mut manifest = manifest(&config);
-    let mut proposal = manifest
-        .graphs
-        .iter()
-        .find(|g| g.kind == GraphKind::Speculative && g.token_capacity == 8)
-        .unwrap()
-        .clone();
-    let mut semantics = config.contract.graph(&proposal.name).unwrap().clone();
-    proposal.name = "Proposal-1-8".into();
-    proposal.kind = GraphKind::Proposal;
-    semantics.graph = proposal.name.clone();
-    semantics.kind = GraphOperation::Proposal;
-    semantics.draft_cursor = None;
-    for state in &mut semantics.state {
-        state.access = StateAccessKind::Read;
-    }
-    let mut decode = manifest
-        .graphs
-        .iter()
-        .find(|g| g.kind == GraphKind::Speculative && g.token_capacity == 1)
-        .unwrap()
-        .clone();
-    let mut decode_contract = config.contract.graph(&decode.name).unwrap().clone();
-    decode.name = "Speculative-free-1".into();
-    decode_contract.graph = decode.name.clone();
-    for graph in &mut manifest.graphs {
-        if graph.kind == GraphKind::Speculative {
-            graph.kind = GraphKind::Verification;
-        }
-    }
-    for graph in &mut config.contract.graphs {
-        if graph.kind == GraphOperation::Speculative {
-            graph.kind = GraphOperation::Verification;
-        }
-    }
-    manifest.graphs.push(decode);
-    config.contract.graphs.push(decode_contract);
-    manifest.graphs.push(proposal);
-    config.contract.graphs.push(semantics);
-    for (index, graph) in manifest.graphs.iter_mut().enumerate() {
-        graph.handle = index + 1;
-    }
-    let address = manifest
-        .buffers
-        .iter()
-        .map(|b| b.address + b.nbytes)
-        .max()
-        .unwrap()
-        .next_multiple_of(4096);
-    manifest.buffers.push(crate::execution::BufferDescriptor {
-        name: "proposal_confidence".into(),
-        address,
-        nbytes: 28,
-        dtype: crate::execution::Dtype::Float32,
-        shape: vec![1, 7],
-        strides: vec![7, 1],
-    });
-    catalog::validate(&config, &manifest).unwrap();
-    // Packages with only the maximum proposal depth remain valid. Additional
-    // captured depths use the same ownership and verification contract.
-    let mut shallow = manifest
-        .graphs
-        .iter()
-        .find(|g| g.kind == GraphKind::Proposal)
-        .unwrap()
-        .clone();
-    let mut shallow_contract = config.contract.graph(&shallow.name).unwrap().clone();
-    shallow.name = "Proposal-1-2".into();
-    shallow.token_capacity = 2;
-    shallow.handle = manifest.graphs.len() + 1;
-    shallow_contract.graph = shallow.name.clone();
-    manifest.graphs.insert(0, shallow);
-    config.contract.graphs.push(shallow_contract);
-    catalog::validate(&config, &manifest).unwrap();
-    assert_eq!(
-        manifest.graphs[catalog::select(
-            &config,
-            &manifest,
-            GraphKind::Proposal,
-            1,
-            2,
-            0,
-            crate::execution::SamplingMode::General
-        )
-        .unwrap()]
-        .token_capacity,
-        2
-    );
-    let mut missing = manifest.clone();
-    missing
-        .graphs
-        .retain(|g| g.kind != GraphKind::Verification || g.token_capacity != 3);
-    assert!(catalog::validate(&config, &missing).is_err());
-    let mut multiple = config.clone();
-    multiple.limits.max_active = 2;
-    assert!(catalog::validate(&multiple, &manifest).is_err());
-    let mut packed = manifest.clone();
-    for graph in &mut packed.graphs {
-        if graph.kind == GraphKind::Verification {
-            graph.packed_token_capacity = graph.token_capacity;
-            graph.token_capacity = 8;
-        }
-    }
-    catalog::validate(&config, &packed).unwrap();
-    let index = catalog::select_shape(
-        &config,
-        &packed,
-        GraphKind::Verification,
-        1,
-        8,
-        0,
-        3,
-        crate::execution::SamplingMode::General,
-    )
-    .unwrap();
-    assert_eq!(packed.graphs[index].packed_tokens(), 3);
-    packed.graphs[index].packed_token_capacity = 9;
-    assert!(catalog::validate(&config, &packed).is_err());
-    let mut coexist = manifest.clone();
-    let template = coexist.graphs.iter().find(|g|
-        g.kind == GraphKind::Verification && g.token_capacity == 8).unwrap().clone();
-    let prefix_address = coexist.buffers.iter().map(|b| b.address + b.nbytes).max().unwrap().next_multiple_of(8);
-    coexist.buffers.push(crate::execution::BufferDescriptor { name: "speculative_prefix_limits".into(),
-        address: prefix_address, nbytes: 4, dtype: crate::execution::Dtype::Int32,
-        shape: vec![1], strides: vec![1] });
-    for (kind, operation, name) in [
-        (GraphKind::Speculative, GraphOperation::Speculative, "joined"),
-        (GraphKind::PackedSpeculative, GraphOperation::PackedSpeculative, "packed-round"),
-    ] {
-        let mut graph = template.clone();
-        let mut semantics = config.contract.graph(&template.name).unwrap().clone();
-        graph.name = name.into(); graph.kind = kind; graph.handle = coexist.graphs.len() + 1;
-        semantics.graph = name.into(); semantics.kind = operation;
-        if kind == GraphKind::PackedSpeculative {
-            graph.draft_tokens = 5; graph.packed_token_capacity = 4;
-            let input = graph.input_bindings.iter_mut().find(|b| b.buffer_name == "query_lengths").unwrap();
-            input.buffer_name = "speculative_prefix_limits".into(); input.host_offset = coexist.input_frame_bytes;
-            coexist.input_frame_bytes += 8;
-            let input = semantics.inputs.iter_mut().find(|b| b.source == ValueSource::QueryLength).unwrap();
-            input.buffer = "speculative_prefix_limits".into(); input.source = ValueSource::SpeculativePrefixLimit;
-        }
-        coexist.graphs.push(graph); config.contract.graphs.push(semantics);
-    }
-    catalog::validate(&config, &coexist).unwrap();
-    config.speculative_token_capacity = 0;
-    assert!(catalog::validate(&config, &coexist).is_err());
-}
-
 fn grammar_packing_fixture() -> (
     ModelConfig,
     crate::execution::ExecutionManifest,
@@ -1434,12 +1281,7 @@ fn grammar_packing_fixture() -> (
         .unwrap()
         .clone();
     for (kind, operation, name) in [
-        (GraphKind::Proposal, GraphOperation::Proposal, "proposal8x6"),
-        (
-            GraphKind::Verification,
-            GraphOperation::Verification,
-            "verification8x6",
-        ),
+        (GraphKind::Decode, GraphOperation::Decode, "proposal8x6"),
     ] {
         let mut contract = template.clone();
         contract.graph = name.into();
@@ -1448,6 +1290,9 @@ fn grammar_packing_fixture() -> (
         let mut graph = descriptor.clone();
         graph.name = name.into();
         graph.kind = kind;
+        graph.draft_tokens = 0;
+        graph.token_capacity = 1;
+        graph.packed_token_capacity = 0;
         manifest.graphs.push(graph);
     }
     let mut scheduler = RequestScheduler::new(
@@ -1488,9 +1333,9 @@ fn grammar_packing_fixture() -> (
         });
     }
     let step = crate::scheduler::ScheduledStep { draft_tokens: 0,
-        kind: GraphKind::Proposal,
+        kind: GraphKind::Decode,
         batch_capacity: 8,
-        token_capacity: 6,
+        token_capacity: 1,
         packed_token_capacity: 0,
         mixed: None,
         requires_feedback: true,
@@ -1514,8 +1359,11 @@ fn grammar_mask_packing_preserves_bits_row_layout_and_transitions() {
                 }
             }
         }
-        for kind in [GraphKind::Proposal, GraphKind::Verification] {
+        for kind in [GraphKind::Decode, GraphKind::Speculative] {
             step.kind = kind;
+            step.token_capacity = if kind == GraphKind::Speculative { 6 } else { 1 };
+            step.draft_tokens = if kind == GraphKind::Speculative { 5 } else { 0 };
+            step.packed_token_capacity = if kind == GraphKind::Speculative { 48 } else { 0 };
             let mut inputs = Inputs::new(&config, &manifest).unwrap();
             // Graph inputs persist between submissions; uploads only change what they cover.
             let mut actual = vec![0xa5; 8 * words * 4];
@@ -1583,7 +1431,7 @@ fn grammar_mask_cache_survives_alternating_graph_indexing() {
         for graph in &mut config.contract.graphs {
             for binding in &mut graph.inputs {
                 if binding.buffer == "sampling_grammar_mask" {
-                    binding.indexing = if graph.kind == GraphOperation::Verification {
+                    binding.indexing = if graph.kind == GraphOperation::Speculative {
                         InputIndexing::SubmissionRow
                     } else { indexing };
                 }
@@ -1593,16 +1441,19 @@ fn grammar_mask_cache_survives_alternating_graph_indexing() {
         let words = config.contract.vocabulary.div_ceil(32);
         let mut actual = vec![0xa5; 8 * words * 4];
         let mut inputs = Inputs::new(&config, &manifest).unwrap();
-        for kind in [GraphKind::Proposal, GraphKind::Verification, GraphKind::Proposal] {
+        for kind in [GraphKind::Decode, GraphKind::Speculative, GraphKind::Decode] {
             step.kind = kind;
+            step.token_capacity = if kind == GraphKind::Speculative { 6 } else { 1 };
+            step.draft_tokens = if kind == GraphKind::Speculative { 5 } else { 0 };
+            step.packed_token_capacity = if kind == GraphKind::Speculative { 48 } else { 0 };
             for admission in admissions.iter_mut().flatten() {
-                admission.grammar_mask = (kind == GraphKind::Verification).then(|| vec![0; words]);
+                admission.grammar_mask = (kind == GraphKind::Speculative).then(|| vec![0; words]);
             }
             pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions).unwrap();
             for upload in inputs.uploads().into_iter().filter(|u| u.buffer == "sampling_grammar_mask") {
                 actual[upload.offset..upload.offset + upload.bytes.len()].copy_from_slice(upload.bytes);
             }
-            if kind == GraphKind::Proposal {
+            if kind == GraphKind::Decode {
                 for (row, lane) in step.lanes.iter().enumerate() {
                     let destination = if indexing == InputIndexing::RequestRow { lane.request.slot as usize } else { row };
                     assert!(actual[destination * words * 4..(destination + 1) * words * 4].iter().all(|&b| b == 0xff),
@@ -1618,7 +1469,7 @@ fn grammar_mask_cache_invalidates_other_bindings_and_graph_writes() {
     for mode in ["missing-input", "offset-input", "state-write"] {
         let (mut config, manifest, scheduler, admissions, mut step) = grammar_packing_fixture();
         let words = config.contract.vocabulary.div_ceil(32);
-        let graph = config.contract.graphs.iter_mut().find(|g| g.kind == GraphOperation::Verification).unwrap();
+        let graph = config.contract.graphs.iter_mut().find(|g| g.graph == "Speculative-8-6").unwrap();
         if mode == "missing-input" {
             graph.inputs.retain(|b| b.buffer != "sampling_grammar_mask");
         } else if mode == "offset-input" {
@@ -1632,16 +1483,19 @@ fn grammar_mask_cache_invalidates_other_bindings_and_graph_writes() {
         step.lanes = vec![step.lanes[1].clone()];
         let mut inputs = Inputs::new(&config, &manifest).unwrap();
         let mut actual = vec![0xa5; 8 * words * 4];
-        for kind in [GraphKind::Proposal, GraphKind::Verification, GraphKind::Verification, GraphKind::Proposal] {
+        for kind in [GraphKind::Decode, GraphKind::Speculative, GraphKind::Speculative, GraphKind::Decode] {
             step.kind = kind;
+            step.token_capacity = if kind == GraphKind::Speculative { 6 } else { 1 };
+            step.draft_tokens = if kind == GraphKind::Speculative { 5 } else { 0 };
+            step.packed_token_capacity = if kind == GraphKind::Speculative { 48 } else { 0 };
             pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions).unwrap();
             for upload in inputs.uploads().into_iter().filter(|u| u.buffer == "sampling_grammar_mask") {
                 actual[upload.offset..upload.offset + upload.bytes.len()].copy_from_slice(upload.bytes);
             }
-            if kind == GraphKind::Proposal || mode == "state-write" {
+            if kind == GraphKind::Decode || mode == "state-write" {
                 assert!(actual[words * 4..2 * words * 4].iter().all(|&b| b == 0xff), "{mode}: missing unconstrained upload");
             }
-            if kind == GraphKind::Verification {
+            if kind == GraphKind::Speculative {
                 // Model execution may overwrite a destination not preserved by
                 // its semantic input contract; reproduce that device write.
                 actual.fill(0);
@@ -1753,3 +1607,115 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
     );
 }
 include!("packed_round_tests.rs");
+
+#[test]
+fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_do_not() {
+    use crate::execution::{ExecutionTiming, TokenVector};
+    for speculative in [false, true] {
+        for source in [Some(ValueSource::ConsumedTokens), Some(ValueSource::SnapshotConsumedTokens), None] {
+            let mut config = config();
+            config.history_drafts = false;
+            config.limits.max_active = 1;
+            if speculative {
+                config.speculative_widths = vec![1, 8];
+                config.speculative_fixed_width = Some(8);
+            }
+            let kind = if speculative { GraphKind::Speculative } else { GraphKind::Decode };
+            let operation = if speculative { GraphOperation::Speculative } else { GraphOperation::Decode };
+            let width = if speculative { 8 } else { 1 };
+            let semantics = config.contract.graphs.iter_mut().find(|graph| graph.kind == operation
+                && graph.graph.split('-').nth(1) == Some("1")
+                && graph.graph.split('-').nth(2) == Some(if speculative { "8" } else { "1" })).unwrap();
+            assert!(semantics.pending_token.is_some());
+            if let Some(source) = source {
+                semantics.inputs.push(testing::binding("generation_cursor", source, InputIndexing::SubmissionRow, 0, 0));
+            }
+            semantics.inputs.push(testing::binding("generation_positions", ValueSource::PromptPosition, InputIndexing::PackedToken, 0, 0));
+            let mut manifest = manifest(&config);
+            manifest.graphs.retain(|graph| graph.batch_capacity == 1
+                && if speculative { graph.kind != GraphKind::Decode
+                    && (graph.kind != GraphKind::Speculative || [1, 8].contains(&graph.token_capacity)) }
+                else { graph.kind != GraphKind::Speculative });
+            for (index, graph) in manifest.graphs.iter_mut().enumerate() { graph.handle = index + 1; }
+            let names: std::collections::HashSet<_> = manifest.graphs.iter().map(|graph| graph.name.clone()).collect();
+            config.contract.graphs.retain(|graph| names.contains(&graph.graph));
+            catalog::validate(&config, &manifest).unwrap();
+            let mut inputs = Inputs::new(&config, &manifest).unwrap();
+            let capabilities = scheduler_capabilities_with_manifest(&config, &manifest).unwrap();
+            if source.is_some() {
+                assert_eq!(capabilities.completion_inputs,
+                    vec![((kind, 1, if speculative { 7 } else { 0 }, width, if speculative { 8 } else { 0 }, 0),
+                        vec!["generation_cursor".to_owned()])]);
+            } else { assert!(capabilities.completion_inputs.is_empty()); }
+            let mut scheduler = RequestScheduler::new(config.identity, config.limits, capabilities).unwrap();
+            if speculative {
+                scheduler.enable_speculation(&config.speculative_widths).unwrap();
+                scheduler.fixed_speculative_width(Some(8)).unwrap();
+            }
+            scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+            let handle = scheduler.admit(RequestSpec { message_boundaries: vec![], prompt: vec![7; 64], conditioning: vec![],
+                max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false }).unwrap();
+            let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
+            admissions[handle.slot as usize] = Some(Admission { handle, sampling: SamplingParameters::default(),
+                max_new_tokens: 64, prompt: vec![7; 64], data: PromptData {
+                    positions: (0..64).map(|position| [position; 3]).collect(),
+                    vision_token_indices: vec![-1; 64], ..Default::default()
+                }, grammar_mask: None, ignore_eos: true, prompt_logprobs: false });
+            let mut timing = ExecutionTiming::default();
+            timing.gpu_ns[0] = Some(1000);
+            let mut sequence = 0;
+            let generation = loop {
+                let plan = scheduler.plan().unwrap();
+                if plan.kind == kind { break plan; }
+                sequence += 1;
+                let fence = Fence(sequence);
+                let live = scheduler.request(handle).unwrap();
+                let consumed = if plan.kind.is_prefill() { 64 } else { live.consumed_tokens as i64 };
+                let emits = plan.kind.is_prefill() || plan.kind == GraphKind::Resume;
+                let mut vector = TokenVector { emitted_count: i64::from(emits), ..Default::default() };
+                if emits { vector.tokens[0] = 7; }
+                let record = CompletionRecord { generation: handle.generation as i64, submission_sequence: fence.0 as i64,
+                    consumed_tokens: consumed, generated_tokens: live.generated_tokens as i64 + i64::from(emits),
+                    token_id: if emits { 7 } else { -1 }, status: 1, vector: Some(vector), ..Default::default() };
+                scheduler.commit(&plan, fence).unwrap();
+                let mut records = [CompletionRecord::default(); 4]; records[handle.slot as usize] = record;
+                scheduler.complete(fence, &records, timing).unwrap();
+            };
+            scheduler.observe_execution(&generation, timing);
+            let generation = scheduler.plan().unwrap();
+            assert_eq!((generation.kind, generation.token_capacity), (kind, width));
+            assert_eq!(scheduler.plan_requires_feedback(&generation), source.is_some());
+            let before = scheduler.request(handle).unwrap();
+            let (consumed, generated) = (before.consumed_tokens, before.generated_tokens);
+            let fence = Fence(sequence + 1);
+            scheduler.commit(&generation, fence).unwrap();
+            pack_inputs(&mut inputs, &config, &scheduler, &generation, &admissions).unwrap();
+            let uploads = inputs.uploads();
+            assert!(!uploads.iter().any(|upload| upload.buffer == "generation_positions"));
+            if source.is_some() {
+                let cursor = uploads.iter().find(|upload| upload.buffer == "generation_cursor").unwrap();
+                assert_eq!(i64::from_le_bytes(cursor.bytes[..8].try_into().unwrap()), consumed as i64);
+                assert!(scheduler.plan().is_none());
+                let mut vector = TokenVector { emitted_count: 1, verification_width: width as i64,
+                    offered_drafts: generation.lanes[0].tokens as i64 - 1, ..Default::default() };
+                vector.tokens[0] = 7;
+                let mut records = [CompletionRecord::default(); 4];
+                records[handle.slot as usize] = CompletionRecord { generation: handle.generation as i64,
+                    submission_sequence: fence.0 as i64, consumed_tokens: consumed as i64 + 1,
+                    generated_tokens: generated as i64 + 1, token_id: 7, status: 1,
+                    vector: Some(vector), ..Default::default() };
+                scheduler.complete(fence, &records, timing).unwrap();
+                let next = scheduler.plan().unwrap();
+                scheduler.commit(&next, Fence(fence.0 + 1)).unwrap();
+                pack_inputs(&mut inputs, &config, &scheduler, &next, &admissions).unwrap();
+                let uploads = inputs.uploads();
+                let cursor = uploads.iter().find(|upload| upload.buffer == "generation_cursor").unwrap();
+                assert_eq!(i64::from_le_bytes(cursor.bytes[..8].try_into().unwrap()), consumed as i64 + 1);
+            } else {
+                let next = scheduler.plan().unwrap();
+                assert_eq!(next.lanes[0].request, handle);
+                scheduler.commit(&next, Fence(fence.0 + 1)).unwrap();
+            }
+        }
+    }
+}

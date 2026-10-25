@@ -174,10 +174,12 @@ steps at 22887c1 or later.
 
 1. Export a TP2 package. On rank zero:
 
+   Replace `CACHE_ENTRY` in conversion commands with the directory path printed by export.
+
    ```sh
    .venv/bin/ignition export glm-5.3-flash --ranks 2 --rendezvous 10.200.0.12:29630 \
-     --gpus 0 --max-concurrency 8 --no-context-parallel \
-     --output /data/flare-runtime/glm53-tp2.safetensors --verbose
+     --gpus 0 --max-concurrency 8 --no-context-parallel --verbose
+   .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-tp2.safetensors
    ```
 
    On the peer:
@@ -248,7 +250,8 @@ at both TP2 and TP4 on Spark.
 
    ```sh
    .venv/bin/ignition export glm-5.3-flash --gpus 0-3 --max-concurrency 16 \
-     --no-context-parallel --output glm53-tp4-sm120.safetensors --verbose
+     --no-context-parallel --verbose
+   .venv/bin/ignition convert CACHE_ENTRY --form packed --output glm53-tp4-sm120.safetensors
    ```
 
 2. Serve:

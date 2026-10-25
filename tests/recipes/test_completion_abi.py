@@ -1,4 +1,4 @@
-"""Completion writers preserve physical lanes in both graph execution ABIs."""
+"""ABI4 completion writers preserve physical lanes and frame ownership."""
 from __future__ import annotations
 
 import os
@@ -12,19 +12,19 @@ import torch
 from ignition.components.sampling import _completion_fields
 
 
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [24])
 def test_completion_shape_contract(fields):
     assert _completion_fields(torch.zeros(2, 4, fields, dtype=torch.int64), torch.device("cpu")) == fields
 
 
-@pytest.mark.parametrize("shape,dtype", [((2, 4, 16), torch.int64), ((2, 3, 24), torch.int64),
+@pytest.mark.parametrize("shape,dtype", [((2, 4, 8), torch.int64), ((2, 4, 16), torch.int64), ((2, 3, 24), torch.int64),
     ((4, 24), torch.int64), ((2, 4, 24), torch.int32)])
 def test_completion_shape_rejects_malformed_records(shape, dtype):
     with pytest.raises(ValueError, match="completion_records"):
         _completion_fields(torch.zeros(shape, dtype=dtype), torch.device("cpu"))
 
 
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [24])
 def test_actual_completion_kernels_with_cpu_interpreter(fields):
     env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(fields)],
@@ -33,7 +33,7 @@ def test_actual_completion_kernels_with_cpu_interpreter(fields):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA device")
-@pytest.mark.parametrize("fields", [8, 24])
+@pytest.mark.parametrize("fields", [24])
 def test_actual_completion_kernels_cuda(fields):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"
     _kernel_cases(fields, "cuda")

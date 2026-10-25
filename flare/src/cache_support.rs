@@ -1,0 +1,183 @@
+//! Cross-platform prepared-model cache selection and deployment choice.
+//!
+//! Unix-specific rank transport and locking remain in `package_cache`.
+
+use crate::config::{Configuration, expand};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+type Failure = Box<dyn std::error::Error + Send + Sync>;
+
+/// Prepared-model cache root: explicit option, then `paths.package_cache`, then the default.
+///
+/// Callers choose the explicit value: Hub and cache commands use `--model-cache`;
+/// distribution peers use `--model-cache` and fall back to `--package-cache`.
+pub fn model_root(explicit: Option<&Path>) -> Result<PathBuf, Failure> {
+    let home = crate::environment::home_directory()?;
+    let config = home.join(".config/flare/config.toml");
+    model_root_from(&home, Some(&config), explicit)
+}
+
+pub(crate) fn model_root_from(
+    home: &Path,
+    config: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, Failure> {
+    if let Some(path) = explicit {
+        return Ok(expand(home, path));
+    }
+    if let Some(config) = config
+        && let Some(configured) = Configuration::load(config, false)?.package_cache(home)
+    {
+        return Ok(configured);
+    }
+    Ok(home.join(".cache/flare/packages"))
+}
+
+fn cache_key(input: &str) -> Result<String, Failure> {
+    flare_helios::package::cache::model_key(input).map_err(|error| error.to_string().into())
+}
+
+/// Accepted user syntax is the model identity (for example `owner/name`); a cache key is
+/// accepted only when the identity it decodes to names the same entry, so both spellings resolve
+/// deterministically.
+pub(crate) fn resolve_model(
+    root: &flare_helios::package::cache::Root,
+    input: &str,
+) -> Result<(String, String), Failure> {
+    let key = cache_key(input)?;
+    if root.ref_entry(&key)?.is_some() || !root.versions(&key)?.is_empty() {
+        return Ok((key, input.to_owned()));
+    }
+    if let Ok(identity) = flare_helios::package::cache::model_identity(input) {
+        let decoded = cache_key(&identity)?;
+        if decoded != key
+            && (root.ref_entry(&decoded)?.is_some() || !root.versions(&decoded)?.is_empty())
+        {
+            return Ok((decoded, identity));
+        }
+    }
+    Ok((key, input.to_owned()))
+}
+
+pub(crate) fn explicit_package_path(input: &Path) -> Result<bool, Failure> {
+    Ok(input.is_absolute()
+        || input.starts_with(".")
+        || input.starts_with("..")
+        || input.try_exists()?)
+}
+
+/// Resolve an immutable local version, holding its lease before releasing the default ref.
+pub(crate) fn local_model(
+    root: &flare_helios::package::cache::Root,
+    input: &Path,
+) -> Result<Option<(flare_helios::package::cache::Entry, bool)>, Failure> {
+    if explicit_package_path(input)? {
+        return Ok(None);
+    }
+    let Some(input) = input.to_str() else {
+        return Ok(None);
+    };
+    let (identity, version) = match input.rsplit_once('@') {
+        Some((model, version)) if !model.is_empty() && !version.is_empty() => {
+            (model, Some(version))
+        }
+        Some(_) => return Err("expected a package path or MODEL[@VERSION]".into()),
+        None => (input, None),
+    };
+    let (model, identity) = resolve_model(root, identity)?;
+    if root.ref_entry(&model)?.is_none() && root.versions(&model)?.is_empty() {
+        return Ok(None);
+    }
+    let entry = match version {
+        Some(version) => root.entry(&model, version)?,
+        None => root.resolve(&model)?.ok_or_else(|| format!(
+            "model {identity} has no selected default version; use flare models list to see local versions"
+        ))?,
+    };
+    Ok(Some((entry, version.is_some())))
+}
+
+/// Normalize requested tensor-parallel sizes: deduplicated, ascending, non-zero.
+pub fn requested_tensor_parallel(requested: &[u32], gpu_count: usize) -> Result<Vec<u32>, Failure> {
+    let mut sizes: Vec<u32> = if requested.is_empty() {
+        vec![u32::try_from(gpu_count.max(1)).map_err(|_| "GPU count is too large")?]
+    } else {
+        requested.to_vec()
+    };
+    if sizes.contains(&0) {
+        return Err("tensor-parallel sizes must be positive".into());
+    }
+    sizes.sort_unstable();
+    sizes.dedup();
+    Ok(sizes)
+}
+
+/// Resolve signed deployments for the requested tensor-parallel sizes.
+///
+/// Topology comes from each authenticated deployment body, never from
+/// availability hints: a size that was never exported, appears twice, or has an
+/// incomplete payload closure is an error rather than a silently dropped request.
+pub fn select_deployments(
+    metadata: &flare_helios::package::reader::Metadata,
+    publishers: &[flare_helios::runtime_package::Publisher],
+    sizes: &[u32],
+) -> Result<Vec<flare_helios::package::protection::Selection>, Failure> {
+    use flare_helios::package::{protection, reader};
+
+    let catalog = protection::verify(
+        &metadata.envelope,
+        publishers,
+        protection::Selection::Catalog,
+    )?;
+    let count = catalog.deployment_count();
+    let mut found: HashMap<u32, Vec<usize>> = HashMap::new();
+    for index in 0..count {
+        let selection = protection::Selection::Deployment {
+            deployment: index,
+            rank: None,
+        };
+        let verified = protection::verify(&metadata.envelope, publishers, selection)?;
+        let deployment = verified
+            .deployment()
+            .ok_or_else(|| format!("deployment {index} has no authenticated body"))?;
+        found
+            .entry(deployment.tensor_parallel)
+            .or_default()
+            .push(index);
+    }
+    let mut selected = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        let indices = found.get(size).ok_or_else(|| {
+            format!("package exports no deployment with tensor-parallel size {size}")
+        })?;
+        match indices.as_slice() {
+            [index] => selected.push(protection::Selection::Deployment {
+                deployment: *index,
+                rank: None,
+            }),
+            _ => {
+                return Err(format!(
+                    "package exports {} deployments with tensor-parallel size {size}",
+                    indices.len()
+                )
+                .into());
+            }
+        }
+    }
+    let mut verified = Vec::with_capacity(selected.len());
+    for selection in &selected {
+        verified.push(protection::verify(
+            &metadata.envelope,
+            publishers,
+            *selection,
+        )?);
+    }
+    flare_helios::package::cache::Root::validate_ready_closure(
+        metadata,
+        &verified,
+        &flare_helios::package::derivation::Limits::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(selected)
+}

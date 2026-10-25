@@ -11,9 +11,10 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @pytest.mark.parametrize("autotune", [False, True])
+@pytest.mark.parametrize("prime", [True, False])
 @pytest.mark.parametrize("heads,groups", [(16, 4), (128, 8)])
 @torch.no_grad()
-def test_replay_width_transitions_and_snapshot_branch(autotune, heads, groups):
+def test_replay_width_transitions_and_snapshot_branch(autotune, prime, heads, groups):
     from b12x.preparation import PreparationSession
     from ignition.components.mamba import PreparedMambaUpdate
     from ignition.components.mamba_speculation import PreparedMambaReplay, PreparedMambaVerification
@@ -44,7 +45,7 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, heads, groups):
     lengths, accepted = (torch.zeros(batch, dtype=torch.int32, device="cuda") for _ in range(2))
     workspace = ScratchArena("cuda:0")
     graphs, operands, replayers = {}, {}, {}
-    with PreparationSession(device="cuda:0", autotune=autotune) as session:
+    with PreparationSession(device="cuda:0", autotune=autotune, prime=prime) as session:
         for width in range(8, 0, -1):
             replay = PreparedMambaReplay(pool.backing, layout, regions, A, rows, lengths,
                 ring_region=layout.region("ring"), count_region=layout.region("pending"), ring_length=ring,
@@ -82,7 +83,7 @@ def test_replay_width_transitions_and_snapshot_branch(autotune, heads, groups):
             forward = compile_forward(forward)
             forward()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with session.capture(), torch.cuda.graph(graph):
                 forward()
             graphs[width], operands[width], replayers[width] = (graph, forward, tuple(updates)), arguments, replay
         session.freeze()

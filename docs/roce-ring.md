@@ -159,13 +159,14 @@ is a mode of the ABI 10 layout, and startup rejects a mismatch before replay.
 
 ### Prepare across four hosts
 
-On `maxwell`, choose an unused output filename and an available rendezvous port:
+On `maxwell`, choose an available rendezvous port. Export publishes to its model
+cache; replace `CACHE_ENTRY` with the printed path to create a standalone package:
 
 ```sh
 .venv/bin/ignition export glm-5.3-flash --gpus 0 --ranks 4 \
   --rendezvous maxwell:29630 --roce-ring --transfer-streams 8 \
-  --max-concurrency 4 \
-  --output /data/flare-runtime/glm53-ring-tp4.safetensors --verbose
+  --max-concurrency 4 --verbose
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-ring-tp4.safetensors
 ```
 
 Run the corresponding command on each peer from its checkout root:

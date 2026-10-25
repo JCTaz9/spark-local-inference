@@ -78,7 +78,7 @@ def prepare(
             )
     config = PreparationConfig(
         prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers,
+        compile_workers=plan.compile_workers, native_dense_activations=plan.native_dense_activations,
         tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,

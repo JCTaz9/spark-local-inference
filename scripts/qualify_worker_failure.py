@@ -21,7 +21,7 @@ import sys
 import time
 import weakref
 
-from qualify_startup_validation import ABI_VERSION, ROOT, SNAPSHOT, digest, fixture, save
+from qualify_startup_validation import ABI_VERSION, SNAPSHOT, fixture
 
 ERROR = "invalid or stale device completion record"
 
@@ -56,9 +56,9 @@ def catalog(snapshot):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graphs, signatures = {}, {}
-    inputs = tuple(name for name in buffers if name not in (
-        "frame_index", "submission_sequence", "completion_records"))
     for item in metadata["graphs"]:
+        inputs = tuple(binding["buffer_name"] for binding in item["input_bindings"]
+                       if binding["buffer_name"] not in ("frame_index", "submission_sequence"))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             buffers["completion_records"][:, :, 7].fill_(1)
@@ -71,24 +71,16 @@ def catalog(snapshot):
     return owner, config
 
 
-class Evidence:
-    def __init__(self, artifacts, value):
-        self.artifacts, self.value = artifacts, value
-        self.http_count = 0
-        self.persist()
-
-    def persist(self):
-        save(self.artifacts / "receipt.json", self.value)
+class Checks:
+    def __init__(self):
+        self.count = 0
 
     def check(self, case, name, passed, **details):
-        self.value["checks"].append({"case": case, "name": name, "passed": bool(passed), **details})
-        self.persist()
+        print(json.dumps(dict(case=case, name=name, passed=bool(passed), **details)), flush=True)
+        assert passed, f"{case}: {name}: {details}"
+        self.count += 1
 
     def http(self, address, label, path, body=None):
-        self.http_count += 1
-        prefix = self.artifacts / f"{self.http_count:03d}-{label}"
-        if body is not None:
-            save(prefix.with_suffix(".request.json"), body)
         connection = http.client.HTTPConnection(address, timeout=30)
         started = time.monotonic()
         try:
@@ -96,12 +88,8 @@ class Evidence:
                 body=None if body is None else json.dumps(body),
                 headers={} if body is None else {"Content-Type": "application/json"})
             response = connection.getresponse()
-            raw = response.read()
-            prefix.with_suffix(".body").write_bytes(raw)
-            observed = {"status": response.status, "headers": dict(response.getheaders()),
-                "body": raw.decode("utf-8"), "elapsed_seconds": time.monotonic() - started}
-            save(prefix.with_suffix(".response.json"), observed)
-            return observed
+            return {"status": response.status, "headers": dict(response.getheaders()),
+                "body": response.read().decode("utf-8"), "elapsed_seconds": time.monotonic() - started}
         finally:
             connection.close()
 
@@ -116,15 +104,13 @@ def qualify_case(evidence, snapshot, stream):
     server = flare_heliopause.Server(owner, manifest, json.dumps(config))
     del owner
     gc.collect()
-    save(evidence.artifacts / f"{case}.manifest.json", manifest)
-    save(evidence.artifacts / f"{case}.config.json", config)
     close_error = None
     try:
         evidence.check(case, "owner-retained-after-handoff", retained() is not None)
         before = evidence.http(server.address, case + "-health-before", "/health")
         evidence.check(case, "ready-before-submission", before["status"] == 200 and server.healthy)
         body = {"model": config["model_id"], "messages": [{"role": "user", "content": "Say hello."}],
-            "max_tokens": 2, "temperature": 0, "stream": stream,
+            "max_tokens": 2, "stream": stream,
             "chat_template_kwargs": {"enable_thinking": False}}
         response = evidence.http(server.address, case, "/v1/chat/completions", body)
         if stream:
@@ -169,15 +155,14 @@ def qualify_case(evidence, snapshot, stream):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true")
-    parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--snapshot", type=Path, default=SNAPSHOT)
     parser.add_argument("--device-uuid")
     args = parser.parse_args()
     if not args.run:
         print(json.dumps(plan(), indent=2))
         return 0
-    if args.artifacts is None or not args.device_uuid or os.environ.get("CUDA_VISIBLE_DEVICES") != args.device_uuid:
-        parser.error("--run requires --artifacts and --device-uuid matching CUDA_VISIBLE_DEVICES")
+    if not args.device_uuid or os.environ.get("CUDA_VISIBLE_DEVICES") != args.device_uuid:
+        parser.error("--run requires --device-uuid matching CUDA_VISIBLE_DEVICES")
     import torch
     import flare_heliopause
 
@@ -185,28 +170,12 @@ def main():
     actual_uuid = str(torch.cuda.get_device_properties(0).uuid)
     if actual_uuid.removeprefix("GPU-") != args.device_uuid.removeprefix("GPU-"):
         raise RuntimeError(f"CUDA UUID {actual_uuid} does not match assigned {args.device_uuid}")
-    args.artifacts.mkdir(parents=True, exist_ok=False)
-    extension = next(Path(flare_heliopause.__file__).parent.glob("*.so"))
-    sources = [Path(__file__).resolve(), Path(__file__).with_name("qualify_startup_validation.py"),
-        *sorted((ROOT / "helios/src").rglob("*.rs")), ROOT / "helios/Cargo.toml", ROOT / "helios/Cargo.lock"]
-    value = {"schema": "flare-helios-worker-failure-v1", "plan": plan(), "checks": [],
-        "extension": {"path": str(extension), "sha256": digest(extension)}, "device_uuid": actual_uuid,
-        "assigned_device_uuid": args.device_uuid,
-        "torch": torch.__version__, "cuda": torch.version.cuda,
-        "sources_before": {str(path): digest(path) for path in sources}}
-    evidence = Evidence(args.artifacts, value)
-    try:
-        for stream in (False, True):
-            qualify_case(evidence, args.snapshot, stream)
-    finally:
-        value["sources_after"] = {str(path): digest(path) for path in sources}
-        value["sources_unchanged"] = value["sources_before"] == value["sources_after"]
-        value["extension_unchanged"] = value["extension"]["sha256"] == digest(extension)
-        value["passed"] = bool(len(value["checks"]) == 22 and all(check["passed"] for check in value["checks"])
-            and value["sources_unchanged"] and value["extension_unchanged"])
-        evidence.persist()
-    print(json.dumps({"passed": value["passed"], "checks": len(value["checks"]), "artifacts": str(args.artifacts)}))
-    return 0 if value["passed"] else 1
+    checks = Checks()
+    for stream in (False, True):
+        qualify_case(checks, args.snapshot, stream)
+    assert checks.count == 22
+    print(json.dumps({"passed": True, "checks": checks.count, "device_uuid": actual_uuid}))
+    return 0
 
 
 if __name__ == "__main__":

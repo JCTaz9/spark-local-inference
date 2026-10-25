@@ -123,7 +123,7 @@ fn fixture(directory: &std::path::Path, version: u64, maximum: u64) -> PathBuf {
         )
     };
     let envelope = [
-        integer(1, 4),
+        integer(1, 6),
         group(1, &metadata),
         group(2, &[]),
         group(3, &[]),

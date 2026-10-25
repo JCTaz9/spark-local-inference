@@ -104,13 +104,16 @@ class PreparedPagedAttention:
                 capacity = paged.verify_graph_capacity(**geometry, query_len=width)
             else:
                 capacity = paged.extend_graph_capacity(**geometry, total_q_capacity=q.shape[0])
+            # Verify replay reserves a schedule for W queries per request;
+            # live cumulative lengths still index the P-row query/output tensors.
+            schedule_rows = pages.shape[0] * width if mode == "verify" else q.shape[0]
             caps = paged.Caps(device=q.device, mode=mode if mode in ("decode", "verify") else "extend",
                 dtype=q.dtype, kv_dtype=key.dtype,
                 num_q_heads=q.shape[1], num_kv_heads=key.shape[2], head_dim_qk=q.shape[2],
-                head_dim_vo=value.shape[3], page_size=key.shape[1], max_total_q=q.shape[0],
+                head_dim_vo=value.shape[3], page_size=key.shape[1], max_total_q=schedule_rows,
                 max_batch=pages.shape[0], max_page_table_width=pages.shape[1], num_cache_pages=key.shape[0],
-                max_work_items=max(capacity.max_work_items, q.shape[0] * 32) if selected_blocks is not None and mode in ("decode", "verify") else capacity.max_work_items,
-                max_partial_rows=max(getattr(capacity, "max_partial_rows", 0), q.shape[0] * 32) if selected_blocks is not None and mode in ("decode", "verify") else getattr(capacity, "max_partial_rows", 0),
+                max_work_items=max(capacity.max_work_items, schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else capacity.max_work_items,
+                max_partial_rows=max(getattr(capacity, "max_partial_rows", 0), schedule_rows * 32) if selected_blocks is not None and mode in ("decode", "verify") else getattr(capacity, "max_partial_rows", 0),
                 use_cuda_graph=True,
                 copy_runtime_metadata=not all(t.dtype == torch.int32 and t.is_contiguous()
                                               for t in (pages, lengths, cu)),
@@ -144,8 +147,8 @@ class PreparedPagedAttention:
                 arguments["q"].normal_(std=.2)
                 arguments["page_table"].zero_()
                 arguments["cache_seqlens"].fill_(min(max(4096, q.shape[0]), pages.shape[1] * key.shape[1]))
-                arguments["cu_seqlens_q"].copy_(torch.arange(cu.numel(), device=cu.device, dtype=cu.dtype)
-                                                   * (width if mode == "verify" else q.shape[0] // pages.shape[0]))
+                arguments["cu_seqlens_q"].copy_((torch.arange(cu.numel(), device=cu.device, dtype=torch.int64)
+                                                   * q.shape[0] // pages.shape[0]).to(cu.dtype))
                 if selected_blocks is not None:
                     blocks = torch.arange(16, dtype=torch.int32, device=q.device)
                     extent = min(max(4096, q.shape[0]), pages.shape[1] * key.shape[1])

@@ -175,8 +175,7 @@ class AttentionIndices(PreparedWindowIndices):
     """
 
     def __init__(self, metadata, *, mode, tokens, visible, buffers):
-        rows = metadata.starts.numel()
-        page_size = 128 if mode == "decode" else 128 + tokens // rows
+        page_size = 128 if mode == "decode" else 128 + metadata.max_query_tokens
         width = page_size if mode == "draft" else 128 + (384 if visible is not None else 0)
         super().__init__(metadata, mode=mode, tokens=tokens, page_size=page_size,
             width=width, visible=visible, buffers=buffers)

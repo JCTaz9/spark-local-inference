@@ -33,14 +33,6 @@ impl Key {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PackedShape {
-    pub batch: usize,
-    pub width: usize,
-    pub tokens: usize,
-    pub nanos: u64,
-}
-
 pub(super) struct PackedRoundShape {
     pub batch: usize,
     pub drafts: usize,
@@ -93,9 +85,7 @@ impl Estimate {
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     index: std::collections::HashMap<Key, usize>,
-    pub proposal_width: Option<usize>,
     packed_round_durations: [[Option<u64>; 9]; 7],
-    packed_verification_durations: [[Option<u64>; 9]; 7],
     now_ns: u64,
     ttl_ns: u64,
 }
@@ -149,19 +139,8 @@ impl ActionCosts {
                 },
             ));
         }
-        let proposal_width = entries.iter().filter_map(|(key, _)| match key.kind {
-            GraphKind::Proposal => Some(key.tokens),
-            GraphKind::PackedSpeculative => Some(key.drafts + 1),
-            _ => None,
-        }).max();
-        // Only the full producer participates in scheduling, including timing and acceptance probes.
-        entries.retain(|(key, _)| match key.kind {
-            GraphKind::Proposal => Some(key.tokens) == proposal_width,
-            GraphKind::PackedSpeculative => Some(key.drafts + 1) == proposal_width,
-            _ => true,
-        });
         let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
-        let mut costs = Self { entries, index, proposal_width,
+        let mut costs = Self { entries, index,
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
         costs.refresh_packed_durations();
         Ok(costs)
@@ -173,27 +152,16 @@ impl ActionCosts {
     }
 
     pub fn duration(&self, kind: GraphKind, batch: usize, tokens: usize) -> Option<u64> {
-        self.shape_duration(kind, batch, tokens, 0).or_else(|| {
-            (kind == GraphKind::Verification && batch.is_power_of_two() && batch <= super::REQUEST_LANES)
-                .then(|| self.packed_verification_durations
-                .get(batch.trailing_zeros() as usize)?.get(tokens).copied().flatten()).flatten()
-        })
+        self.shape_duration(kind, batch, tokens, 0)
     }
 
     fn refresh_packed_durations(&mut self) {
         self.packed_round_durations = Default::default();
-        self.packed_verification_durations = Default::default();
         for (key, estimate) in &self.entries {
-            let durations = match key.kind {
-                GraphKind::PackedSpeculative => &mut self.packed_round_durations,
-                GraphKind::Verification if key.packed != 0 => &mut self.packed_verification_durations,
-                _ => continue,
-            };
-            let maximum = if key.kind == GraphKind::PackedSpeculative {
-                (key.drafts + 1).min(key.tokens)
-            } else { key.tokens }.min(key.packed / key.batch);
+            if key.kind != GraphKind::Speculative || key.packed == 0 { continue; }
+            let maximum = (key.drafts + 1).min(key.tokens).min(key.packed);
             let nanos = estimate.nanos.saturating_add(estimate.handoff_ns);
-            for duration in durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
+            for duration in self.packed_round_durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
                 *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
             }
         }
@@ -204,14 +172,8 @@ impl ActionCosts {
         self.packed_round_durations.get(batch.trailing_zeros() as usize)?.get(width).copied().flatten()
     }
 
-    pub fn packed_shapes(&self) -> impl Iterator<Item = PackedShape> + '_ {
-        self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Verification && key.packed != 0)
-            .map(|(key, estimate)| PackedShape { batch: key.batch, width: key.tokens, tokens: key.packed,
-                nanos: estimate.nanos.saturating_add(estimate.handoff_ns) })
-    }
-
     pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {
-        self.entries.iter().filter(|(key, _)| key.kind == GraphKind::PackedSpeculative)
+        self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Speculative && key.packed != 0)
             .map(|(key, estimate)| PackedRoundShape {
                 batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
                 nanos: estimate.nanos.saturating_add(estimate.handoff_ns),
@@ -230,12 +192,12 @@ impl ActionCosts {
 
     fn exact_duration(&self, kind: GraphKind, batch: usize, tokens: usize, prefill: usize, packed: usize) -> Option<u64> {
         self.entry(Key {
-            drafts: 0,
+            drafts: if kind == GraphKind::Speculative { tokens - 1 } else { 0 },
             kind,
             batch,
             tokens,
             prefill,
-            packed,
+            packed: if kind == GraphKind::Speculative { batch * tokens } else { packed },
         })
         .map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
     }

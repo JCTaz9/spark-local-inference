@@ -320,13 +320,14 @@ same boundary; violations must be resolved before committing.
   allowlist. Shared code derives behavior from concrete geometry and dataflow.
   Independent enum identifiers select reusable tool/reasoning parsers and image
   preparation/layout implementations only. Review every field and all consumers.
-- **Protocol Buffer changes preserve model package compatibility.** Every Protocol
-  Buffer change **must** be accompanied by Helios code that keeps previously
-  exported model packages loadable and usable without re-export. Shared code must
-  handle absent fields and Protobuf default values while preserving older metadata
-  semantics and explicit values. Wire-format compatibility alone is insufficient.
-  Include regression tests for older serialized metadata and validate the affected
-  package loading and serving paths across the affected model contracts.
+- **Model packages enforce versioned contracts.** Serving requires payload format
+  2, execution ABI 4, and prepared model contract 2. Other execution ABI or
+  prepared contract versions fail before replay and require re-export. Semantic
+  changes require explicit versioning; removed Protobuf fields and enum values
+  remain reserved. Remove superseded loaders and migration-only tests. Backward
+  compatibility requires an explicit maintainer requirement. Validate required
+  fields, explicit values, geometry, and unsupported-version rejection across
+  affected loading and serving paths.
 - **Numerical and performance requirements are separate.** State copies and
   metadata are exact. Arithmetic comparisons follow each operator's precision
   and reduction semantics. Complete graph and service measurements determine
@@ -412,13 +413,13 @@ For Qwen at concurrency four:
 | Prefill scheduling | One request per chunk, interleaved with decode |
 | Maximum prefill chunk | 4,096 tokens |
 | Prefill capacities | 128, 256, 512, 1,024, 2,048, 4,096 tokens |
-| Tail placement | Smallest captured capacity containing the live tail |
+| Tail placement | Every eligible captured capacity competes by useful service and measured cost |
 | Context limit | 262,144 tokens |
 | Main KV / GDN recurrence | BF16 / FP32 |
 | PLE delivery | Compact GPU rows supplied by Helios from disk or RAM |
 | Checkpoint endpoints | Rendered message endpoints, final prompt, and terminal consumed prefix |
 | MTP draft limit | Five drafts plus the pending input |
-| Speculative scheduling | One round in flight |
+| Speculative scheduling | Up to two complete generation programs in flight when dependencies permit |
 | Vision | Prepared image capacities; video validation remains separate |
 
 Ignition's `--prefill-chunk-size` selects a multiple of 64 between 64 and the
@@ -427,18 +428,20 @@ plus the exact limit; a limit of 64 captures one 64-token graph. Preparation
 validates every operator geometry and workspace envelope. An unsupported
 capacity fails instead of silently shrinking the chunk or omitting a variant.
 
-At the default Qwen capacities, ordinary serving has 25 graphs. Five-draft
-speculation replaces three decode graphs with eighteen verification graphs,
-giving 40 graphs. Prefill, resume, vision, initialization, snapshot, and
-restore share the same catalog. `--no-mtp` omits draft weights and speculative
-state during preparation. Load-time `--mtp-draft-tokens 0` selects target-only
-verification while retaining the package's MTP weights and history layout.
+Ordinary generation uses decode programs; speculation uses complete captured
+proposal/verification/commit programs. Each speculative descriptor explicitly
+records request capacity B, captured proposal depth D, per-request target capacity
+W including the pending token, and aggregate target rows P. Rectangular programs
+also record P = B × W. Width-one speculative programs draw no proposals and
+preserve draft context. Standalone proposal and verification dispatches are not
+part of the execution contract.
 
-Flare can reduce concurrency and draft depth within the package's captured
-capacities. Fixed verification loads one width for each required batch;
-adaptive verification loads the permitted widths. Concurrency three requires
-the batch-four bucket. Missing variants and capacity increases fail before
-CUDA initialization.
+`--no-mtp` omits draft weights and state during preparation. Load-time
+`--mtp-draft-tokens 0` selects ordinary decode while retaining package storage.
+Runtime reductions require actual captured programs. Fixed selection supports
+host-allocated rectangular and ragged programs; GPU confidence allocation
+requires adaptive selection. Concurrency three requires the batch-four bucket.
+Missing variants and capacity increases fail before CUDA initialization.
 
 Continuation rows and KV pages occupy separate fixed virtual ranges.
 Helios backs those ranges after uploading selected graphs, retaining the
@@ -957,13 +960,15 @@ Tool and reasoning parsers and image preparation/layout functions are selected
 independently by typed frontend enums. Missing fields, unknown or unspecified
 enum values, invalid storage views, and incompatible input geometry reject loading.
 
-Pending-token input sources determine the scheduler's completion dependency.
-Host-fed decode waits for its preceding completion; device-fed decode declares a
-persistent state read and the admission and sampling graphs that produce it.
+Each selected program's pending-token inputs determine its completion dependency.
+Host-fed pending tokens wait for the preceding completion. Device-fed generation
+declares a persistent read, and initialization, restoration, prefill, scored
+prefill, resume, decode, speculative, and mixed producers declare their state
+writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. These declarations preserve the existing completion ABI.
+history. ABI4 uses 24-field completions for every operation.
 
 Captured operators use b12x's default numerical policy and tuned execution plans.
 MoE reductions may use arrival-ordered atomic additions, so identical graph inputs
@@ -1173,19 +1178,31 @@ buffers. Page tables remain resident; decode updates only changed entries.
 The decode graph writes the sampled token back into the request's device state.
 The following decode consumes it directly.
 
-Ordinary decode uses two completion frames and permits at most two steps
-in flight. Speculative generation permits one round in flight, so width
-selection, copy proposals, and host constraints use its completed result. A copy
-stream transfers compact token/status records after their production event. A
-frame is reused only after its transfer completes. Input staging buffers are
-double-buffered so that a frame's uploads never overwrite a pending transfer.
+Ordinary decode and complete speculative generation can occupy two completion
+frames. Exact host `QueryLength` bindings select lengths before proposal draws;
+GPU `SpeculativePrefixLimit` bindings freeze per-lane ceilings while the captured
+program allocates within P. Both paths reserve cache against their full
+submitted lane limits. Confidence producers declare `confidence_width` and write
+FP32 `[2, request_slots, draft_capacity]` completion frames.
+
+Host pending-token, grammar, history, stop, cost-discovery, and phase-transition
+dependencies serialize the affected program. Prefill, scored prefill, mixed,
+resume, vision, and state operations drain the queue. A copy stream transfers
+records behind production events; input staging and completion frames remain
+owned until their fences complete. Tensor-parallel retirement waits for all
+ranks, protecting frame reuse and cancellation cleanup.
+
+Planning uses expected token and delivery service frozen at submission to project
+prices and ages at the queued horizon. An expected queued delivery resets only
+the projected age. Validated completion updates observed service; actual output
+publication alone resets observed visible-output age.
 
 A grammar-constrained request needs a vocabulary mask for step k+1 derived from
 the token sampled at step k. While any constrained request is in the decode
 batch, the loop runs one step in flight: the Rust-owned host grammar engine
 advances on the transferred token, writes each constrained lane's mask into the
 staging buffer, and the sampling operation applies the mask before filtering.
-Unconstrained ordinary-decode batches keep two steps in flight. Grammar compilation and
+Dependency-free ordinary and speculative generation keep up to two steps in flight. Grammar compilation and
 advancement do not call Python.
 
 Device completion flags suppress further mutation for finished requests. Slot
@@ -1214,7 +1231,7 @@ manage penalties, grammar masks and request-state updates. Temperature must be
 positive; zero-temperature requests are rejected because greedy decoding
 collapses the model's probability distribution.
 
-Execution ABIs 2 and 3 retain `sampling_mode="general"` as their sole
+Execution ABI 4 uses `sampling_mode="general"` as their sole
 supported manifest value. Bounded top-k optimization is deferred. Measure
 sampler cost inside the complete graph before changing it; threshold ties
 must never be truncated to a fixed number of candidates.
@@ -1368,8 +1385,24 @@ them into the prepared token stream without splitting atomic image spans. Cache
 reuse depends on the actual prepared prefix identity; context-dependent changes
 to earlier tokens cannot reuse a checkpoint for different tokens.
 
+At admission, the scheduler budgets newly captured cache snapshots from the
+loaded snapshot capacity divided by configured maximum concurrency, rounded
+down. A nonempty pool permits at least one capture per request; an empty pool
+permits none. The budget reserves a terminal capture and, when generation can
+continue beyond the prompt and the budget permits, a prompt capture. A single
+output token shares the prompt and terminal endpoint.
+
+The remaining budget selects message checkpoints within the uncached prompt
+suffix. If all eligible boundaries fit, retain them all. Otherwise, place token
+targets at equal intervals between the reused prefix and the prompt end, choose
+the nearest eligible message boundary to each target, and deduplicate the
+results. Equal-distance ties choose the earlier boundary. Only selected boundaries
+interrupt prefill; unselected messages can share a full captured prefill chunk.
+The budget limits new captures, not existing reusable checkpoints or mandatory
+state transfers between conditioned-input windows.
+
 Endpoints are not rounded to token groups or KV pages. The scheduler obtains a
-snapshot destination when it reaches an endpoint, using normal cache eviction.
+snapshot destination when it reaches a selected endpoint, using normal cache eviction.
 If all snapshot slots are pinned, inference continues without publishing that
 checkpoint. The number of messages does not enlarge the prepared snapshot pool.
 
@@ -1432,14 +1465,24 @@ request publishes additional shared ancestors.
 Track logical references separately from outstanding GPU use. A page or slot
 becomes reusable only after both have ended.
 
-Under snapshot pressure, evict unpinned leaves first. If every leaf is pinned,
-remove an ancestor checkpoint with exactly one child and no direct request pin:
+Under snapshot-only pressure, thin checkpoint chains before evicting their
+endpoints. A removable checkpoint has exactly one child and no direct request
+pin. Prefer interior checkpoints over chain roots, and remove the checkpoint
+whose surviving parent and child delimit the shortest token interval. Break
+equal-distance ties by least recent access. This retains sparse history coverage
+while preserving conversation endpoints during long prefills, including endpoints
+of idle conversations. If no chain can be thinned, evict the least recently
+used unpinned leaf, regardless of its age. Endpoint retention is a preference,
+not a reservation that can prevent progress when only endpoints remain.
+Under KV-page pressure, select the least recently used eligible
+leaf or removable ancestor and recheck physical backing after each retirement.
+
+Removing an ancestor transfers its storage without invalidating descendants:
 transfer its ordered page segment and last-use fence to that child, bypass the
 ancestor in the parent chain, and retire only the ancestor snapshot. Descendant
 checkpoint IDs, snapshots, and complete page chains remain valid. The removed
-prefix no longer matches lookups. This bounds snapshot consumption during long
-appended conversations without discarding the longest reusable prefix. Branching
-ancestors and directly pinned checkpoints retain their snapshots.
+prefix no longer matches lookups. Branching ancestors and directly pinned
+checkpoints retain their snapshots.
 
 Maintain resource-specific padding sentinels in the prepared metadata contract.
 Padding must never address another request's writable state.

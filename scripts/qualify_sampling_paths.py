@@ -1,19 +1,13 @@
-"""Measure captured production samplers on fingerprinted checkpoint logits."""
+"""Measure captured production samplers on saved Qwen checkpoint logits."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import importlib.machinery
 import json
 import math
 import os
-import subprocess
 import sys
-import time
-import traceback
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,47 +17,20 @@ REVISION = "dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2"
 SLOTS = (2, 0, 3, 1)
 
 
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def tensor_hash(tensor):
-    if tensor.device.type != "cpu":
-        raise ValueError("hashing requires an explicit CPU readback")
-    return hashlib.sha256(tensor.contiguous().reshape(-1).view(__import__("torch").uint8).numpy().tobytes()).hexdigest()
-
-
-def save(path, value):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
-
-
-def load_inputs(receipt_path, artifact_path):
+def load_inputs(path):
     import torch
 
-    receipt = json.loads(receipt_path.read_text())
-    if receipt.get("checkpoint") != {"repository": MODEL, "revision": REVISION}:
-        raise ValueError("decoder receipt does not identify the pinned checkpoint")
-    artifact_path = (artifact_path or Path(receipt["tensor_output"])).resolve()
-    actual = digest(artifact_path)
-    if actual != receipt.get("tensor_sha256"):
-        raise ValueError(f"decoder artifact SHA-256 mismatch: expected {receipt.get('tensor_sha256')}, observed {actual}")
-    artifact = torch.load(artifact_path, map_location="cpu", weights_only=True)
+    artifact = torch.load(path, map_location="cpu", weights_only=True)
     logits = artifact["logits"]
-    if artifact["prompt"] != receipt["prompt_tokens"] or artifact["tokens"] != receipt["generated_tokens"]:
-        raise ValueError("decoder artifact prompt/generated IDs differ from its receipt")
     if len(logits) != 4 or any(t.dtype != torch.bfloat16 or t.shape != (248320,)
                               or not bool(t.isfinite().all()) for t in logits):
-        raise ValueError("require four finite BF16 full-vocabulary decoder logits rows")
+        raise ValueError("require four finite BF16 full-vocabulary checkpoint logits rows")
     if [int(t.argmax()) for t in logits] != artifact["tokens"]:
         raise ValueError("recorded greedy tokens differ from the saved logits")
-    return artifact, {"receipt": str(receipt_path), "receipt_sha256": digest(receipt_path),
-        "artifact": str(artifact_path), "artifact_sha256": actual, "checkpoint": receipt["checkpoint"],
-        "prompt_tokens": artifact["prompt"], "generated_tokens": artifact["tokens"],
-        "logits": [{"row": i, "shape": list(t.shape), "dtype": str(t.dtype), "sha256": tensor_hash(t),
-            "top_k_20_survivors": int((t >= t.topk(20).values[-1]).sum())} for i, t in enumerate(logits)],
-        "model_numerical_reference": receipt.get("numerical_reference")}
+    if not artifact["prompt"] or any(type(t) is not int or not 0 <= t < 248320
+                                     for t in artifact["prompt"] + artifact["tokens"]):
+        raise ValueError("checkpoint prompt and generated tokens must be valid vocabulary IDs")
+    return artifact
 
 
 def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
@@ -88,9 +55,14 @@ def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
     state = {name: getattr(initial, name).clone() for name in initial.__dataclass_fields__}
     expected = {name: value.clone() for name, value in state.items()}
     trace = torch.full((steps, 4), -1, dtype=torch.int64)
-    records = torch.full((2, 4, 8), -99, dtype=torch.int64)
-    records[0].zero_()
-    records[0, :, 4] = -1
+    records = torch.full((2, 4, 24), -99, dtype=torch.int64)
+    def completion_record(epoch=0, consumed=0, generated=0, token=-1, status=0, *, active=False):
+        return torch.tensor([epoch, int(active), consumed, generated, token, status, 0, 0,
+            int(token >= 0), 0, 0, 0, -1, max(consumed - 1, 0) if active else 0,
+            0, 1, token, *([-1] * 7)], dtype=torch.int64)
+    records[0].copy_(completion_record().expand(4, -1))
+    emitted = torch.zeros((steps, 4), dtype=torch.int64)
+    vector_tokens = torch.full((steps, 4), -1, dtype=torch.int64)
     sampled_rows = [0] * steps
     consumed_rows = [0] * steps
     terminals = []
@@ -107,7 +79,9 @@ def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
         cdf = probabilities.cumsum(0).double()
         for step in range(steps):
             if int(expected["status"][slot]) != 1:
-                records[0, slot, 4] = -1
+                records[0, slot].copy_(completion_record(parameters[row].generation,
+                    int(expected["consumed_tokens"][slot]), int(expected["generated_tokens"][slot]),
+                    status=int(expected["status"][slot]), active=True))
                 continue
             counter = int(expected["rng_counter"][slot].item())
             word = philox4x32_reference(parameters[row].seed, counter)[0]
@@ -115,14 +89,16 @@ def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
             index = int(torch.searchsorted(cdf, torch.tensor(uniform, dtype=torch.float64), right=False))
             token = index if index < len(cdf) else int(torch.nonzero(probabilities > 0)[-1])
             trace[step, slot] = token
+            vector_tokens[step, slot] = token
+            emitted[step, slot] = 1
             sampled_rows[step] += 1
             consumed = int(expected["consumed_tokens"][slot])
             expected["generated_tokens"][slot] += 1
             expected["rng_counter"][slot] = counter + 1
             expected["histogram"][slot, token] += 1
             terminal = token in parameters[row].eos_token_ids
-            records[0, slot] = torch.tensor([parameters[row].generation, 1, consumed,
-                step + 1, token, 2 if terminal else 1, 0, 0], dtype=torch.int64)
+            records[0, slot].copy_(completion_record(parameters[row].generation, consumed,
+                int(expected["generated_tokens"][slot]), token, 2 if terminal else 1, active=True))
             if terminal:
                 expected["status"][slot] = 2
                 expected["pending_token"][slot] = token
@@ -134,7 +110,8 @@ def cpu_case(artifact, rows, block_steps, policy, *, one_sample=False):
             expected["ple_history"][slot] = torch.tensor([previous, token])
             expected["consumed_tokens"][slot] = consumed + 1
     expected = {"state." + name: value for name, value in expected.items()}
-    expected.update(sampled_ids=trace, completion_records=records)
+    expected.update(sampled_ids=trace, emitted_counts=emitted, vector_tokens=vector_tokens,
+                    completion_records=records)
     return {"name": f"{policy}-b{rows}-n{block_steps}" + ("-one-sample" if one_sample else ""),
         "rows": rows, "steps": steps, "budget_steps": block_steps, "policy": policy,
         "timing_scope": "one_active_sample" if one_sample else "block_with_terminal_semantics",
@@ -148,6 +125,7 @@ class CapturedCase:
         import torch
 
         from ignition.components.sampling import PreparedSampling
+        from ignition.components.completion import CompletionOutputs
         from ignition.components.token_state import PreparedTokenState
         from ignition.recipes.qwen38.sampling import DeviceRequestState
 
@@ -159,22 +137,28 @@ class CapturedCase:
         self.slots = torch.tensor(SLOTS[:rows], dtype=torch.int32, device="cuda")
         self.epochs = torch.tensor([31 + slot for slot in SLOTS[:rows]], dtype=torch.int64, device="cuda")
         self.live = torch.tensor([rows], dtype=torch.int32, device="cuda")
-        self.records = torch.full((2, 4, 8), -99, dtype=torch.int64, device="cuda")
+        self.completion = CompletionOutputs.allocate((2, 4, 24), device="cuda")
+        self.records = self.completion.records
+        self.records.fill_(-99)
         self.frame = torch.zeros(1, dtype=torch.int32, device="cuda")
         self.sequence = torch.ones(1, dtype=torch.int64, device="cuda")
         self.trace = torch.full((steps, 4), -1, dtype=torch.int64, device="cuda")
+        self.emitted = torch.zeros((steps, 4), dtype=torch.int64, device="cuda")
+        self.vector_tokens = torch.full((steps, 4), -1, dtype=torch.int64, device="cuda")
         self.tokens = torch.zeros(rows, dtype=torch.int64, device="cuda")
         self.spans = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
         self.sampler = PreparedSampling(self.logits, self.state, self.slots, self.epochs, self.live,
-            self.records, self.frame, self.sequence)
+            self.completion, self.frame, self.sequence)
         self.token_state = PreparedTokenState(self.state, self.tokens, self.spans, self.slots, self.epochs, self.live, history=self.state.ple_history, history_pad_id=248044)
         for name, value in case["initial"].items():
             getattr(self.state, name).copy_(value)
         self.sampler.prepare()
         self.token_state.prepare()
         self.buffers = {"state." + name: getattr(self.state, name) for name in self.state.__dataclass_fields__}
+        self.buffers.update(self.completion.buffers())
         self.buffers.update(logits=self.logits, slots=self.slots, epochs=self.epochs, live=self.live,
             completion_records=self.records, frame=self.frame, sequence=self.sequence, sampled_ids=self.trace,
+            emitted_counts=self.emitted, vector_tokens=self.vector_tokens,
             tokens=self.tokens, spans=self.spans, sample_enabled=self.sampler.sample_enabled)
         for name, tensor in self.sampler.scratch_tensors.items():
             self.buffers["sampler." + name] = tensor
@@ -205,6 +189,8 @@ class CapturedCase:
     def step(self, step):
         self.sampler()
         self.trace[step].copy_(self.records[0, :, 4])
+        self.emitted[step].copy_(self.records[0, :, 8])
+        self.vector_tokens[step].copy_(self.records[0, :, 16])
         self.token_state.gather()
         self.tokens.copy_(self.token_state.pending_tokens)
         self.token_state.consume()
@@ -226,55 +212,37 @@ def quantiles(values):
         "p90": quantile(.9), "p95": quantile(.95), "maximum": ordered[-1], "quantile_method": "linear"}
 
 
-def check_outputs(expected, observed, artifacts, label):
+def check_outputs(expected, observed):
     import torch
 
-    hashes, failures = {}, []
     for name, reference in expected.items():
         actual = observed[name]
-        equal = actual.shape == reference.shape and actual.dtype == reference.dtype and tensor_hash(actual) == tensor_hash(reference)
-        hashes[name] = tensor_hash(actual)
-        if not equal:
-            path = artifacts / f"{label}-{name}.pt"
-            torch.save({"expected": reference, "actual": actual}, path)
-            failures.append({"tensor": name, "expected_sha256": tensor_hash(reference),
-                "actual_sha256": hashes[name], "artifact": str(path), "artifact_sha256": digest(path)})
-    return hashes, failures
+        assert actual.shape == reference.shape and actual.dtype == reference.dtype, name
+        assert torch.equal(actual.contiguous().view(torch.uint8),
+                           reference.contiguous().view(torch.uint8)), f"state mismatch: {name}"
 
 
-def measure(args, artifact, cases, receipt):
-    import flare_heliopause
+def measure(args, artifact, cases):
     import torch
 
     from ignition.preparation.graphs import PreparedGraphBundle
 
     if not args.gpu_uuid or os.environ.get("CUDA_VISIBLE_DEVICES") != args.gpu_uuid:
-        raise ValueError("GPU execution requires --gpu-uuid matching the single assigned CUDA_VISIBLE_DEVICES UUID")
+        raise ValueError("--gpu-uuid must match the single assigned CUDA_VISIBLE_DEVICES UUID")
     if not args.gpu_uuid.startswith("GPU-"):
         raise ValueError("GPU selection must use its explicit UUID")
-    package = Path(flare_heliopause.__file__).resolve()
-    extensions = [p for p in package.parent.iterdir() if any(p.name.endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES)]
-    if len(extensions) != 1:
-        raise ValueError("cannot identify one native extension")
-    receipt["native_extension"] = {"path": str(extensions[0]), "sha256": digest(extensions[0])}
-    receipt["device"] = {"uuid": args.gpu_uuid, "name": torch.cuda.get_device_name(0),
-        "capability": list(torch.cuda.get_device_capability(0)), "torch_cuda_version": torch.version.cuda}
-    query = ["nvidia-smi", "--id=" + args.gpu_uuid,
-        "--query-gpu=uuid,name,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw", "--format=csv,noheader"]
-    receipt["device"]["before"] = subprocess.run(query, check=True, text=True, capture_output=True).stdout.strip()
+    actual_uuid = str(torch.cuda.get_device_properties(0).uuid)
+    if actual_uuid.removeprefix("GPU-") != args.gpu_uuid.removeprefix("GPU-"):
+        raise ValueError(f"CUDA UUID {actual_uuid} differs from assigned {args.gpu_uuid}")
     stream = torch.cuda.Stream()
-    owners = []
-    for case in cases:
-        print("CAPTURE", case["name"], flush=True)
-        owners.append(CapturedCase(case, artifact, stream))
-    graphs = {owner.name + suffix: graph for owner in owners for suffix, graph in (("-reset", owner.reset_graph), ("-sample", owner.graph))}
+    owners = [CapturedCase(case, artifact, stream) for case in cases]
+    graphs = {owner.name + suffix: graph for owner in owners
+              for suffix, graph in (("-reset", owner.reset_graph), ("-sample", owner.graph))}
     buffers = {owner.name + "." + name: tensor for owner in owners for name, tensor in owner.buffers.items()}
     bundle = PreparedGraphBundle(device=0, graphs=graphs, buffers=buffers, resources=(*owners, stream))
-    receipt["graph_handles"] = {name: graph.raw_cuda_graph_exec() for name, graph in graphs.items()}
-    receipt["capture_allocated_bytes"] = torch.cuda.memory_allocated()
-    receipt["observations"] = []
-    receipt["timings"] = {owner.name: [] for owner in owners}
-    save(args.output, receipt)
+    timings = {owner.name: [] for owner in owners}
+    observations = []
+    worker = bundle.start_worker()
 
     def replay(name):
         ticket = worker.submit(bundle.graph_indices[name])
@@ -282,11 +250,8 @@ def measure(args, artifact, cases, receipt):
         if result is None or result.ticket != ticket or result.error is not None:
             raise RuntimeError(f"native replay did not complete {name}: {result}")
 
-    worker = None
     try:
-        worker = bundle.start_worker()
         for iteration in range(args.warmup + args.repetitions):
-            # Reverse case order between repetitions.
             order = owners if iteration % 2 == 0 else list(reversed(owners))
             for owner in order:
                 before = torch.cuda.memory_stats()["allocation.all.allocated"]
@@ -294,116 +259,57 @@ def measure(args, artifact, cases, receipt):
                 replay(owner.name + "-sample")
                 after = torch.cuda.memory_stats()["allocation.all.allocated"]
                 elapsed = owner.start.elapsed_time(owner.end)
-                if not math.isfinite(elapsed) or elapsed <= 0:
-                    raise RuntimeError("CUDA timing events did not report a positive finite duration")
-                observed = owner.readback()
-                label = f"{owner.name}-iteration{iteration}"
-                hashes, failures = check_outputs(owner.case["expected"], observed, args.artifacts, label)
-                record = {"name": owner.name, "iteration": iteration, "warmup": iteration < args.warmup,
-                    "allocation_count_before": before, "allocation_count_after": after,
-                    "elapsed_block_ms": elapsed, "sampled_lane_tokens": owner.case["sampled_lane_tokens"],
-                    "state_sha256": hashes, "sampled_ids": observed["sampled_ids"].tolist(), "failures": failures}
-                if owner.case["steps"] == 1:
-                    record["elapsed_per_active_batch_step_ms"] = elapsed / owner.case["steps"]
-                receipt["observations"].append(record)
+                assert math.isfinite(elapsed) and elapsed > 0
+                check_outputs(owner.case["expected"], owner.readback())
+                assert before == after, f"replay allocation in {owner.name}: {before} -> {after}"
+                observation = dict(name=owner.name, iteration=iteration, warmup=iteration < args.warmup,
+                    elapsed_block_ms=elapsed, sampled_lane_tokens=owner.case["sampled_lane_tokens"],
+                    consumed_lane_tokens=owner.case["consumed_lane_tokens"])
+                observations.append(observation)
+                print(json.dumps(observation), flush=True)
                 if iteration >= args.warmup:
-                    receipt["timings"][owner.name].append(elapsed)
-                save(args.output, receipt)
-                if failures or after != before:
-                    raise AssertionError(f"sampler correctness/allocation failure in {label}; receipt preserves details")
-            print(f"CHECKED block repetition {iteration + 1}/{args.warmup + args.repetitions}", flush=True)
-        receipt["summary_block_ms"] = {name: quantiles(values) for name, values in receipt["timings"].items()}
-        receipt["summary_active_batch_step_ms"] = {owner.name:
-            quantiles([value / owner.case["steps"] for value in receipt["timings"][owner.name]])
-            for owner in owners if owner.case["steps"] == 1}
-        receipt["passed"] = True
+                    timings[owner.name].append(elapsed)
     finally:
-        try:
-            if worker is not None:
-                worker.close()
-                receipt["native_worker_closed"] = True
-        except Exception as error:
-            receipt["native_worker_closed"] = False
-            receipt["close_error"] = repr(error)
-            receipt["passed"] = False
-            raise
-        finally:
-            save(args.output, receipt)
-    receipt["device"]["after"] = subprocess.run(query, check=True, text=True, capture_output=True).stdout.strip()
-    receipt["native_extension_unchanged"] = digest(extensions[0]) == receipt["native_extension"]["sha256"]
-    if not receipt["native_extension_unchanged"]:
-        raise AssertionError("native extension changed during qualification")
+        worker.close()
+    result = dict(checkpoint=dict(repository=MODEL, revision=REVISION),
+        input=str(args.logits_artifact), gpu_uuid=actual_uuid, observations=observations,
+        summary_block_ms={name: quantiles(values) for name, values in timings.items()},
+        summary_active_batch_step_ms={owner.name: quantiles(timings[owner.name])
+                                     for owner in owners if owner.case["steps"] == 1})
+    if args.output is not None:
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--receipt", type=Path, required=True)
-    parser.add_argument("--logits-artifact", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--artifacts", type=Path, required=True)
-    parser.add_argument("--validate-only", action="store_true", help="Verify provenance and build exact CPU state oracles without initializing CUDA.")
+    parser.add_argument("--logits-artifact", type=Path, required=True,
+        help=f"Saved four-row BF16 decoder logits from {MODEL} at {REVISION}; no generated substitutes.")
+    parser.add_argument("--output", type=Path, help="Raw timing measurements as JSON.")
+    parser.add_argument("--validate-only", action="store_true",
+        help="Load checkpoint logits and construct CPU state oracles without CUDA initialization.")
     parser.add_argument("--gpu-uuid")
     parser.add_argument("--blocks", nargs="+", type=int, choices=(32, 64), default=(32, 64))
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=20)
     args = parser.parse_args()
-    if args.output.exists() or (args.artifacts.exists() and any(args.artifacts.iterdir())):
-        parser.error("output and artifact destinations must not contain an earlier run")
+    if not args.logits_artifact.is_file():
+        parser.error(f"saved checkpoint logits are unavailable: {args.logits_artifact}")
+    if args.output is not None and args.output.exists():
+        parser.error("output already exists")
     if args.warmup < 1 or args.repetitions < 5 or len(set(args.blocks)) != len(args.blocks):
         parser.error("require at least one warmup, five repetitions and unique block sizes")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.artifacts.mkdir(parents=True, exist_ok=True)
-    (args.artifacts / Path(__file__).name).write_bytes(Path(__file__).read_bytes())
     import torch
-    import triton
 
     torch.set_num_threads(2)
-    import importlib.metadata
-    import importlib.util
-    flashinfer_root = Path(importlib.util.find_spec("flashinfer").origin).resolve().parent
-    source_paths = [Path(__file__).resolve(), ROOT / "ignition/recipes/qwen38/sampling.py", ROOT / "ignition/preparation/graphs.py", *(
-        flashinfer_root / relative for relative in ("sampling.py", "jit/sampling.py", "utils.py", "data/csrc/sampling.cu",
-        "data/include/flashinfer/sampling.cuh", "data/include/flashinfer/air_top_p.cuh"))]
-    receipt = {"schema": "flare-sampling-path-qualification-v2", "sampling_policy": "flashinfer_top_k_top_p_min_p_philox_v1", "flashinfer": importlib.metadata.version("flashinfer-python"), "historical_baseline": "sampling-paths-original.json", "started_at": datetime.now(timezone.utc).isoformat(),
-        "passed": False, "mode": "cpu_validation" if args.validate_only else "native_cuda_measurement",
-        "command": sys.argv, "python": sys.version, "torch": torch.__version__, "triton": triton.__version__,
-        "source_sha256": {str(path): digest(path) for path in source_paths}, "warmup_blocks": args.warmup,
-        "measured_blocks": args.repetitions, "limitations": [
-            "Operator measurement on recorded checkpoint logits; excludes vocabulary projection, transformer computation and HTTP/runtime scheduling.",
-            "Timed blocks include production sampler, sampled-ID trace copy, pending-token gather/copy/consume and CUDA graph event scope.",
-            "Each block reuses fixed logits with neutral penalties; captured copies reset independent request state outside the timed span.",
-            "Stochastic block timings retain EOS and inactive iterations and are not divided by block length as fully active latency; one-sample captures measure active default sampling separately.",
-            "Model arithmetic acceptance remains unresolved; these logits are fingerprinted execution artifacts, not an independent model oracle."]}
-    started = time.monotonic()
-    try:
-        artifact, provenance = load_inputs(args.receipt.resolve(), args.logits_artifact)
-        receipt["inputs"] = provenance
-        cases = [cpu_case(artifact, rows, steps, "checkpoint_defaults")
-                 for rows in (1, 2, 4) for steps in args.blocks]
-        cases.extend(cpu_case(artifact, rows, steps, "checkpoint_defaults", one_sample=True)
-                     for rows in (1, 2, 4) for steps in args.blocks)
-        receipt["cases"] = [{key: value for key, value in case.items() if key not in ("initial", "expected")}
-            | {"expected_sha256": {name: tensor_hash(value) for name, value in case["expected"].items()},
-               "expected_sampled_ids": case["expected"]["sampled_ids"].tolist()} for case in cases]
-        if args.validate_only:
-            if torch.cuda.is_initialized():
-                raise AssertionError("CPU-only validation initialized CUDA")
-            receipt["cuda_initialized"] = False
-            receipt["passed"] = True
-        else:
-            measure(args, artifact, cases, receipt)
-        receipt["sources_unchanged"] = all(digest(path) == value for path, value in receipt["source_sha256"].items())
-        if not receipt["sources_unchanged"]:
-            raise AssertionError("measurement sources changed during execution")
-    except Exception:
-        receipt["passed"] = False
-        receipt["failure"] = traceback.format_exc()
-        raise
-    finally:
-        receipt["elapsed_seconds"] = time.monotonic() - started
-        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
-        save(args.output, receipt)
-        print(json.dumps({"output": str(args.output), "passed": receipt["passed"], "mode": receipt["mode"]}), flush=True)
+    artifact = load_inputs(args.logits_artifact)
+    cases = [cpu_case(artifact, rows, steps, "checkpoint_defaults", one_sample=one_sample)
+             for rows in (1, 2, 4) for steps in args.blocks for one_sample in (False, True)]
+    if args.validate_only:
+        assert not torch.cuda.is_initialized()
+        print(json.dumps(dict(passed=True, cases=len(cases), cuda_initialized=False)))
+    else:
+        measure(args, artifact, cases)
 
 
 if __name__ == "__main__":

@@ -44,12 +44,15 @@ class RecordedPreparationSession(PreparationSession):
     All kernels prepare in one batch using b12x's declaration coalescing and
     compiler pool. Finalizers bind the selected plans after the shared scratch
     arena has its serving capacity.
+
+    Selected plans materialize without per-operation priming. Complete forwards
+    warm their execution paths before capture; tuning candidates still prime.
     """
 
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="medium"):
+                 tuning_replica=None, autotune_effort="medium", native_dense_activations=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
@@ -61,9 +64,10 @@ class RecordedPreparationSession(PreparationSession):
         identity.update(checkpoint=checkpoint, workload_schema=workload_schema,
                         numerical_policy=numerical_policy)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
+        self.native_dense_activations = native_dense_activations
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
-                             namespace=identity, race_budget=race_budget,
+                             namespace=identity, race_budget=race_budget, prime=False,
                              collective_barrier=None if coordinator is None else coordinator.barrier)
         if type(headroom_bytes) is not int or headroom_bytes < 0:
             raise ValueError("headroom_bytes must be a nonnegative byte count")
@@ -358,6 +362,7 @@ class RecordedPreparationSession(PreparationSession):
             self.tuning_report = {
                 "workload_schema": self._workload_schema, "namespace": self.namespace.to_dict(),
                 "autotune_effort": self.autotune_effort,
+                "native_dense_activations": self.native_dense_activations,
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,

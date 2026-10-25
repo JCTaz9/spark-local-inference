@@ -12,9 +12,10 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
 
     speculation = plan.speculation
     drafting = {} if speculation is None else {
-        "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
+        "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_graph_budget": speculation.graph_budget or 64, "speculative_fixed_width": speculation.fixed_width}
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        native_dense_activations=plan.native_dense_activations,
         devices=tuple(range(plan.world_size)), compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk,
@@ -40,7 +41,7 @@ RECIPE = Recipe(
         stored_bytes=566_027_990_784, device_bytes=568_511_624_448, draft_bytes=5_536_632_576,
         expansion_bytes=14 << 30),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     ranks=MappingProxyType({world: RankCosts(33_816_576 // world, 3_276_800 // world, 8 << 30)
                             for world in (2, 4, 8)}),

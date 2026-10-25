@@ -2,6 +2,8 @@
 
 use super::format::*;
 use crate::Result;
+use crate::package::schema::wire as payload;
+use std::collections::HashMap;
 
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
@@ -28,17 +30,11 @@ pub(super) fn size(value: u64) -> Result<usize> {
 }
 
 pub(super) fn serving_contract(
-    mut value: wire::ServingContract,
-    prepared_concurrency: u64,
+    value: wire::ServingContract,
+    _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if let Some(vision) = value
-        .model_contract
-        .as_mut()
-        .and_then(|model| model.vision.as_mut())
-    {
-        if vision.max_images > 0 && vision.feature_slots == 0 {
-            vision.feature_slots = prepared_concurrency;
-        }
+    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 2) {
+        return Err(invalid("unsupported prepared model contract version; re-export the model package"));
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
     value.as_object_mut().unwrap().retain(|_, v| !v.is_null());
@@ -259,6 +255,7 @@ pub(super) fn decode(value: wire::BundleIndex) -> Result<Package> {
                 alignment: size(v.alignment)?,
                 file: v.file,
                 data_spans: convert(v.data_spans, |v| Ok([size(v.offset)?, size(v.nbytes)?]))?,
+                sources: vec![],
                 relocations: convert(v.relocations, relocation)?,
                 address: v.address,
                 memory: match wire::Memory::try_from(v.memory) {
@@ -345,50 +342,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn packed_rows_preserve_absent_field_semantics_and_honor_explicit_bounds() {
-        // Serialized verification metadata predating the separate physical-row field.
-        let bytes = b"\x12\x0cverification\x20\x08\x28\x06";
-        let legacy = wire::ExecutionGraph::decode(bytes.as_slice()).unwrap();
-        assert_eq!(legacy.packed_token_capacity, 0);
-        assert_eq!(legacy.packed_tokens(), 48);
-        let mut encoded = bytes.to_vec();
-        encoded.extend_from_slice(b"\x68\x18");
-        let packed = wire::ExecutionGraph::decode(encoded.as_slice()).unwrap();
-        assert_eq!(packed.packed_tokens(), 24);
-        assert_eq!(packed.token_capacity, 6);
-        let mut json = serde_json::to_value(&legacy).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("packed_token_capacity");
-        let restored: wire::ExecutionGraph = serde_json::from_value(json).unwrap();
-        assert_eq!(restored.packed_tokens(), 48);
-    }
-
-    #[test]
-    fn omitted_vision_slots_inherit_prepared_concurrency() {
-        for (prepared, slots, images, expected) in
-            [(16, 0, 4, 16), (3, 0, 4, 3), (16, 4, 4, 4), (16, 0, 0, 0)]
-        {
-            let value = wire::ServingContract {
-                max_active: Some(2),
-                model_contract: Some(wire::ModelContract {
-                    vision: Some(wire::VisionCapacity {
-                        feature_slots: slots,
-                        max_images: images,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            let decoded = wire::ServingContract::decode(value.encode_to_vec().as_slice()).unwrap();
-            let json = serving_contract(decoded, prepared).unwrap();
-            assert_eq!(json["model_contract"]["vision"]["feature_slots"], expected);
-            assert_eq!(json["max_active"], 2);
-        }
-    }
-
     fn defaults() -> wire::DefaultSamplingParameters {
         wire::DefaultSamplingParameters {
             seed: Some(u64::MAX),
@@ -424,9 +377,10 @@ mod tests {
     fn serialized_sampling_without_ranges_preserves_defaults() {
         // DefaultSamplingParameters fields 1 through 8, without field 9.
         let bytes = [
-            0x08, 0x00, 0x15, 0x00, 0x00, 0x80, 0x3f, 0x18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0x01, 0x25, 0x33, 0x33, 0x73, 0x3f, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x35, 0x00,
-            0x00, 0x80, 0x3f, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x00, 0x00,
+            0x08, 0x00, 0x15, 0x00, 0x00, 0x80, 0x3f, 0x18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x01, 0x25, 0x33, 0x33, 0x73, 0x3f, 0x2d, 0x00, 0x00, 0x00, 0x00,
+            0x35, 0x00, 0x00, 0x80, 0x3f, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x45, 0x00, 0x00, 0x00,
+            0x00,
         ];
         let decoded = wire::DefaultSamplingParameters::decode(bytes.as_slice()).unwrap();
         assert!(decoded.ranges.is_none());
@@ -482,7 +436,8 @@ mod tests {
             (Some(f32::NAN), Some(1.5)),
             (Some(0.5), Some(f32::INFINITY)),
         ] {
-            value.ranges.as_mut().unwrap().temperature = Some(wire::SamplingFloatRange { min, max });
+            value.ranges.as_mut().unwrap().temperature =
+                Some(wire::SamplingFloatRange { min, max });
             assert!(
                 sampling_defaults(value.clone()).is_err(),
                 "{min:?}..={max:?}"
@@ -606,8 +561,13 @@ mod tests {
         {
             let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
             let settings = frontend.image.unwrap();
-            assert_eq!(settings.preparation_kind(), crate::model::contract::ImagePreparationKind::Glm);
-            let processor = crate::frontend::images::ImageProcessor::load(settings, Default::default()).unwrap();
+            assert_eq!(
+                settings.preparation_kind(),
+                crate::model::contract::ImagePreparationKind::Glm
+            );
+            let processor =
+                crate::frontend::images::ImageProcessor::load(settings, Default::default())
+                    .unwrap();
             assert_eq!(processor.geometry(112, 112).unwrap().tokens, 16);
         }
     }
@@ -669,37 +629,61 @@ mod tests {
     #[test]
     fn serialized_scored_prefill_preserves_operation_and_prompt_target_values() {
         // GraphContract(kind=12) and ValueBinding(source=39) predate packed rounds.
-        let graph = wire::GraphContract::decode(b"\x0a\x05score\x12\x0d\x0a\x07targets\x10\x27\x18\x04\x40\x0c".as_slice()).unwrap();
+        let graph = wire::GraphContract::decode(
+            b"\x0a\x05score\x12\x0d\x0a\x07targets\x10\x27\x18\x04\x40\x0c".as_slice(),
+        )
+        .unwrap();
         let contract: crate::model::contract::GraphContract =
             serde_json::from_value(serde_json::to_value(graph).unwrap()).unwrap();
-        assert_eq!(contract.kind, crate::model::contract::GraphOperation::ScoredPrefill);
-        assert_eq!(contract.inputs[0].source, crate::model::contract::ValueSource::PromptTargetToken);
-        assert_eq!(contract.inputs[0].indexing, crate::model::contract::InputIndexing::PackedToken);
-        let execution = wire::ExecutionGraph::decode(b"\x12\x0escored_prefill\x20\x01\x28\x40".as_slice()).unwrap();
-        assert_eq!(crate::execution::GraphKind::try_from(execution.kind.as_str()).unwrap(),
-            crate::execution::GraphKind::ScoredPrefill);
+        assert_eq!(
+            contract.kind,
+            crate::model::contract::GraphOperation::ScoredPrefill
+        );
+        assert_eq!(
+            contract.inputs[0].source,
+            crate::model::contract::ValueSource::PromptTargetToken
+        );
+        assert_eq!(
+            contract.inputs[0].indexing,
+            crate::model::contract::InputIndexing::PackedToken
+        );
+        let execution =
+            wire::ExecutionGraph::decode(b"\x12\x0escored_prefill\x20\x01\x28\x40".as_slice())
+                .unwrap();
+        assert_eq!(
+            crate::execution::GraphKind::try_from(execution.kind.as_str()).unwrap(),
+            crate::execution::GraphKind::ScoredPrefill
+        );
         assert_eq!(execution.draft_tokens, None);
         assert_eq!(execution.packed_tokens(), 64);
     }
 
     #[test]
-    fn packed_combined_metadata_is_additive_and_unknown_operations_are_rejected() {
-        let legacy = wire::ExecutionGraph::decode(b"\x12\x0cverification\x20\x08\x28\x06".as_slice()).unwrap();
-        assert_eq!(legacy.draft_tokens, None);
-        assert_eq!(legacy.verify_tokens, None);
-        assert_eq!(legacy.packed_token_capacity, 0);
-        assert_eq!(crate::model::contract::GraphOperation::try_from(11).unwrap(),
-            crate::model::contract::GraphOperation::Verification);
-        assert_eq!(crate::model::contract::ValueSource::try_from(5).unwrap(),
-            crate::model::contract::ValueSource::QueryLength);
-        assert!(crate::model::contract::GraphOperation::try_from(99).is_err());
-        assert!(crate::model::contract::ValueSource::try_from(99).is_err());
-        let graph = wire::ExecutionGraph { kind: "packed_speculative".into(),
-            batch_capacity: 32, token_capacity: 6, draft_tokens: Some(1), verify_tokens: Some(6),
-            packed_token_capacity: 128, draft_source: 1, ..Default::default() };
+    fn unified_generation_rejects_removed_operations_and_preserves_geometry() {
+        for operation in [0, 10, 11, 13, 99] {
+            assert!(crate::model::contract::GraphOperation::try_from(operation).is_err());
+        }
+        for kind in ["proposal", "verification", "packed_speculative"] {
+            assert!(crate::execution::GraphKind::try_from(kind).is_err());
+        }
+        let graph = wire::ExecutionGraph {
+            kind: "speculative".into(), batch_capacity: 32, token_capacity: 6,
+            draft_tokens: Some(7), verify_tokens: Some(6), packed_token_capacity: 128,
+            draft_source: 1, ..Default::default()
+        };
         let restored = wire::ExecutionGraph::decode(graph.encode_to_vec().as_slice()).unwrap();
         assert_eq!((restored.draft_tokens, restored.verify_tokens, restored.packed_token_capacity),
-            (Some(1), Some(6), 128));
+            (Some(7), Some(6), 128));
+    }
+
+    #[test]
+    fn prepared_contract_versions_require_reexport() {
+        for version in [0, 1, 3] {
+            let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
+                version, ..Default::default()
+            }), ..Default::default() };
+            assert!(serving_contract(value, 4).unwrap_err().to_string().contains("re-export"));
+        }
     }
 
     #[cfg(feature = "server")]
@@ -804,5 +788,445 @@ mod tests {
         )
         .unwrap();
         assert!(syntax.tools.is_none() && syntax.reasoning.is_none());
+    }
+}
+
+/// Adapt one authenticated payload-package rank into the loader's runtime description.
+///
+/// Payload identity and binding are already authenticated by `package::protection`; this function
+/// only translates validated payload-relative records into the resource keys and data spans the
+/// shared loader consumes. Every resource key it creates names an open container and a byte range
+/// the caller resolved, so reads never depend on a persisted logical-file layout.
+pub(super) fn payload_rank(
+    rank: &payload::RankBody,
+    architecture: [i32; 2],
+    placements: &Placements,
+) -> Result<Package> {
+    let mut resources: HashMap<String, wire::Span> = HashMap::new();
+    let mut span_for = |key: String, use_: &payload::PayloadUse| -> Result<String> {
+        let slice = use_
+            .slice
+            .as_ref()
+            .ok_or_else(|| invalid("payload use has no slice"))?;
+        let placement = placements
+            .get(slice.payload_id.as_slice())
+            .ok_or_else(|| invalid("bound payload has no physical placement"))?;
+        let offset = placement
+            .offset
+            .checked_add(slice.offset)
+            .ok_or_else(|| invalid("payload placement offset overflow"))?;
+        if slice
+            .offset
+            .checked_add(slice.nbytes)
+            .is_none_or(|end| end > placement.nbytes)
+        {
+            return Err(invalid("payload slice exceeds its placed payload"));
+        }
+        resources.insert(
+            key.clone(),
+            wire::Span {
+                filename: placement.token.clone(),
+                offset,
+                nbytes: slice.nbytes,
+            },
+        );
+        Ok(key)
+    };
+
+    let mut allocations = Vec::with_capacity(rank.allocations.len());
+    let mut by_allocation: HashMap<&str, Vec<(u64, u64, Source)>> = HashMap::new();
+    for (index, initializer) in rank.initializers.iter().enumerate() {
+        let use_ = initializer
+            .source
+            .as_ref()
+            .ok_or_else(|| invalid("initializer has no source"))?;
+        let slice = use_
+            .slice
+            .as_ref()
+            .ok_or_else(|| invalid("initializer source has no slice"))?;
+        let key = span_for(format!("initializer/{index}"), use_)?;
+        by_allocation
+            .entry(initializer.allocation.as_str())
+            .or_default()
+            .push((
+                initializer.destination_offset,
+                slice.nbytes,
+                Source {
+                    resource: key,
+                    offset: 0,
+                    nbytes: slice.nbytes,
+                },
+            ));
+    }
+    for allocation in &rank.allocations {
+        let mut spans = by_allocation
+            .remove(allocation.name.as_str())
+            .unwrap_or_default();
+        spans.sort_by_key(|(offset, _, _)| *offset);
+        allocations.push(Allocation {
+            name: allocation.name.clone(),
+            nbytes: size(allocation.nbytes)?,
+            alignment: size(allocation.alignment)?,
+            file: None,
+            data_spans: spans
+                .iter()
+                .map(|(offset, nbytes, _)| Ok([size(*offset)?, size(*nbytes)?]))
+                .collect::<Result<Vec<_>>>()?,
+            sources: spans.into_iter().map(|(_, _, source)| source).collect(),
+            relocations: convert(allocation.relocations.clone(), relocation)?,
+            address: allocation.address,
+            memory: match wire::Memory::try_from(allocation.memory) {
+                Ok(wire::Memory::Device) => Memory::Device,
+                Ok(wire::Memory::MappedHost) => Memory::MappedHost,
+                Ok(wire::Memory::Peer) => Memory::Peer,
+                Err(_) => return Err(invalid("unknown protobuf memory kind")),
+            },
+            sizing: allocation.sizing.clone(),
+        });
+    }
+
+    let mut executable_keys = Vec::with_capacity(rank.resources.len());
+    for resource in &rank.resources {
+        let use_ = payload::PayloadUse {
+            slice: resource.stored.clone(),
+            role: payload::PayloadRole::Kernels as i32,
+        };
+        executable_keys.push(span_for(
+            format!("executable/{}", resource.resource_id),
+            &use_,
+        )?);
+    }
+
+    let mut modules = Vec::with_capacity(rank.modules.len());
+    for (module_index, module) in rank.modules.iter().enumerate() {
+        let cubin = executable_keys
+            .get(module.cubin as usize)
+            .ok_or_else(|| invalid("module cubin reference is outside the rank"))?
+            .clone();
+        let mut globals = Vec::with_capacity(module.globals.len());
+        for (global_index, global) in module.globals.iter().enumerate() {
+            let contents = global
+                .contents
+                .as_ref()
+                .ok_or_else(|| invalid("module global has no contents"))?;
+            // Structural indices, not names: bounded names may contain any separator character,
+            // so string concatenation could collide two distinct globals.
+            let key = span_for(format!("global/{module_index}/{global_index}"), contents)?;
+            globals.push(Global {
+                symbol: global.symbol.clone(),
+                file: key,
+                nbytes: size(global.nbytes)?,
+                relocations: convert(global.relocations.clone(), relocation)?,
+            });
+        }
+        modules.push(Module {
+            name: module.name.clone(),
+            file: cubin,
+            globals,
+        });
+    }
+
+    let functions = rank
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(id, function)| {
+            Ok(Function {
+                id,
+                module: function.module.clone(),
+                symbol: function.symbol.clone(),
+                parameter_sizes: convert(function.parameter_sizes.clone(), size)?,
+                attributes: function
+                    .attributes
+                    .iter()
+                    .map(|value| [value.id, value.value])
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let graphs = rank
+        .graphs
+        .iter()
+        .map(|graph| {
+            Ok(Graph {
+                name: graph.name.clone(),
+                flags: graph.flags,
+                resource: executable_keys
+                    .get(graph.resource as usize)
+                    .ok_or_else(|| invalid("graph resource reference is outside the rank"))?
+                    .clone(),
+                node_count: size(graph.node_count)?,
+                edge_count: size(graph.edge_count)?,
+                functions: convert(graph.functions.clone(), size)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let context = rank
+        .context
+        .clone()
+        .ok_or_else(|| invalid("rank has no CUDA context description"))?;
+    let package = Package {
+        resources,
+        architecture,
+        allocations,
+        modules,
+        functions,
+        graphs,
+        reservations: convert(rank.reservations.clone(), |value| {
+            Ok(Reservation {
+                address: value.address,
+                nbytes: size(value.nbytes)?,
+            })
+        })?,
+        execution: rank.execution.clone(),
+        context: Context {
+            flags: context.flags,
+            cache: context.cache,
+            limits: convert(context.limits, |value| {
+                Ok([size(value.id)?, size(value.value)?])
+            })?,
+        },
+        events: rank.events.clone(),
+    };
+    Ok(package)
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    fn placement(token: &str, offset: u64, nbytes: u64) -> Placement {
+        Placement {
+            token: token.into(),
+            offset,
+            nbytes,
+        }
+    }
+    fn use_of(id: u8, offset: u64, nbytes: u64) -> payload::PayloadUse {
+        payload::PayloadUse {
+            slice: Some(payload::PayloadSlice {
+                payload_id: vec![id; 32],
+                offset,
+                nbytes,
+            }),
+            role: payload::PayloadRole::Weights as i32,
+        }
+    }
+
+    fn rank() -> payload::RankBody {
+        payload::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(wire::Context::default()),
+            reservations: vec![wire::Reservation {
+                address: 0x1000_0000,
+                nbytes: 8192,
+            }],
+            allocations: vec![payload::Allocation {
+                name: "weights".into(),
+                nbytes: 8192,
+                alignment: 4096,
+                address: Some(0x1000_0000),
+                memory: wire::Memory::Device as i32,
+                sizing: None,
+                relocations: vec![],
+            }],
+            // Deliberately out of destination order and drawn from two different payloads: the
+            // adapter must order destinations and keep each source exact.
+            initializers: vec![
+                payload::Initializer {
+                    allocation: "weights".into(),
+                    destination_offset: 4096,
+                    source: Some(use_of(2, 16, 4096)),
+                },
+                payload::Initializer {
+                    allocation: "weights".into(),
+                    destination_offset: 0,
+                    source: Some(use_of(1, 0, 4096)),
+                },
+            ],
+            payloads: vec![],
+            resources: vec![payload::ExecutableResource {
+                resource_id: 9,
+                kind: payload::ExecutableKind::Graph as i32,
+                stored: Some(payload::PayloadSlice {
+                    payload_id: vec![3; 32],
+                    offset: 0,
+                    nbytes: 32,
+                }),
+                decoded_nbytes: 16,
+                chunk_nbytes: 4 << 20,
+                chunk_sha256: vec![vec![0; 32]],
+            }],
+            modules: vec![payload::Module {
+                name: "model".into(),
+                cubin: 0,
+                globals: vec![payload::ModuleGlobal {
+                    symbol: "constant".into(),
+                    nbytes: 8,
+                    contents: Some(payload::PayloadUse {
+                        slice: Some(payload::PayloadSlice {
+                            payload_id: vec![4; 32],
+                            offset: 8,
+                            nbytes: 8,
+                        }),
+                        role: payload::PayloadRole::InitialState as i32,
+                    }),
+                    relocations: vec![],
+                }],
+            }],
+            functions: vec![payload::Function {
+                module: "model".into(),
+                symbol: "kernel".into(),
+                parameter_sizes: vec![8, 8],
+                attributes: vec![],
+            }],
+            graphs: vec![payload::Graph {
+                name: "decode".into(),
+                flags: 0,
+                resource: 0,
+                node_count: 1,
+                edge_count: 0,
+                functions: vec![0],
+            }],
+            events: vec!["ready".into()],
+            peers: vec![],
+            execution: None,
+            roce: None,
+            prepared_weights: None,
+        }
+    }
+
+    #[test]
+    fn payload_rank_keeps_every_initializer_source_exact() {
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 100, 4096)),
+            (vec![2u8; 32], placement("weights-b", 200, 8192)),
+            (vec![3u8; 32], placement("graphs", 4096, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        let package = payload_rank(&rank(), [12, 0], &placements).unwrap();
+        package.validate().unwrap();
+        let allocation = &package.allocations[0];
+        assert!(allocation.is_payload_bound());
+        assert!(allocation.file.is_none());
+        assert_eq!(allocation.data_spans, vec![[0, 4096], [4096, 4096]]);
+        assert_eq!(
+            allocation.sources,
+            vec![
+                Source {
+                    resource: "initializer/1".into(),
+                    offset: 0,
+                    nbytes: 4096,
+                },
+                Source {
+                    resource: "initializer/0".into(),
+                    offset: 0,
+                    nbytes: 4096,
+                },
+            ]
+        );
+        let first = &package.resources["initializer/1"];
+        assert_eq!(
+            (first.filename.as_str(), first.offset, first.nbytes),
+            ("weights-a", 100, 4096)
+        );
+        let second = &package.resources["initializer/0"];
+        // Payload-relative slice offsets add to the container-relative placement.
+        assert_eq!(
+            (second.filename.as_str(), second.offset, second.nbytes),
+            ("weights-b", 216, 4096)
+        );
+        let executable = &package.resources["executable/9"];
+        assert_eq!(
+            (executable.filename.as_str(), executable.offset),
+            ("graphs", 4096)
+        );
+        assert_eq!(package.modules[0].file, "executable/9");
+        assert_eq!(package.modules[0].globals[0].file, "global/0/0");
+        assert_eq!(package.resources["global/0/0"].offset, 8);
+        assert_eq!(package.graphs[0].resource, "executable/9");
+        assert_eq!(package.graphs[0].functions, vec![0]);
+        assert_eq!(package.functions[0].parameter_sizes, vec![8, 8]);
+        assert_eq!(package.context.limits.len(), 0);
+        assert_eq!(package.events, vec!["ready".to_string()]);
+    }
+
+    #[test]
+    fn module_global_keys_do_not_depend_on_name_concatenation() {
+        let mut body = rank();
+        body.modules = vec![
+            payload::Module {
+                name: "a".into(),
+                cubin: 0,
+                globals: vec![payload::ModuleGlobal {
+                    symbol: "b:c".into(),
+                    nbytes: 8,
+                    contents: Some(payload::PayloadUse {
+                        slice: Some(payload::PayloadSlice {
+                            payload_id: vec![4; 32],
+                            offset: 0,
+                            nbytes: 8,
+                        }),
+                        role: payload::PayloadRole::InitialState as i32,
+                    }),
+                    relocations: vec![],
+                }],
+            },
+            payload::Module {
+                name: "a:b".into(),
+                cubin: 0,
+                globals: vec![payload::ModuleGlobal {
+                    symbol: "c".into(),
+                    nbytes: 8,
+                    contents: Some(payload::PayloadUse {
+                        slice: Some(payload::PayloadSlice {
+                            payload_id: vec![4; 32],
+                            offset: 8,
+                            nbytes: 8,
+                        }),
+                        role: payload::PayloadRole::InitialState as i32,
+                    }),
+                    relocations: vec![],
+                }],
+            },
+        ];
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 100, 4096)),
+            (vec![2u8; 32], placement("weights-b", 200, 8192)),
+            (vec![3u8; 32], placement("graphs", 0, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        let package = payload_rank(&body, [12, 0], &placements).unwrap();
+        assert_eq!(package.modules[0].globals[0].file, "global/0/0");
+        assert_eq!(package.modules[1].globals[0].file, "global/1/0");
+        assert_eq!(package.resources["global/0/0"].offset, 0);
+        assert_eq!(package.resources["global/1/0"].offset, 8);
+    }
+
+    #[test]
+    fn payload_rank_rejects_slices_without_a_placement() {
+        let placements = Placements::from([(vec![1u8; 32], placement("weights-a", 0, 4096))]);
+        assert!(payload_rank(&rank(), [12, 0], &placements).is_err());
+    }
+
+    #[test]
+    fn payload_rank_rejects_a_slice_past_its_placed_payload() {
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 0, 4096)),
+            (vec![2u8; 32], placement("weights-b", 0, 4096)),
+            (vec![3u8; 32], placement("graphs", 0, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        assert!(payload_rank(&rank(), [12, 0], &placements).is_err());
+        let placements = Placements::from([
+            (vec![1u8; 32], placement("weights-a", 0, 4096)),
+            (vec![2u8; 32], placement("weights-b", 0, 8192)),
+            (vec![3u8; 32], placement("graphs", 0, 64)),
+            (vec![4u8; 32], placement("globals", 0, 32)),
+        ]);
+        payload_rank(&rank(), [12, 0], &placements).unwrap();
     }
 }

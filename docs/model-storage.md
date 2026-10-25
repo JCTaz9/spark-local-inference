@@ -2,7 +2,9 @@
 
 The private model bucket is `s3://flare-models-555824081510-us-west-2/` in
 `us-west-2`. Public access is blocked, object ownership is bucket-owner enforced,
-and default encryption uses S3-managed AES-256 keys. Incomplete multipart uploads
+and default encryption uses S3-managed AES-256 keys. Executable package storage uses
+one zstd level-3 frame per resource; S3-managed encryption remains separate
+storage-at-rest protection. Incomplete multipart uploads
 expire after seven days; completed objects do not expire.
 
 Run the threaded uploader from the repository root. `uv` supplies its Boto3 and

@@ -18,6 +18,14 @@ Recipe and execution-component changes also require
   plans through `register_finalizer`. Scratch sizing and serving bindings must
   follow tuning.
 
+`RecordedPreparationSession` uses `PreparationSession(prime=False)`. Selected
+plans still materialize, construct prepare-call bindings, retain owners, and
+run restore/close hooks, but skip the call's reset, activation production, and
+execution. Factories must construct required resources without depending on
+those execution hooks. Tuning candidates and retained benchmark calls still
+prime. Complete-forward warmup in `capture_forwards` runs every selected variant
+before the session's capture guard forbids further kernel resolution.
+
 ## Startup progress
 
 - Show startup work through `ignition.progress.phase`. Weight loading and kernel
@@ -52,7 +60,9 @@ and retained owners to `flare_heliopause`. Recipes describe file-backed table
 ranges and generated frontend text without creating package files or payload
 offsets. Heliopause records CUPTI resources, traverses graphs and pointer-bearing
 storage, downloads retained bytes, serializes resources, and owns asset writes,
-hashing, encryption, signing, conversion, rank payload transfer, and publication.
+hashing, zstd level-3 executable compression, signing, conversion, rank payload
+transfer, and publication. Each executable resource is one zstd level-3 frame
+with a signed decoded length and compressed-chunk commitments.
 Keep captured buffers, contexts, graph templates, and kernel owners alive until
 native work confirms a drain; an unsuccessful drain retains their owners.
 

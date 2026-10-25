@@ -177,3 +177,62 @@ def test_noncausal_draft_block_attends_to_future_positions_without_crossing_requ
                 sm_scale=512 ** -.5, attn_sink=sink, swa_page_size=span, cache_format="deepseek_v41")
             torch.testing.assert_close(output.float(), expected.float(), atol=.012, rtol=.08)
         graph.reset()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("world", [3, 4])
+def test_recipe_requests_replay_full_table_rows_with_tp_projection_ownership(world):
+    from types import SimpleNamespace
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.recipes.deepseek41.engram import Tables, PreparedTableRequests
+
+    device = torch.device("cuda:0")
+    tokens, rows = 12, 3
+    geometry = engram.build_geometry(layer_ids=(1,), base_table_size=101, compressed_vocab_size=32)
+    token_map = tuple(range(32))
+    frame = torch.zeros(1, dtype=torch.int32, device=device)
+    inputs = EngramInputs.allocate(tokens, device, timings=ReadinessTimings.allocate(frame, 1))
+    ids = torch.tensor([13, 5, 7, 28, 13, 8, 2, 1, 5, 7, 9, 1], device=device)
+    starts = torch.tensor([0, 3, 3, 9], dtype=torch.int32, device=device)
+    histories = torch.tensor([[2, 2, 2], [9, 10, 11], [5, 7, 8]], device=device)
+    stored_history = torch.cat((torch.zeros((1, 3), dtype=torch.int64, device=device), histories))
+    counts = torch.tensor([9, rows], dtype=torch.int32, device=device)
+    metadata = SimpleNamespace(token_ids=ids, query_start_loc=starts, live_counts=counts,
+        starts=torch.full((rows,), 3, dtype=torch.int32, device=device),
+        state_rows=torch.arange(1, rows + 1, dtype=torch.int32, device=device))
+    sequence = torch.ones(1, dtype=torch.int64, device=device)
+    mailbox = MappedHostAllocation((tokens * 24 + 1,), torch.int64, device)
+    tables = Tables(geometry, token_map, {}, {1: inputs}, {1: mailbox}, sequence,
+                    TensorParallelShard(world - 1, world), None)
+    pool = SimpleNamespace(region=lambda name: stored_history)
+    try:
+        with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+            operation = PreparedTableRequests(tables, metadata, pool, session=session, name="shared_table_requests")
+            compiled = compile_forward(operation)
+            compiled()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graph):
+                compiled()
+            for generation in (2, 3, 4):
+                sequence.fill_(generation)
+                ids.add_(1).remainder_(32)
+                mailbox.host_view.fill_(-1)
+                before = torch.cuda.memory_stats(device)
+                graph.replay()
+                torch.cuda.synchronize()
+                after = torch.cuda.memory_stats(device)
+                for key in ("allocation.all.allocated", "allocation.all.freed",
+                            "segment.all.allocated", "segment.all.freed"):
+                    assert before[key] == after[key]
+
+                expected = hash_reference(ids[:9].tolist(), [True] * 9, starts.tolist(), list(range(rows)),
+                    histories.tolist(), token_map, geometry, 1)
+                actual = mailbox.host_view[:-1].view(tokens, 24)
+                assert mailbox.host_view[-1].item() == generation
+                assert torch.equal(actual[:9], expected)
+                assert actual[9:].eq(-1).all()
+                assert actual[:9].ge(0).all()
+            graph.reset()
+    finally:
+        mailbox.close()

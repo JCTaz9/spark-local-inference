@@ -492,22 +492,46 @@ impl PrefixCheckpointCache {
         Ok(self.retire_leaf(id))
     }
 
-    /// Retire the oldest eligible leaf or compactable ancestor under either pressure.
+    /// Thin dense checkpoint chains before retiring endpoints under snapshot pressure.
     /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let mut report = EvictionReport::default();
         while report.pages_scheduled < target.pages || report.snapshots_scheduled < target.snapshots
         {
-            let candidate = self
-                .nodes
-                .values()
-                .filter(|node| {
-                    node.ready
-                        && ((node.pins == 0 && node.child_count == 0)
-                            || (node.direct_pins == 0 && node.child_count == 1))
+            let interior = (target.pages == 0)
+                .then(|| {
+                    self.nodes
+                        .values()
+                        .filter_map(|child| {
+                            let parent = self.nodes.get(&child.parent?)?;
+                            (parent.ready && parent.direct_pins == 0 && parent.child_count == 1)
+                                .then_some((parent, child))
+                        })
+                        .min_by_key(|(node, child)| {
+                            let start = node
+                                .parent
+                                .map_or(0, |id| self.nodes[&id].prefix.consumed_tokens);
+                            (
+                                node.parent.is_none(),
+                                child.prefix.consumed_tokens - start,
+                                node.accessed,
+                                node.id,
+                            )
+                        })
+                        .map(|(node, _)| node.id)
                 })
-                .min_by_key(|node| (node.accessed, node.id))
-                .map(|node| node.id);
+                .flatten();
+            let candidate = interior.or_else(|| {
+                self.nodes
+                    .values()
+                    .filter(|node| {
+                        node.ready
+                            && ((node.pins == 0 && node.child_count == 0)
+                                || (node.direct_pins == 0 && node.child_count == 1))
+                    })
+                    .min_by_key(|node| (node.accessed, node.id))
+                    .map(|node| node.id)
+            });
             let Some(id) = candidate else {
                 break;
             };

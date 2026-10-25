@@ -51,14 +51,17 @@ fn export_capture(
                         .map(serde_json::from_value::<super::protection::PublisherRequest>)
                         .transpose()?
                         .map(|p| p.publisher())
-                        .transpose()?;
-                    super::package::publish(
+                        .transpose()?
+                        .ok_or_else(|| super::invalid("export requires a publisher identity"))?;
+                    super::package::publish_payload(
                         &request.path,
-                        output.index.clone(),
-                        output.payload.clone(),
-                        publisher.as_ref(),
-                        &request.options,
-                        request.shard_size,
+                        std::slice::from_ref(&output),
+                        output.index.peer_memory.clone(),
+                        output.index.cluster.clone(),
+                        &publisher,
+                        request.options.cache.clone(),
+                        request.options.no_weights,
+                        "directory",
                     )?;
                 }
                 Ok(())
@@ -181,19 +184,14 @@ pub(crate) fn execution(
             .get("speculation_enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if kind == "packed_speculative" {
+        if kind == "speculative" || kind == "mixed" && speculative {
+            if !graph.contains_key("draft_tokens") {
+                return Err(super::invalid("speculative graph lacks explicit proposal depth"));
+            }
             graph.insert("verify_tokens".into(), width.into());
             graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "speculative" || kind == "mixed" && speculative {
-            graph.insert("draft_tokens".into(), width.saturating_sub(1).into());
-            graph.insert("verify_tokens".into(), width.into());
-            graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "proposal" {
-            graph.insert("draft_tokens".into(), width.saturating_sub(1).into());
-            graph.insert("draft_source".into(), "MTP".into());
-        } else if kind == "verification" {
-            graph.insert("verify_tokens".into(), width.into());
         }
+
     }
     message("Execution", &value)
 }
@@ -429,39 +427,139 @@ fn append_planes(
 }
 
 #[pyclass(module = "flare_heliopause")]
-struct NativeExportStage {
+pub(crate) struct NativeExportStage {
     directory: std::sync::Mutex<Option<tempfile::TempDir>>,
+    cache: Option<std::path::PathBuf>,
+    leases: std::sync::Mutex<Vec<crate::package::cache::PayloadObject>>,
     #[pyo3(get)]
     path: String,
+}
+
+impl NativeExportStage {
+    /// Retain payload object leases for the export's lifetime.
+    ///
+    /// A closed stage rejects retention instead of accepting leases it will drop
+    /// with its workspace, so the caller learns immediately.
+    pub(crate) fn retain_payload_leases(
+        &self,
+        leases: crate::export::PayloadLeases,
+    ) -> super::Result<()> {
+        let directory = self
+            .directory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if directory.is_none() {
+            return Err(super::invalid("export stage is closed"));
+        }
+        // Hold the lifecycle lock while extending the leases, in the same order
+        // `close` takes them (directory, then leases), so a concurrent close cannot
+        // clear the leases between the check and the extension.
+        let mut held = self
+            .leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        held.extend(leases.0);
+        drop(directory);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(cache: Option<std::path::PathBuf>, closed: bool) -> Self {
+        Self {
+            directory: std::sync::Mutex::new(if closed {
+                None
+            } else {
+                Some(tempfile::tempdir().unwrap())
+            }),
+            cache,
+            leases: std::sync::Mutex::new(Vec::new()),
+            path: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_for_test(&self) -> usize {
+        self.leases.lock().unwrap().len()
+    }
 }
 
 #[pymethods]
 impl NativeExportStage {
     #[new]
-    #[pyo3(signature=(destination, staging=None))]
+    #[pyo3(signature=(destination=None, staging=None, cache=None))]
     fn new(
         py: Python<'_>,
-        destination: std::path::PathBuf,
+        destination: Option<std::path::PathBuf>,
         staging: Option<std::path::PathBuf>,
+        cache: Option<std::path::PathBuf>,
     ) -> PyResult<Self> {
         let directory = py
             .detach(|| -> super::Result<_> {
-                if destination.try_exists()? {
-                    return Err(super::invalid("export destination already exists"));
-                }
-                let parent = destination.parent().unwrap_or(std::path::Path::new("."));
-                std::fs::create_dir_all(parent)?;
-                let staging = staging.as_deref().unwrap_or(parent);
-                std::fs::create_dir_all(staging)?;
+                let workspace = staging_parent(destination.as_deref(), staging.as_deref(), cache.as_deref());
+                std::fs::create_dir_all(&workspace)?;
                 Ok(tempfile::Builder::new()
                     .prefix(".flare-export-")
-                    .tempdir_in(staging)?)
+                    .tempdir_in(workspace)?)
             })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             path: directory.path().to_string_lossy().into_owned(),
             directory: std::sync::Mutex::new(Some(directory)),
+            cache: cache.map(|path| path.to_path_buf()),
+            leases: std::sync::Mutex::new(Vec::new()),
         })
+    }
+    /// Reserve one rank's staged source path inside the live workspace.
+    fn rank_path(&self, py: Python<'_>, rank: usize) -> PyResult<String> {
+        let directory = self
+            .directory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let directory = directory
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("export stage is closed"))?;
+        if !py
+            .detach(|| directory.path().try_exists())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        {
+            return Err(PyRuntimeError::new_err("export stage is closed"));
+        }
+        Ok(directory
+            .path()
+            .join(format!("rank-{rank}.json"))
+            .to_string_lossy()
+            .into_owned())
+    }
+    /// Lease every cache payload named by staged rank sources.
+    ///
+    /// Python drops preparation leases when it closes the prepared model, so the
+    /// stage keeps its own leases until it is closed.
+    fn retain_sources(&self, py: Python<'_>, paths: Vec<std::path::PathBuf>) -> PyResult<usize> {
+        let cache = self
+            .cache
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("export stage has no package cache"))?;
+        let retained = py
+            .detach(|| -> super::Result<Vec<crate::package::cache::PayloadObject>> {
+                let root = crate::package::cache::Root::open(&cache)?;
+                let mut objects = Vec::new();
+                for path in paths {
+                    for id in super::package::source_payload_ids(&path)? {
+                        let object = root
+                            .payload(id)?
+                            .ok_or_else(|| super::invalid(format!("staged source names missing payload {id}")))?;
+                        objects.push(object);
+                    }
+                }
+                Ok(objects)
+            })
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let count = retained.len();
+        // Route through the checked lifecycle path so a concurrent close cannot
+        // accept leases after the stage has closed.
+        self.retain_payload_leases(crate::export::PayloadLeases(retained))
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        Ok(count)
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let directory = self
@@ -469,11 +567,69 @@ impl NativeExportStage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        self.leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         if let Some(directory) = directory {
             py.detach(|| directory.close())
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Directory that hosts the native export workspace.
+///
+/// An absent destination means a cache-only export: the workspace comes from
+/// explicit staging or the package cache. A relative destination with no
+/// directory component resolves to the current directory, never to an empty
+/// path.
+pub(crate) fn staging_parent(
+    destination: Option<&std::path::Path>,
+    staging: Option<&std::path::Path>,
+    cache: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    if let Some(staging) = staging.filter(|path| !path.as_os_str().is_empty()) {
+        return staging.to_path_buf();
+    }
+    if let Some(destination) = destination.filter(|path| !path.as_os_str().is_empty()) {
+        return destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+    }
+    cache
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf()
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::staging_parent;
+    use std::path::Path;
+
+    #[test]
+    fn staging_parent_normalizes_relative_and_absent_destinations() {
+        assert_eq!(
+            staging_parent(Some(Path::new("out/package")), Some(Path::new("stage")), Some(Path::new("cache"))),
+            Path::new("stage")
+        );
+        assert_eq!(staging_parent(Some(Path::new("package")), None, None), Path::new("."));
+        assert_eq!(
+            staging_parent(Some(Path::new("out/package")), None, None),
+            Path::new("out")
+        );
+        assert_eq!(
+            staging_parent(None, Some(Path::new("stage")), Some(Path::new("cache"))),
+            Path::new("stage")
+        );
+        assert_eq!(
+            staging_parent(None, None, Some(Path::new("cache"))),
+            Path::new("cache")
+        );
+        assert_eq!(staging_parent(None, None, None), Path::new("."));
     }
 }
 
@@ -710,18 +866,21 @@ mod tests {
     fn native_rank_emission_validates_resolved_rebuild_weights() {
         let request: super::super::CaptureRequest = serde_json::from_value(serde_json::json!({
             "path":"unused", "context":0, "graphs":[], "allocations":[], "execution":null,
-            "server":null, "package_data":null, "shard_size":67108864,
+            "server":null, "package_data":null,
             "rebuild_weights":{"version":1,"tensors":[{"name":"weight","dtype":"float32",
                 "element_bytes":4,"shape":[4],"stride":[1],"address":4096,"extent":16}],"unavailable":[]}
         })).unwrap();
         let (_, allocations) = rebuild_catalog();
         let output = super::super::RankOutput {
+            hardware: None,
+            payload_leases: Default::default(),
             index: super::super::wire::ModelIndex {
                 version: 4, ranks: vec![super::super::wire::BundleIndex { allocations, ..Default::default() }],
                 ..Default::default()
             },
             allocations: vec![serde_json::from_value(serde_json::json!({"name":"weights","address":4096,"nbytes":64})).unwrap()],
             payload: vec![], module_globals: vec![], external: vec![], staging: None,
+            weight_payload: None,
         };
         let mut valid = output.clone();
         finish_rank(&request, &mut valid).unwrap();
@@ -812,7 +971,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":3,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3}]});
+        let input = serde_json::json!({"abi_version":4,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));

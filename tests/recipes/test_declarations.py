@@ -19,11 +19,7 @@ GLM = resolve("glm-5.3-flash")
     ("qwen3.8-flash", 5, 34, {"mtp": True}),
     ("qwen3.8-27b", 5, 34, {"mtp": True}),
     ("glm-5.3-flash", 5, 34, {"mtp": True}),
-    ("deepseek-v4-flash", 5, 34, {}),
     ("step5-preview-nvfp4", 3, 24, {}),
-    ("mimo-v2.6-pro-mopd", 7, 44, {}),
-    ("kimi-k3-mxfp4-csf", 7, 44, {"draft_checkpoint": Path("dspark")}),
-    ("nemotron-bolt-24gb", 7, 44, {"draft_checkpoint": Path("lilicorr")}),
 ])
 def test_rectangular_recipe_defaults_prepare_bounded_speculative_coverage(alias, drafts, graphs, options):
     from importlib import import_module
@@ -375,5 +371,30 @@ def test_deepseek41_recipe_defaults_and_adapter_preserve_packed_gpu_planning(mon
             config.speculative_token_capacity, config.speculative_graph_budget,
             config.mla_compute_mode, config.expert_scale_compression) == expected
     assert config.prefill_chunk_size == 4096
-    assert config.dspark and config.split_speculation
+    assert config.dspark
     assert config.packed_verification and config.draft_prefix_selection == "gpu"
+
+
+@pytest.mark.parametrize("alias,options", [
+    ("deepseek-v4-flash", {}),
+    ("mimo-v2.6-pro-mopd", {}),
+    ("kimi-k3-mxfp4-csf", {"draft_checkpoint": Path("dspark")}),
+    ("nemotron-bolt-24gb", {"draft_checkpoint": Path("lilicorr")}),
+])
+def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, options):
+    from importlib import import_module
+
+    recipe = resolve(alias).recipe
+    selected = recipe.speculation
+    config = import_module(f"ignition.recipes.{recipe.name}.bootstrap").PreparationConfig(
+        max_active=recipe.concurrency, speculative_widths=selected.widths,
+        speculative_token_capacity=selected.token_capacity,
+        speculative_graph_budget=selected.graph_budget, **options)
+    assert selected.packed_verification and selected.graph_budget == 64
+    shapes = set(config.speculative_round_shapes)
+    assert {(batch, 1, batch) for batch in (1, 2, 4, 8, 16, 32)} <= shapes
+    assert (32, selected.draft_tokens + 1, 128) in shapes
+    assert any(batch * width > packed for batch, width, packed in shapes)
+    assert all(batch <= packed <= min(128, batch * width) for batch, width, packed in shapes)
+    assert config.decode_tokens == 128
+    assert config.decode_samples == 32 * (selected.draft_tokens + 1)

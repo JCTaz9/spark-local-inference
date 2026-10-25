@@ -100,18 +100,19 @@ class RuntimePackage:
             cubin_bytes=sum(len(image) for image in self.modules.values() if isinstance(image, bytes)))
 
     def write(self, path, graphs, *, execution=None, server=None, progress=None, package_data=None,
-              publisher=None, sources=False, shard_size=64 << 30, rebuild_weights=None, zero_ranges=()):
+              publisher=None, sources=False, rebuild_weights=None, zero_ranges=()):
         import flare_heliopause
         from .package_snapshot import _OPTIONS
-        from .rebuild_manifest import rebuild_weights_metadata
+        from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
 
         if any(isinstance(module, bytes) for module in self.modules.values()):
             raise ValueError("module images must be native recorder handles or cubin file paths")
         context, _ = flare_heliopause.current_context()
+        from ignition.components.weights import record_final_fp4_expert_provenance_all
+        record_final_fp4_expert_provenance_all()
+        # Absent cache configuration stays absent: the native exporter owns
+        # default destination and cache selection.
         cache = _OPTIONS.get()
-        if cache is None and publisher is not None:
-            from .package_snapshot import ExportOptions
-            cache = ExportOptions(Path(path).parent / ".flare-cache")
         request = dict(path=str(path), context=context, graphs=_graphs(graphs),
             allocations=[asdict(a) for a in self.allocations], kernels=[asdict(k) for k in self.kernels],
             modules={name: str(path) for name,path in self.modules.items()},
@@ -121,7 +122,8 @@ class RuntimePackage:
             transports=self.transports, device_address_floor=self.device_address_floor, execution=execution,
             server=server, package_data=None if package_data is None else package_data.export_metadata(),
             rebuild_weights=None if rebuild_weights is None else rebuild_weights_metadata(rebuild_weights),
-            zero_ranges=list(zero_ranges), sources=sources, shard_size=shard_size,
+            weight_payload=weight_payload_request(rebuild_weights),
+            zero_ranges=list(zero_ranges), sources=sources,
             options=_cache_options(cache))
         self.source_path = Path(path)
         self._capture(request, (self, self.owners, graphs), self.recorder)
@@ -156,12 +158,12 @@ def _publisher_metadata(publisher):
 
 
 def export_model(prepared, images, storage, path, *, options, progress=None, publisher=None, bundle_only=False,
-                 sources=False, shard_size=64 << 30):
+                 sources=False):
     """Hand captured handles and preparation metadata to the native exporter."""
     import flare_heliopause
     from .tensor_metadata import live_metadata
     from .package_snapshot import _OPTIONS
-    from .rebuild_manifest import rebuild_weights_metadata
+    from .rebuild_manifest import rebuild_weights_metadata, weight_payload_request
     from .memory_inventory import collect_inventory, print_inventory
 
     if storage.error is not None:
@@ -200,11 +202,12 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         for address, (size, kind) in images.allocations.items() if kind == "device")]
     numeric, parameter_layouts = live_metadata(
         numeric_bounds, storage.numeric_storage, prepared.buffers, zero_ranges=zero_ranges)
+    # Warmup/binding has finalized expert storage by export time.
+    from ignition.components.weights import record_final_fp4_expert_provenance_all
+    record_final_fp4_expert_provenance_all()
     context, _ = flare_heliopause.current_context()
+    # Absent cache configuration stays absent; the native exporter decides.
     cache = _OPTIONS.get()
-    if cache is None and publisher is not None:
-        from .package_snapshot import ExportOptions
-        cache = ExportOptions(Path(path).parent / ".flare-cache")
     request = dict(path=str(path), context=context, rank=storage.rank, granularity=storage.granularity,
         world_size=storage.world, local_ranks=storage.local_ranks,
         publisher=_publisher_metadata(publisher),
@@ -219,7 +222,8 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
-        options=_cache_options(cache), sources=sources, shard_size=shard_size)
+        weight_payload=weight_payload_request(getattr(prepared, "rebuild_weights", None)),
+        options=_cache_options(cache), sources=sources)
     package = RuntimePackage(allocations=allocations, modules={}, kernels=(), owners=(prepared, storage, images))
     package.source_path = Path(path)
     package._capture(request, package.owners, images.native)

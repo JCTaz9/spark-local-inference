@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -48,7 +50,7 @@ def _rank(rank, directory):
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.runtime_package import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
-    from tests.components.test_collective_transport_tp4_cuda import _expected, _operands
+    from tests.components.test_collective_transport_tp4_cuda import _expected, _operands, _selected_query
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -76,6 +78,12 @@ def _rank(rank, directory):
                     runtime=runtime, session=session, coordinator=coordinator, name=name)
                     for name, (width, rows) in shapes.items()}
                 session.tune(show_progress=False)
+                queries = {name: _selected_query(operation) for name, operation in operations.items()}
+                if rank == 0:
+                    for name, operation in operations.items():
+                        query = queries[name]
+                        print(f"{name}: {operation.plan.selection.config}; surface={query['surface']}; "
+                              f"transport={query['call'].get('transport')}", flush=True)
                 stream = torch.cuda.Stream(device=device)
                 graphs, signatures = {}, {}
                 for name, operation in operations.items():
@@ -113,9 +121,14 @@ def _rank(rank, directory):
                     group="KV_PAGES", maximum=16, units=16)
                 buffers = {"frame_index": torch.zeros(1, dtype=torch.int32, device=device),
                     "submission_sequence": torch.zeros(1, dtype=torch.int64, device=device),
-                    "completion_records": torch.zeros((2, 1, 8), dtype=torch.int64, device=device),
+                    "completion_records": torch.zeros((2, 1, 24), dtype=torch.int64, device=device),
                     "state_pool": state, "memory_capacity": torch.tensor([4, 16], device=device),
                     "pages": pages}
+                records = buffers["completion_records"]
+                records[..., 4] = -1
+                records[..., 12:14] = -1
+                records[..., 15] = 1
+                records[..., 16:] = -1
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{name}": value for name, value in outputs.items()})
                 prepared = PreparedExecution(device=rank, graphs=graphs, buffers=buffers,
@@ -131,7 +144,7 @@ def _rank(rank, directory):
                             values[rank].view(torch.uint8).numpy().tobytes())
                     for name, (width, rows) in shapes.items():
                         expected = _expected([value[:rows] for value in _operands(33, width, step)],
-                            rank, operations[name].plan.query.surface)
+                            rank, queries[name])
                         path = f"expected-{name}-{step}.bin"
                         (folder / path).write_bytes(expected.view(torch.uint8).numpy().tobytes())
                         cases.append(dict(graph=name, source=f"source-{width}", output=f"output-{name}",

@@ -124,8 +124,8 @@ def phase(progress, label, *, total=None, live=True):
             stage.live = Live(stage, console=display.console, refresh_per_second=8,
                               redirect_stdout=False, redirect_stderr=False)
             stage.live.start()
-        else:
-            display.console.print(stage)
+        elif live:
+            display.console.print(f"[ STARTED  ] {label}.", markup=False)
     elif progress is not None:
         progress(f"{label} started")
     try:

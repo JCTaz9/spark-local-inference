@@ -1,6 +1,6 @@
 //! Cost-bounded acquisition of request-local speculative yield observations.
 
-use super::{policy::{Candidate, bits}, utility::{LaneValue, ValueRate, best_cohort}, *};
+use super::{policy::{Candidate, bits}, utility::LaneValue, *};
 
 impl RequestScheduler {
     pub(super) fn optimistic_tokens(&self, request: &LiveRequest, width: usize) -> f64 {
@@ -10,58 +10,37 @@ impl RequestScheduler {
     pub(super) fn acceptance_probe(&self, ordinary: Candidate,
         values: &[LaneValue; REQUEST_LANES], age_price: f64) -> Option<Candidate> {
         let mut candidates = Vec::new();
-        if self.split.is_some() {
-            self.split_candidates(&mut candidates, values, age_price, true);
-            candidates.retain(|candidate| matches!(candidate.kind, GraphKind::Proposal | GraphKind::PackedSpeculative));
-        } else {
-            self.mixed_candidates(&mut candidates, values, age_price, true);
-            for batch in crate::execution::BATCH_CAPACITIES.into_iter()
-                .take_while(|batch| *batch <= self.limits.max_active.next_power_of_two()) {
-                for &width in &self.speculative_catalog[batch.ilog2() as usize] {
-                    let Some(nanos) = self.costs.duration(GraphKind::Speculative, batch, width) else { continue; };
-                    if width == 1 || nanos == 0 { continue; }
-                    let offers: Vec<_> = self.slots.iter().enumerate().filter_map(|(slot, entry)| {
-                        let request = entry.request.as_ref()?;
-                        (self.eligible(request) && self.request_kind(request) == Some(GraphKind::Speculative)).then(|| {
-                            let width = self.speculative_tokens(request, width);
-                            (slot, values[slot].decode(self.optimistic_tokens(request, width), nanos as f64 / 1e6))
-                        })
-                    }).collect();
-                    let mask = best_cohort::<REQUEST_LANES>(&offers, batch);
-                    if mask == 0 { continue; }
-                    let value = offers.iter().filter(|(slot, _)| mask & (1 << slot) != 0).map(|(_, value)| value).sum();
-                    candidates.push(Candidate { draft_tokens: 0, kind: GraphKind::Speculative, mask, batch, capacity: width,
-                        packed_token_capacity: 0, prefill_capacity: 0, prefill_slot: None, work: 0,
-                        duration_ns: nanos, rate: ValueRate::new(nanos, value, age_price), feedback: true,
-                        verification_budget: None });
-                }
-            }
-        }
+        self.packed_round_candidates(&mut candidates, values, age_price, true);
+        self.mixed_candidates(&mut candidates, values, age_price, true);
         let count = self.prune_padding(&mut candidates);
-        let observed_width = |candidate: Candidate, slot: usize| {
+        let observed_width = |candidate: Candidate, slot: usize, optimistic: bool| {
             if candidate.mask & (1 << slot) == 0 || candidate.prefill_slot == Some(slot)
-                || !matches!(candidate.kind, GraphKind::Speculative | GraphKind::Proposal | GraphKind::PackedSpeculative | GraphKind::Mixed) {
+                || !matches!(candidate.kind, GraphKind::Speculative | GraphKind::Mixed) {
                 1
             } else {
-                let width = if candidate.kind == GraphKind::PackedSpeculative {
-                    candidate.capacity.min(candidate.draft_tokens + 1)
-                } else { candidate.capacity };
-                self.speculative_tokens(self.slots[slot].request.as_ref().unwrap(), width)
+                if let Some(lengths) = candidate.host_lengths {
+                    usize::from(lengths[slot])
+                } else if candidate.packed_token_capacity != 0 {
+                    self.estimated_round_lengths(candidate.mask, candidate.batch, candidate.draft_tokens,
+                        candidate.capacity, candidate.packed_token_capacity, optimistic)[slot]
+                } else {
+                    self.speculative_tokens(self.slots[slot].request.as_ref().unwrap(), candidate.capacity)
+                }
             }
         };
         candidates[..count].iter().copied().filter(|candidate| {
             candidate.rate.duration_ns != 0 && candidate.rate.compare(ordinary.rate).is_gt()
                 && bits(candidate.mask).any(|slot| {
                     let request = self.slots[slot].request.as_ref().unwrap();
-                    let width = observed_width(*candidate, slot);
-                    width > observed_width(ordinary, slot)
+                    let width = observed_width(*candidate, slot, true);
+                    width > observed_width(ordinary, slot, false)
                         && request.max_new_tokens - request.generated_tokens > width as u32
                         && self.limits.max_sequence_tokens - request.scheduled_consumed as usize > width
                 })
         }).max_by(|a, b| {
             let gain = |candidate: &Candidate| (candidate.rate.score - ordinary.rate.score) / candidate.rate.duration_ns as f64;
             let information = |candidate: &Candidate| bits(candidate.mask).flat_map(|slot| {
-                (observed_width(ordinary, slot) - 1..observed_width(*candidate, slot) - 1)
+                (observed_width(ordinary, slot, false) - 1..observed_width(*candidate, slot, true) - 1)
                     .map(move |depth| self.speculative_information(self.slots[slot].request.as_ref().unwrap(), depth))
             }).fold(f64::INFINITY, f64::min);
             gain(a).total_cmp(&gain(b))

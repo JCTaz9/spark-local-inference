@@ -365,6 +365,9 @@ struct Source {
     size: u64,
     sha256: String,
     blob: bool,
+    /// Hex payload identity when the bytes are a cache object rather than a plain file.
+    #[serde(default)]
+    payload: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -472,12 +475,63 @@ fn completion(
     Ok(())
 }
 
+/// Declared payload objects resolved from the rank's live leases.
+///
+/// Declared weight groups hold their bytes in the shared model cache under a
+/// payload identity (`WeightPayloadGroup.payload_id`). Capture keeps those
+/// objects leased in `RankOutput.payload_leases`, so the sender reads the exact
+/// leased files rather than reopening paths from an identity string.
+pub(crate) fn cache_payload_sources(output: &RankOutput) -> Result<Vec<(PathBuf, String, u64)>> {
+    let mut sources = Vec::new();
+    let Some(weight) = output.weight_payload.as_ref() else {
+        return Ok(sources);
+    };
+    for group in weight
+        .groups
+        .iter()
+        .chain(std::iter::once(&weight.initial_state))
+    {
+        if group.payload_id.is_empty() {
+            continue;
+        }
+        let id: [u8; 32] = group
+            .payload_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("declared payload identity is not 32 bytes"))?;
+        let object = output
+            .payload_leases
+            .0
+            .iter()
+            .find(|object| object.id().as_bytes() == &id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "declared payload group {:?} has no leased cache object",
+                    group.name
+                ))
+            })?;
+        if object.length() != group.nbytes {
+            return Err(invalid(format!(
+                "declared payload group {:?} length differs from its leased object",
+                group.name
+            )));
+        }
+        let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+        sources.push((object.path().to_owned(), hex, group.nbytes));
+    }
+    Ok(sources)
+}
+
 pub(crate) fn send_rank(
     output: RankOutput,
     inventory: Value,
     control_fd: i32,
     channels: Vec<ChannelState>,
 ) -> Result<Vec<ChannelState>> {
+    // Hold the leases for the whole transfer: the rank's declared payload objects
+    // must outlive the manifest, the data channels, and the completion exchange.
+    let payload_leases = output.payload_leases.0.clone();
+    let _leased = payload_leases;
     if channels.is_empty() {
         return Err(invalid(
             "rank export requires established fabric channels; management payload transfer is forbidden",
@@ -518,6 +572,7 @@ pub(crate) fn send_rank(
                 size: file.metadata()?.len(),
                 sha256,
                 blob,
+                payload: None,
             },
         );
         identities.insert(path.clone(), before);
@@ -526,6 +581,36 @@ pub(crate) fn send_rank(
         "{} files, {hashed_bytes} bytes hashed",
         files.len()
     ));
+    // Cache-backed declared payloads: one leased object per declared group.
+    let objects = cache_payload_sources(&output)?;
+    for (path, hex, _length) in &objects {
+        if files.contains_key(path) {
+            continue;
+        }
+        let _transaction = FileTransaction::acquire(FileDirection::Send, 3)?;
+        let file = Arc::new(super::io::open_read(path)?);
+        let before = super::io::Identity::of(&file)?;
+        let mut digest = Sha256::new();
+        let source = super::io::Source::from_file(file.clone(), 0, file.metadata()?.len())?;
+        budget.scan(&source, |bytes| {
+            digest.update(bytes);
+            hashed_bytes += bytes.len() as u64;
+            Ok(())
+        })?;
+        if super::io::Identity::of(&file)? != before {
+            return Err(invalid("cached payload object changed during metadata scan"));
+        }
+        files.insert(
+            path.clone(),
+            Source {
+                size: file.metadata()?.len(),
+                sha256: format!("{:x}", digest.finalize()),
+                blob: false,
+                payload: Some(hex.clone()),
+            },
+        );
+        identities.insert(path.clone(), before);
+    }
     let mut control = Socket::borrow(control_fd)?;
     send_control(
         &mut control,
@@ -598,6 +683,12 @@ pub(crate) struct ReceiveOutput {
     #[cfg(test)]
     #[serde(skip_serializing)]
     pub output: RankOutput,
+    /// Live leases for the payload objects this receive installed.
+    ///
+    /// The coordinator must move these into its retained export stage before the
+    /// outputs are dropped, otherwise a later `combine` can find the objects gone.
+    #[serde(skip)]
+    pub leases: crate::export::PayloadLeases,
     pub inventory: Value,
     pub channels: Vec<ChannelState>,
     pub stats: Value,
@@ -614,6 +705,55 @@ impl ReceiveProgress {
         self.phase.advance(count);
         self.phase.detail(format!("{} bytes received", *bytes));
     }
+}
+
+/// Verify an already-present cache object by payload identity and declared length.
+///
+/// A cached container may be any valid wrapper of the same payload bytes, so the
+/// payload digest and the declared group length are authoritative here; the
+/// transport container digest only proves what this transfer carried.
+fn verify_cached_payload(
+    cache: &Path,
+    id: helios_core::package::PayloadId,
+    length: u64,
+) -> Result<helios_core::package::cache::PayloadObject> {
+    let root = helios_core::package::cache::Root::open(cache)?;
+    let object = root
+        .payload(id)?
+        .ok_or_else(|| invalid("cached payload object disappeared"))?;
+    if object.length() != length {
+        return Err(invalid("cached payload object has the wrong length"));
+    }
+    if object.slice().digest()? != id {
+        return Err(invalid("cached payload object does not match its identity"));
+    }
+    Ok(object)
+}
+
+/// Adopt a received cache payload object under its signed payload identity.
+///
+/// The staged file is a complete companion container; its payload bytes are
+/// verified against the declared identity by the cache insertion path, so a
+/// corrupt or mislabelled object never enters the cache.
+fn install_payload_object(
+    cache: &Path,
+    id: helios_core::package::PayloadId,
+    length: u64,
+    partial: &Path,
+) -> Result<helios_core::package::cache::PayloadObject> {
+    let root = helios_core::package::cache::Root::open(cache)?;
+    let container = helios_core::package::container::Container::open(partial)?;
+    let slice = container.tensor(helios_core::package::container::COMPANION_TENSOR)?;
+    if slice.len() != length {
+        return Err(invalid(
+            "received payload object length differs from its declared group",
+        ));
+    }
+    let object = root.store_slice(Some(id), &slice)?;
+    if object.length() != length {
+        return Err(invalid("received payload object has the wrong length"));
+    }
+    Ok(object)
 }
 
 fn receive_rank(
@@ -655,19 +795,83 @@ fn receive_rank(
             .ok_or_else(|| invalid("rank export destination has no parent"))?,
     )?;
     let store = super::blob::BlobStore::new(cache, budget.clone())?;
+    let installed: std::sync::Mutex<Vec<helios_core::package::cache::PayloadObject>> =
+        std::sync::Mutex::new(Vec::new());
     let progress = helios_core::startup::StartupProgress::silent();
     let cache_phase = progress.phase("Verify rank export cache", None);
     let mut cached_bytes = 0;
     let mut cached_files = 0;
     let mut targets = BTreeMap::new();
     let mut requested = Vec::new();
+    // Declared cache payload identities, parsed before any path is formed.
+    let mut declared_objects: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+    if let Some(sources) = manifest.output.weight_payload.as_ref() {
+        for group in sources
+            .groups
+            .iter()
+            .chain(std::iter::once(&sources.initial_state))
+        {
+            if group.payload_id.is_empty() {
+                continue;
+            }
+            let id: [u8; 32] = group
+                .payload_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("declared payload identity is not 32 bytes"))?;
+            // Byte-identical groups legitimately share one payload identity; only
+            // conflicting lengths for one identity are invalid.
+            match declared_objects.entry(id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(group.nbytes);
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    if *slot.get() != group.nbytes {
+                        return Err(invalid(
+                            "declared payload identity has conflicting group lengths",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let mut object_sources: BTreeMap<[u8; 32], &Source> = BTreeMap::new();
+    for (name, info) in &manifest.files {
+        let Some(hex) = &info.payload else {
+            continue;
+        };
+        let id = helios_core::package::PayloadId::parse(hex)
+            .map_err(|_| invalid("rank export payload identity is invalid"))?;
+        let Some(length) = declared_objects.get(id.as_bytes()) else {
+            return Err(invalid("rank export carries an undeclared payload object"));
+        };
+        if *length == 0 || info.size == 0 || info.size > 64 << 30 {
+            return Err(invalid("invalid declared payload object size"));
+        }
+        let _ = name;
+        object_sources.insert(*id.as_bytes(), info);
+    }
+    if object_sources.len() != declared_objects.len() {
+        return Err(invalid(
+            "declared payload objects are missing from the rank export inventory",
+        ));
+    }
     let referenced: BTreeSet<_> = manifest
         .output
         .payload
         .iter()
         .map(|p| p.source.path.clone())
         .collect();
-    if referenced != manifest.files.keys().cloned().collect() {
+    // Cache-backed declared payload objects are inventory entries that no logical
+    // payload part references, so both sets together must describe the manifest.
+    let objects: BTreeSet<_> = manifest
+        .files
+        .iter()
+        .filter(|(_, info)| info.payload.is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    let declared: BTreeSet<_> = referenced.union(&objects).cloned().collect();
+    if declared != manifest.files.keys().cloned().collect() {
         return Err(invalid(
             "rank export file inventory differs from payload sources",
         ));
@@ -683,7 +887,9 @@ fn receive_rank(
         {
             return Err(invalid("invalid rank export file digest or size"));
         }
-        let target = if info.blob {
+        let target = if let Some(hex) = &info.payload {
+            cache.join("blobs").join(format!("{hex}.safetensors"))
+        } else if info.blob {
             store.root.join(format!("{}.safetensors", info.sha256))
         } else {
             request
@@ -694,7 +900,17 @@ fn receive_rank(
         };
         if target.try_exists()? {
             let _transaction = FileTransaction::acquire(FileDirection::Receive, 3)?;
-            super::blob::verify_file(&target, digest_bytes(&info.sha256)?, info.size, &budget)?;
+            if let Some(hex) = &info.payload {
+                let id = helios_core::package::PayloadId::parse(hex)?;
+                let length = declared_objects[id.as_bytes()];
+                let object = verify_cached_payload(cache, id, length)?;
+                installed
+                    .lock()
+                    .map_err(|_| invalid("payload lease lock poisoned"))?
+                    .push(object);
+            } else {
+                super::blob::verify_file(&target, digest_bytes(&info.sha256)?, info.size, &budget)?;
+            }
             cached_bytes += info.size;
             cached_files += 1;
             cache_phase.advance(info.size);
@@ -705,6 +921,11 @@ fn receive_rank(
             if info.blob && no_weights {
                 return Err(invalid(
                     "--no-weights requires the peer stored-data blob in the coordinator cache",
+                ));
+            }
+            if info.payload.is_some() && no_weights {
+                return Err(invalid(
+                    "--no-weights requires the peer payload object in the coordinator cache",
                 ));
             }
             requested.push(name.clone());
@@ -784,6 +1005,19 @@ fn receive_rank(
                         fs::Permissions::from_mode(0o444)
                     })?;
                 }
+                if info.payload.is_some() {
+                    let id = helios_core::package::PayloadId::parse(
+                        info.payload.as_deref().unwrap_or_default(),
+                    )?;
+                    let object = install_payload_object(
+                        cache,
+                        id,
+                        declared_objects[id.as_bytes()],
+                        &partial,
+                    )?;
+                    installed.lock().map_err(|_| invalid("payload lease lock poisoned"))?.push(object);
+                    return Ok(());
+                }
                 match fs::hard_link(&partial, target) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -807,6 +1041,9 @@ fn receive_rank(
         part.source.path = targets[&part.source.path].clone();
     }
     manifest.output.staging = None;
+    let leases = crate::export::PayloadLeases(
+        installed.into_inner().map_err(|_| invalid("payload lease lock poisoned"))?,
+    );
     {
         let _transaction = FileTransaction::acquire(FileDirection::Receive, 1)?;
         super::package::write_sources(&request.destination, &manifest.output)?;
@@ -819,6 +1056,7 @@ fn receive_rank(
     Ok(ReceiveOutput {
         #[cfg(test)]
         output: manifest.output,
+        leases,
         inventory: manifest.inventory,
         channels,
         stats: json!({"payload_bytes":size,"payload_seconds":seconds,"payload_gbps":size as f64 * 8.0 / seconds.max(f64::MIN_POSITIVE) / 1e9,"files":requested.len(),"streams":count,"transport":"fabric-tcp","cached_bytes":cached_bytes,"cached_files":cached_files}),
@@ -964,6 +1202,9 @@ fn export_receive_ranks(
     cache: PathBuf,
     no_weights: bool,
     owners: pyo3::Py<pyo3::PyAny>,
+    // Required, not optional: a caller without a stage would silently drop the
+    // received payload leases before `combine` runs.
+    stage: pyo3::PyRef<'_, super::binding::NativeExportStage>,
 ) -> pyo3::PyResult<String> {
     use pyo3::types::PyAnyMethods;
     if owners.bind(py).is_none() {
@@ -974,13 +1215,19 @@ fn export_receive_ranks(
     let requests = serde_json::from_str(requests)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let mut lease = crate::lifetime::OwnerLease(Some(owners));
-    let result = py.detach(move || -> Result<String> {
-        Ok(serde_json::to_string(&receive_ranks(
-            requests, &cache, no_weights,
-        )?)?)
-    });
+    let result = py.detach(move || receive_ranks(requests, &cache, no_weights));
     drop(lease.take_after_drain());
-    result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    let mut outputs =
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    // Move received payload leases into the retained export stage while the
+    // outputs still own them, so `combine` cannot lose the objects afterwards.
+    for output in outputs.iter_mut() {
+        stage
+            .retain_payload_leases(std::mem::take(&mut output.leases))
+            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
+    }
+    serde_json::to_string(&outputs)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
 
 pub(crate) fn register(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
@@ -1032,6 +1279,8 @@ mod tests {
     }
     fn output(path: PathBuf, length: u64) -> RankOutput {
         RankOutput {
+            payload_leases: Default::default(),
+            hardware: None,
             index: super::super::wire::ModelIndex {
                 version: 4,
                 ranks: vec![Default::default()],
@@ -1049,6 +1298,7 @@ mod tests {
             module_globals: vec![],
             external: vec![],
             staging: None,
+            weight_payload: None,
         }
     }
     fn roundtrip(
@@ -1087,6 +1337,261 @@ mod tests {
             }
         })
     }
+    /// Roundtrip of a rank whose declared payload objects are leased by the sender.
+    fn roundtrip_with_cache(
+        directory: &Directory,
+        name: &str,
+        source: &RankOutput,
+        no_weights: bool,
+    ) -> Result<ReceiveOutput> {
+        let (control_root, control_peer) = sockets();
+        let (root, peer) = sockets();
+        std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                send_rank(
+                    source.clone(),
+                    json!({"test":true}),
+                    control_peer.as_raw_fd(),
+                    vec![state(&peer, false)],
+                )
+            });
+            let receiver = receive_ranks(
+                vec![ReceiveRequest {
+                    control_fd: control_root.as_raw_fd(),
+                    channels: vec![state(&root, true)],
+                    destination: directory.0.join(name),
+                }],
+                &directory.0.join("cache"),
+                no_weights,
+            );
+            let sent = sender.join().unwrap();
+            match receiver {
+                Ok(mut outputs) => {
+                    sent?;
+                    Ok(outputs.remove(0))
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn cache_backed_output(
+        directory: &Directory,
+        payload: &[u8],
+    ) -> (RankOutput, helios_core::package::PayloadId) {
+        let sender_cache = directory.0.join("sender-cache");
+        let root = helios_core::package::cache::Root::open(&sender_cache).unwrap();
+        let raw = directory.0.join("group.payload");
+        fs::write(&raw, payload).unwrap();
+        let slice = helios_core::package::container::Slice::new(
+            std::sync::Arc::new(fs::File::open(&raw).unwrap()),
+            0,
+            payload.len() as u64,
+        )
+        .unwrap();
+        let object = root.store_slice(None, &slice).unwrap();
+        let id = object.id();
+        let staged = directory.0.join("staged-resource");
+        fs::write(&staged, b"rank-resource").unwrap();
+        let mut output = output(staged.clone(), 13);
+        output.weight_payload = Some(crate::export::WeightPayloadSources {
+            groups: vec![crate::export::WeightPayloadGroup {
+                name: "layer-000".into(),
+                storage: "stable".into(),
+                nbytes: payload.len() as u64,
+                spans: Vec::new(),
+                payload_id: object.id().as_bytes().to_vec(),
+            }],
+            initial_state: crate::export::WeightPayloadGroup::default(),
+            views: Vec::new(),
+        });
+        output.payload_leases = crate::export::PayloadLeases(vec![object]);
+        (output, id)
+    }
+
+    #[test]
+    fn repeated_identical_payload_groups_share_one_object_and_round_trip() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 89) as u8).collect();
+        let (mut source, id) = cache_backed_output(&directory, &payload);
+        // A second semantic group legitimately holds the identical bytes.
+        let weight = source.weight_payload.as_mut().unwrap();
+        let mut twin = weight.groups[0].clone();
+        twin.name = "layer-000-scales".into();
+        weight.groups.push(twin);
+
+        let received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
+        let groups = received.output.weight_payload.as_ref().unwrap();
+        assert_eq!(groups.groups.len(), 2, "a declared group was dropped");
+        assert_eq!(groups.groups[0].payload_id, id.as_bytes().to_vec());
+        assert_eq!(groups.groups[1].payload_id, id.as_bytes().to_vec());
+        let store = helios_core::package::cache::Root::open(&directory.0.join("cache")).unwrap();
+        assert!(store.payload(id).unwrap().is_some());
+        assert_eq!(received.leases.0.len(), 1, "one object per unique identity");
+    }
+
+    #[test]
+    fn native_stage_retains_received_leases_and_rejects_a_closed_stage() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 59) as u8).collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+        let mut received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
+        let cache = directory.0.join("cache");
+        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+        let stage = crate::export::binding::NativeExportStage::for_test(
+            Some(cache.clone()),
+            false,
+        );
+
+        // Binding order: move the leases into the stage, then let outputs drop.
+        stage
+            .retain_payload_leases(std::mem::take(&mut received.leases))
+            .unwrap();
+        drop(received);
+        assert_eq!(stage.retained_for_test(), 1);
+        assert_eq!(
+            store.collect().unwrap().objects,
+            0,
+            "the stage did not keep the received object"
+        );
+        assert!(store.payload(id).unwrap().is_some());
+        drop(stage);
+        assert!(store.collect().unwrap().objects >= 1);
+
+        // A closed stage refuses retention rather than silently dropping leases.
+        let mut received = roundtrip_with_cache(&directory, "rank2.json", &source, false).unwrap();
+        let closed = crate::export::binding::NativeExportStage::for_test(
+            Some(cache),
+            true,
+        );
+        assert!(closed
+            .retain_payload_leases(std::mem::take(&mut received.leases))
+            .is_err());
+        assert_eq!(closed.retained_for_test(), 0);
+    }
+
+    #[test]
+    fn retained_receive_leases_outlive_the_receive_outputs() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..1536u32).map(|i| (i % 71) as u8).collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+        let mut received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
+        let cache = directory.0.join("cache");
+        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+
+        // The binding moves leases into the retained stage before the outputs drop.
+        let retained = std::mem::take(&mut received.leases);
+        assert_eq!(retained.0.len(), 1);
+        drop(received);
+        assert_eq!(
+            store.collect().unwrap().objects,
+            0,
+            "retained stage lost the object"
+        );
+        assert!(store.payload(id).unwrap().is_some());
+
+        drop(retained);
+        assert!(store.collect().unwrap().objects >= 1);
+        assert!(store.payload(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn warm_receive_retains_the_object_lease_until_the_output_is_dropped() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 113) as u8).collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+
+        let cold = roundtrip_with_cache(&directory, "rank-cold.json", &source, false).unwrap();
+        let warm = roundtrip_with_cache(&directory, "rank-warm.json", &source, true).unwrap();
+        let cache = directory.0.join("cache");
+        let store = helios_core::package::cache::Root::open(&cache).unwrap();
+
+        // Both receiver outputs hold live leases for the warm-hit object.
+        assert_eq!(warm.leases.0.len(), 1);
+        assert_eq!(cold.leases.0.len(), 1);
+        assert_eq!(store.collect().unwrap().objects, 0, "leased object reclaimed");
+
+        drop(cold);
+        drop(warm);
+        assert!(store.collect().unwrap().objects >= 1, "object not reclaimed");
+        assert!(store.payload(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_backed_payloads_transfer_and_reuse_the_receiver_cache() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+
+        let received = roundtrip_with_cache(&directory, "rank.json", &source, false).unwrap();
+        assert_eq!(received.inventory["test"], true);
+        let receiver_cache = directory.0.join("cache");
+        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        assert!(store.payload(id).unwrap().is_some(), "payload object missing");
+
+        // A second transfer with --no-weights reuses the object already present.
+        let received = roundtrip_with_cache(&directory, "rank2.json", &source, true).unwrap();
+        assert_eq!(received.inventory["test"], true);
+        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        assert!(store.payload(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn declared_payload_object_must_exist_in_the_sender_cache() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..512u32).map(|i| (i % 31) as u8).collect();
+        let (mut source, id) = cache_backed_output(&directory, &payload);
+        source.weight_payload.as_mut().unwrap().groups[0].payload_id = id.as_bytes().to_vec();
+        // Dropping the lease models a capture that lost its object: the sender must
+        // refuse before any control manifest is written.
+        source.payload_leases = Default::default();
+        let error = cache_payload_sources(&source)
+            .expect_err("declared payload without a lease was accepted");
+        assert!(
+            error.to_string().contains("leased cache object"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cache_backed_payloads_require_the_object_for_no_weights_and_reject_corruption() {
+        let directory = Directory::new();
+        let payload: Vec<u8> = (0..2048u32).map(|i| (i % 97) as u8).collect();
+        let (source, id) = cache_backed_output(&directory, &payload);
+        let object_path = source.payload_leases.0[0].path().to_owned();
+
+        // --no-weights with an empty receiver cache must fail, not reconstruct.
+        let error = match roundtrip_with_cache(&directory, "rank.json", &source, true)
+        {
+            Ok(_) => panic!("--no-weights accepted a missing payload object"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("--no-weights"),
+            "{error}"
+        );
+        let receiver_cache = directory.0.join("cache");
+        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        assert!(store.payload(id).unwrap().is_none());
+
+        // Corrupting the sender object is detected before it can be adopted.
+        let sender_cache = object_path.parent().unwrap().parent().unwrap().to_path_buf();
+        let mut permissions = fs::metadata(&object_path).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o644);
+        }
+        fs::set_permissions(&object_path, permissions).unwrap();
+        let mut bytes = fs::read(&object_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&object_path, &bytes).unwrap();
+        let fresh = Directory::new();
+        assert!(roundtrip_with_cache(&fresh, "rank3.json", &source, false).is_err());
+        let store = helios_core::package::cache::Root::open(&receiver_cache).unwrap();
+        assert!(store.payload(id).unwrap().is_none());
+    }
+
     #[test]
     fn loopback_streams_payload_and_preserves_sequence() {
         let directory = Directory::new();
@@ -1456,6 +1961,7 @@ mod tests {
                     size: bytes.len() as u64,
                     sha256: digest.clone(),
                     blob: false,
+                    payload: None,
                 },
             );
             std::thread::scope(|scope| {

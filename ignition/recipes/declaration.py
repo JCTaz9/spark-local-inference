@@ -95,10 +95,11 @@ class Speculation:
     """Multi-token speculation: how many draft tokens a round verifies and where drafts come from.
 
     A round verifies the pending input and up to `draft_tokens` drafts.
-    Preparation captures width one at every request bucket and wider widths
+    Preparation captures width one at every request bucket and complete rounds
     within the target-token capacity. `adaptive` sets the serving default: choose
-    widths from measured costs and conditional acceptance estimates when true, or use the fixed maximum when
-    false. Flare can reduce both capacities when loading the package. Drafts
+    prepared layouts from measured costs and conditional acceptance estimates
+    when true, or use the fixed maximum verification width when false. Package
+    loading accepts capacity reductions represented by captured graphs. Drafts
     come from the checkpoint's learned draft model.
     """
 
@@ -128,8 +129,8 @@ class Speculation:
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
-            if (not self.packed_verification or not self.adaptive or self.draft_tokens < 1):
-                raise ValueError("speculative graph budget requires packed adaptive learned speculation")
+            if self.draft_tokens < 1:
+                raise ValueError("speculative graph budget requires positive learned draft depth")
         if self.draft_prefix_selection not in ("cpu", "gpu"):
             raise ValueError("draft prefix selection must be cpu or gpu")
         if self.draft_prefix_selection == "gpu" and (

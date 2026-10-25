@@ -311,6 +311,16 @@ impl Bootstrap {
             Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
             Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
         };
+        for (name, coefficient) in [
+            ("scheduler_terminal_value", &mut scheduling_policy.terminal_value),
+            ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price),
+        ] {
+            if let Some(value) = object.get(name) {
+                *coefficient = value.as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
+            }
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
                 .filter(|v| v.is_finite() && *v > 0.0)
@@ -560,6 +570,26 @@ mod tests {
         for preference in ["balanced", "throughput"] {
             let mut configured = legacy.clone();
             configured["scheduler_policy"] = preference.into();
+            let defaults = Bootstrap::load(&configured.to_string(), &manifest).unwrap();
+            assert_eq!(defaults.server.scheduling_policy.terminal_value, 256.0);
+            assert_eq!(defaults.server.scheduling_policy.terminal_age_price, 1.0);
+            for key in ["scheduler_terminal_value", "scheduler_terminal_age_price"] {
+                for number in [0.0, 0.5, 512.0] {
+                    let mut overrides = configured.clone();
+                    overrides[key] = number.into();
+                    let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap();
+                    assert_eq!(loaded.server.scheduling_policy.terminal_value,
+                        if key == "scheduler_terminal_value" { number } else { 256.0 });
+                    assert_eq!(loaded.server.scheduling_policy.terminal_age_price,
+                        if key == "scheduler_terminal_age_price" { number } else { 1.0 });
+                }
+                for invalid in [json!(-1), json!("NaN"), json!(null)] {
+                    let mut overrides = configured.clone();
+                    overrides[key] = invalid;
+                    assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                        .to_string().contains(key));
+                }
+            }
             configured["mtp_adaptive_verification_alpha"] = 0.5.into();
             let loaded = Bootstrap::load(&configured.to_string(), &manifest).unwrap();
             assert_eq!(loaded.server.scheduling_policy.adaptive_verification_alpha, 0.5);

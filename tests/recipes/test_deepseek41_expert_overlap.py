@@ -8,12 +8,12 @@ import torch
 from ignition.recipes.deepseek41 import decoder
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 33, 48, 64, 96, 128, 129])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 32, 33, 48, 64, 96, 128, 129])
 @pytest.mark.parametrize("mode", ["decode", "verify", "draft", "prefill"])
 @pytest.mark.parametrize("overlap", [False, True])
 def test_layer_overlap_uses_physical_capacity_and_enabled_workspace(monkeypatch, rows, mode, overlap):
     scratch = decoder.Scratch.allocate(rows, 1, 4, "meta")
-    calls = []
+    calls, mhc_calls = [], []
 
     def component(*args, **kwargs):
         return SimpleNamespace(plan=object())
@@ -22,6 +22,11 @@ def test_layer_overlap_uses_physical_capacity_and_enabled_workspace(monkeypatch,
         calls.append((shared, kwargs))
         return object()
 
+    def concurrent_mhc(operation, *, stream):
+        mhc_calls.append((operation, stream))
+        return object()
+
+    monkeypatch.setattr(decoder, "ConcurrentMHC", concurrent_mhc)
     for name in ("PreparedMHC", "PreparedAttention", "PreparedAllReduce", "UnquantizedProjection",
                  "PreparedRouter", "PreparedRoutedExperts", "PreparedMLP", "PreparedMHCPost"):
         monkeypatch.setattr(decoder, name, component)
@@ -31,7 +36,7 @@ def test_layer_overlap_uses_physical_capacity_and_enabled_workspace(monkeypatch,
                 scoring_func="sigmoid", norm_topk_prob=True, routed_scaling_factor=1., swiglu_limit=10.)
     weights = SimpleNamespace(engram=None, attention=None, experts=SimpleNamespace(
         vision_correction=None, router=None, correction=None, experts=None, shared=None))
-    workspace = SimpleNamespace(overlap=overlap)
+    workspace = SimpleNamespace(overlap=overlap, background_stream=object())
     session = object()
     layer = decoder.PreparedLayer(3, weights, None, scratch,
         SimpleNamespace(token_ids=torch.empty(rows, device="meta")),
@@ -46,3 +51,8 @@ def test_layer_overlap_uses_physical_capacity_and_enabled_workspace(monkeypatch,
         assert options == dict(parallel_plans=(layer.router_projection.plan, layer.router.plan,
             layer.experts.plan), session=session, workspace=workspace, defer_launch=rows > 4)
     assert not calls
+    expected_mhc = overlap and mode in ("decode", "verify", "draft") and rows <= 32
+    assert (layer.concurrent_attention_hc is not None) == expected_mhc
+    assert (layer.concurrent_ffn_hc is not None) == expected_mhc
+    assert mhc_calls == ([(layer.attention_hc, workspace.background_stream),
+                         (layer.ffn_hc, workspace.background_stream)] if expected_mhc else [])

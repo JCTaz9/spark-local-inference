@@ -330,13 +330,13 @@ pub struct Rates {
     pub prefill: f64,
     /// Generated tokens per second.
     pub generated: f64,
-    /// Speculative or verification graphs completed per second.
+    /// Complete speculative generation programs completed per second.
     pub verify: f64,
     /// Accepted drafts per draft-offering request round; `None` without such rounds.
     pub acceptance: Option<f64>,
-    /// Allocated draft positions per progressing decode or verification request round.
+    /// Allocated draft positions per progressing generation request round.
     pub depth: Option<f64>,
-    /// Weight bytes read per second: verification graphs per second times the bytes one decode
+    /// Weight bytes read per second: complete speculative programs per second times the bytes one decode
     /// step reads, as the package declares; zero when it declares none.
     pub weights: f64,
 }

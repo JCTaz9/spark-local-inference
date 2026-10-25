@@ -871,21 +871,11 @@ fn cubin_strip_global_source<'py>(
 fn cubin_global_symbols(image: &[u8]) -> PyResult<Vec<String>> {
     super::cubin::global_symbols(image).map_err(|e| PyValueError::new_err(e.to_string()))
 }
-#[pyfunction]
-fn cubin_redact_symbols<'py>(
-    py: Python<'py>,
-    image: &[u8],
-) -> PyResult<(Bound<'py, PyBytes>, BTreeMap<String, String>)> {
-    let (image, symbols) =
-        super::cubin::redact_symbols(image).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((PyBytes::new(py, &image), symbols))
-}
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeModuleRecorder>()?;
     module.add_function(wrap_pyfunction!(cubin_strip_debug, module)?)?;
     module.add_function(wrap_pyfunction!(cubin_strip_global_source, module)?)?;
     module.add_function(wrap_pyfunction!(cubin_global_symbols, module)?)?;
-    module.add_function(wrap_pyfunction!(cubin_redact_symbols, module)?)?;
     Ok(())
 }
 

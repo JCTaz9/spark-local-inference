@@ -24,13 +24,13 @@ class Resources:
         self.buffers = {
             "frame_index": torch.zeros(1, dtype=torch.int32, device="cuda"),
             "submission_sequence": torch.zeros(1, dtype=torch.int64, device="cuda"),
-            "completion_records": torch.zeros((2, 4, 8), dtype=torch.int64, device="cuda"),
+            "completion_records": torch.zeros((2, 4, 24), dtype=torch.int64, device="cuda"),
             "tokens": torch.zeros(4, dtype=torch.int64, device="cuda"),
             "slots": torch.arange(4, dtype=torch.int64, device="cuda"),
             "generations": torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda"),
         }
         self.consumed = torch.zeros(4, dtype=torch.int64, device="cuda")
-        self.scratch = [torch.zeros((4, 8), dtype=torch.int64, device="cuda") for _ in (2, 4)]
+        self.scratch = [torch.zeros((4, 24), dtype=torch.int64, device="cuda") for _ in (2, 4)]
         self.active = [torch.tensor([1] * count + [0] * (4-count), dtype=torch.int64, device="cuda") for count in (2, 4)]
         self.stream = torch.cuda.Stream()
         self.pool = torch.cuda.graph_pool_handle()
@@ -47,6 +47,11 @@ class Resources:
             output[:, 3].copy_(self.consumed)
             output[:, 4].scatter_(0, buffer["slots"], torch.where(active.bool(), buffer["tokens"] + 10 * (index+1), -1))
             output[:, 5].scatter_(0, buffer["slots"], active)
+            output[:, 8].copy_(output[:, 5])
+            output[:, 12:14].fill_(-1)
+            output[:, 15].fill_(1)
+            output[:, 16:].fill_(-1)
+            output[:, 16].copy_(output[:, 4])
             buffer["completion_records"].index_copy_(0, buffer["frame_index"].to(torch.int64), output.unsqueeze(0))
 
         self.stream.wait_stream(torch.cuda.current_stream())
@@ -72,14 +77,15 @@ class Resources:
             offset = (offset + 7) // 8 * 8
             bindings.append({"buffer_name": name, "host_offset": offset, "nbytes": tensor.numel() * tensor.element_size()})
             offset += bindings[-1]["nbytes"]
-        self.manifest = {"abi_version": 2, "context": context, "device": device, "max_active": 4,
+        self.manifest = {"abi_version": 4, "context": context, "device": device, "max_active": 4,
             "input_frame_bytes": (offset + 7)//8*8,
             "buffers": [{"name": name, "address": tensor.data_ptr(), "nbytes": tensor.numel() * tensor.element_size(),
                 "dtype": str(tensor.dtype).removeprefix("torch."), "shape": list(tensor.shape), "strides": list(tensor.stride())}
                 for name, tensor in self.buffers.items()],
             "graphs": [{"name": f"decode{count}", "kind": "decode", "handle": graph.raw_cuda_graph_exec(),
-                "sampling_mode": "general", "estimated_duration_ns": 0,
-                "batch_capacity": count, "token_capacity": 1, "input_bindings": bindings}
+                "sampling_mode": "general", "confidence_width": 0, "estimated_duration_ns": 0,
+                "batch_capacity": count, "token_capacity": 1, "prefill_capacity": 0,
+                "input_bindings": bindings}
                 for count, graph in zip((2,4), self.graphs)]}
 
     def __del__(self):
@@ -101,6 +107,10 @@ class ExecutionTests(unittest.TestCase):
             event = executor.poll()
             if event is not None:
                 self.assertEqual(event.fence, expected)
+                for row in event.records:
+                    self.assertEqual(len(row), 24)
+                    self.assertEqual(row[8:16], [row[5], 0, 0, 0, -1, -1, 0, 1])
+                    self.assertEqual(row[16:], [row[4], -1, -1, -1, -1, -1, -1, -1])
                 return event
             time.sleep(.001)
         self.fail("native completion event did not arrive within 10 seconds")
@@ -169,8 +179,8 @@ class ExecutionTests(unittest.TestCase):
     def test_validation_and_bad_upload_do_not_consume_frames(self):
         owner = Resources(self.native)
         invalid = copy.deepcopy(owner.manifest)
-        invalid["buffers"][2]["shape"] = [4,2,8]
-        invalid["buffers"][2]["strides"] = [16,8,1]
+        invalid["buffers"][2]["shape"] = [4,2,24]
+        invalid["buffers"][2]["strides"] = [48,24,1]
         with self.assertRaisesRegex(ValueError, "required buffer layout"):
             self.native.GraphExecutor(owner, invalid)
         executor = self.native.GraphExecutor(owner, owner.manifest)

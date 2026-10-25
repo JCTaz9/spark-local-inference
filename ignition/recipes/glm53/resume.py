@@ -4,13 +4,13 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.resume import PreparedResumeState
-from ignition.components.sampling import PreparedCompletion, PreparedSampling
+from ignition.components.sampling import PreparedSampling
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 
 class PreparedResume:
     def __init__(self, weights, requests, pool, inputs, records, frame, sequence, *, rows,
-                 runtime, vocabulary_runtime, coordinator, session, name, replicated_sampling=False):
+                 runtime, vocabulary_runtime, coordinator, session, name):
         self.state = PreparedResumeState(requests, pool.last_hidden, inputs.row_slot_ids[:rows],
             inputs.row_generations[:rows], inputs.live_rows, world_size=weights.shard.world_size, state_rows=inputs.request_state_rows)
         self.validation = PreparedAllReduce(self.state.validation_input, self.state.validation_sum,
@@ -23,13 +23,11 @@ class PreparedResume:
             session=session, name=f"{name}.lm_head")
         arguments = (requests, inputs.row_slot_ids[:rows], inputs.row_generations[:rows], inputs.live_rows,
                      records, frame, sequence)
-        self.completion = PreparedCompletion(*arguments) if weights.shard.rank != 0 and not replicated_sampling else PreparedSampling(self.logits, *arguments)
+        self.completion = PreparedSampling(self.logits, *arguments)
         self.completion.prepare()
-        if replicated_sampling:
-            self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
-                coordinator=coordinator, name=name + ".sampling")
-        self.compilation_variant = "sample" if weights.shard.rank == 0 or replicated_sampling else "consume"
-        self.replicated_sampling = replicated_sampling
+        self.completion.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+            coordinator=coordinator, name=name + ".sampling")
+        self.compilation_variant = "sample"
 
     def __call__(self):
         self.validation(self.state.validate())

@@ -3,12 +3,14 @@
 use crate::model::ModelConfig;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -18,6 +20,8 @@ use std::{
 struct ModelCatalog {
     card: Value,
     names: HashSet<String>,
+    ollama_model: Value,
+    ollama_info: Value,
 }
 
 impl ModelCatalog {
@@ -42,7 +46,13 @@ impl ModelCatalog {
             .contract
             .vision
             .enabled()
-            .then(|| super::config::image_limits(&model.contract.vision, model.limits.max_sequence_tokens).ok())
+            .then(|| {
+                super::config::image_limits(
+                    &model.contract.vision,
+                    model.limits.max_sequence_tokens,
+                )
+                .ok()
+            })
             .flatten();
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
@@ -90,7 +100,51 @@ impl ModelCatalog {
                 "output_modalities": ["text"],
             },
         });
-        Self { card, names }
+        let mut capabilities = vec!["completion"];
+        if model.contract.vision.enabled() {
+            capabilities.push("vision");
+        }
+        if model.contract.frontend.tools.is_some() {
+            capabilities.push("tools");
+        }
+        if model.contract.frontend.reasoning.is_some() {
+            capabilities.push("thinking");
+        }
+        let details = json!({
+            "parent_model": "",
+            "format": "flare",
+            "family": "",
+            "families": [],
+            "parameter_size": "",
+            "quantization_level": "",
+        });
+        let ollama_info = json!({
+            "details": details,
+            "capabilities": capabilities,
+            "model_info": {
+                "general.name": id,
+                "flare.context_length": model.limits.max_sequence_tokens,
+                "flare.vocab_size": model.contract.vocabulary,
+            },
+        });
+        // Discovery clients cache /api/show by digest, including across server restarts.
+        let mut digest = Sha256::new();
+        digest.update(model.identity);
+        digest.update(ollama_info.to_string().as_bytes());
+        let ollama_model = json!({
+            "name": id,
+            "model": id,
+            "modified_at": "0001-01-01T00:00:00Z",
+            "size": 0,
+            "digest": format!("{:x}", digest.finalize()),
+            "details": details,
+        });
+        Self {
+            card,
+            names,
+            ollama_model,
+            ollama_info,
+        }
     }
 }
 
@@ -102,7 +156,55 @@ where
         .route("/v1/models", get(list))
         // A wildcard also accepts repository IDs such as organization/model.
         .route("/v1/models/{*model}", get(retrieve))
+        .route("/api/tags", get(ollama_list))
+        .route("/api/show", post(ollama_show))
         .with_state(Arc::new(ModelCatalog::new(model, served_names)))
+}
+
+async fn ollama_list(State(catalog): State<Arc<ModelCatalog>>) -> Json<Value> {
+    Json(json!({"models": [&catalog.ollama_model]}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShowRequest {
+    model: String,
+    #[serde(default, rename = "verbose")]
+    _verbose: bool,
+}
+
+async fn ollama_show(
+    State(catalog): State<Arc<ModelCatalog>>,
+    request: Result<Json<ShowRequest>, JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(error) => {
+            let status = match error.status() {
+                StatusCode::UNPROCESSABLE_ENTITY => StatusCode::BAD_REQUEST,
+                status => status,
+            };
+            return (status, Json(json!({"error": error.body_text()}))).into_response();
+        }
+    };
+    if request.model.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "model is required"})),
+        )
+            .into_response();
+    }
+    if catalog.names.contains(&request.model) {
+        Json(catalog.ollama_info.clone()).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": format!("model '{}' not found", request.model),
+            })),
+        )
+            .into_response()
+    }
 }
 
 async fn list(State(catalog): State<Arc<ModelCatalog>>) -> Json<Value> {
@@ -190,7 +292,10 @@ mod tests {
             text["flare"]["sampling_defaults"],
             json!(model.sampling_defaults)
         );
-        assert_eq!(text["flare"]["sampling_ranges"], json!(model.sampling_ranges));
+        assert_eq!(
+            text["flare"]["sampling_ranges"],
+            json!(model.sampling_ranges)
+        );
         assert_eq!(text["flare"]["input_modalities"], json!(["text"]));
         assert_eq!(text["flare"]["output_modalities"], json!(["text"]));
         assert_eq!(text["flare"]["max_images_per_prompt"], 0);
@@ -207,7 +312,10 @@ mod tests {
         model.max_top_logprobs = crate::execution::MAX_TOP_LOGPROBS;
         let logprobs = ModelCatalog::new(&model, &[]).card;
         assert_eq!(logprobs["permission"][0]["allow_logprobs"], true);
-        assert_eq!(logprobs["flare"]["max_top_logprobs"], crate::execution::MAX_TOP_LOGPROBS);
+        assert_eq!(
+            logprobs["flare"]["max_top_logprobs"],
+            crate::execution::MAX_TOP_LOGPROBS
+        );
         model.limits.max_sequence_tokens = 4096;
         model.contract.vision = VisionCapabilities {
             feature_slots: 4,
@@ -261,13 +369,18 @@ mod tests {
     }
 
     fn get(address: SocketAddr, path: &str) -> (u16, Value) {
+        request(address, "GET", path, "")
+    }
+
+    fn request(address: SocketAddr, method: &str, path: &str, body: &str) -> (u16, Value) {
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         )
         .unwrap();
         let mut response = String::new();
@@ -276,6 +389,141 @@ mod tests {
         assert!(headers.contains("application/json"));
         let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
         (status, serde_json::from_str(body).unwrap())
+    }
+
+    #[test]
+    fn ollama_capabilities_follow_prepared_frontend_and_vision() {
+        use crate::model::contract::{
+            ReasoningParser, ReasoningParserKind, ToolParser, ToolParserKind,
+        };
+        for vision in [false, true] {
+            for tools in [false, true] {
+                for thinking in [false, true] {
+                    let mut model = config();
+                    if vision {
+                        model.contract.vision = VisionCapabilities {
+                            feature_slots: 4,
+                            max_images: 4,
+                            features_per_request: 256,
+                            patches_per_feature: 4,
+                            patch_capacities: vec![1024],
+                        };
+                    }
+                    model.contract.frontend.tools = tools.then(|| ToolParser {
+                        kind: ToolParserKind::QwenCoder,
+                        wrapping_newlines: 0,
+                        tag_separator: String::new(),
+                    });
+                    model.contract.frontend.reasoning = thinking.then(|| ReasoningParser {
+                        kind: ReasoningParserKind::ThinkTags,
+                        open: "<think>".into(),
+                        close: "</think>".into(),
+                        wrapping_newlines: 0,
+                        terminal_markers: vec![],
+                    });
+                    let catalog = ModelCatalog::new(&model, &[]);
+                    let capabilities = catalog.ollama_info["capabilities"].as_array().unwrap();
+                    assert!(capabilities.contains(&json!("completion")));
+                    assert_eq!(capabilities.contains(&json!("vision")), vision);
+                    assert_eq!(capabilities.contains(&json!("tools")), tools);
+                    assert_eq!(capabilities.contains(&json!("thinking")), thinking);
+                    assert_eq!(
+                        capabilities.len(),
+                        1 + vision as usize + tools as usize + thinking as usize
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ollama_digest_invalidates_cached_metadata() {
+        let mut model = config();
+        let original = ModelCatalog::new(&model, &[]).ollama_model["digest"].clone();
+        assert_eq!(
+            original,
+            ModelCatalog::new(&model, &[]).ollama_model["digest"]
+        );
+        model.limits.max_sequence_tokens /= 2;
+        let reduced = ModelCatalog::new(&model, &[]).ollama_model["digest"].clone();
+        assert_ne!(original, reduced);
+        model.identity[0] = 1;
+        assert_ne!(
+            reduced,
+            ModelCatalog::new(&model, &[]).ollama_model["digest"]
+        );
+        assert_ne!(
+            original,
+            ModelCatalog::new(&config(), &["alias".into()]).ollama_model["digest"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_http_discovery_resolves_aliases_and_validates_requests() {
+        let aliases = [
+            "alias",
+            "organization/model",
+            "alias",
+            "",
+            "alias with space",
+        ]
+        .map(String::from);
+        let router =
+            router::<()>(&config(), &aliases).layer(axum::extract::DefaultBodyLimit::max(1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let (status, tags) = get(address, "/api/tags");
+            assert_eq!(status, 200);
+            let models = tags["models"].as_array().unwrap();
+            assert_eq!(models.len(), 1);
+            let model = &models[0];
+            assert_eq!(model["name"], "alias");
+            assert_eq!(model["model"], "alias");
+            assert_eq!(model["details"]["format"], "flare");
+            for field in ["family", "parameter_size", "quantization_level"] {
+                assert!(model["details"][field].is_string());
+            }
+            assert_eq!(model["modified_at"], "0001-01-01T00:00:00Z");
+            assert_eq!(model["size"], 0);
+            assert_eq!(model["digest"].as_str().unwrap().len(), 64);
+            let show = |body: Value| request(address, "POST", "/api/show", &body.to_string());
+            let (status, info) = show(json!({"model": "alias"}));
+            assert_eq!(status, 200);
+            assert_eq!(info["details"], model["details"]);
+            assert_eq!(info["capabilities"], json!(["completion"]));
+            assert_eq!(info["model_info"]["general.name"], "alias");
+            assert_eq!(info["model_info"]["flare.context_length"], 8192);
+            assert_eq!(info["model_info"]["flare.vocab_size"], 1024);
+            for name in ["organization/model", "alias with space"] {
+                assert_eq!(
+                    show(json!({"model": name, "verbose": true})),
+                    (200, info.clone())
+                );
+            }
+            assert_eq!(get(address, "/api/tags").1, tags);
+            for body in [
+                json!({}),
+                json!({"model": ""}),
+                json!({"model": null}),
+                json!({"model": 1}),
+                json!({"model": "alias", "verbose": "true"}),
+                json!({"model": "alias", "options": {"num_ctx": 1}}),
+            ] {
+                let (status, error) = show(body);
+                assert_eq!(status, 400);
+                assert!(error["error"].is_string());
+            }
+            let (status, error) = show(json!({"model": "unknown"}));
+            assert_eq!(status, 404);
+            assert!(error["error"].as_str().unwrap().contains("unknown"));
+            assert_eq!(request(address, "POST", "/api/show", "{").0, 400);
+            assert_eq!(show(json!({"model": "x".repeat(2048)})).0, 413);
+        })
+        .await;
+        serving.abort();
+        result.unwrap();
     }
 
     #[tokio::test]

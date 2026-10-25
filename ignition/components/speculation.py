@@ -372,7 +372,7 @@ class PreparedStochasticVerification:
 
 
 class PreparedSpeculativeCommit:
-    """Commit a verified chain prefix and emit physical-slot ABI3 records.
+    """Commit a verified chain prefix and emit physical-slot completion vectors.
 
     A round emitting t tokens commits verification input t-1, leaving emitted
     token t-1 pending. Exact snapshot maintenance selects the committed state

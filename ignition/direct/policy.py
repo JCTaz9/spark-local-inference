@@ -21,8 +21,8 @@ step, and credited with committed tokens and published deliveries. Each
 rectangular selection function names the Helios code it mirrors; floating-point
 operations follow the same order so those paths choose identically from identical
 inputs. Packed candidates use the complete captured shape and causal prefix
-forecasts from the latest completed conditional confidence. They do not reproduce
-Helios's retained-proposal forecasts or regrouping.
+forecasts from completed conditional confidence. Each speculative graph performs
+proposal generation, target verification, and commit within one captured round.
 """
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ class Policy:
             if generated and generated < request.max_new_tokens:
                 for kind, batch, width, packed, drafts in self.packed_catalog:
                     tokens = self.speculative_tokens(request, min(width, drafts + 1) if drafts else width)
-                    if tokens > 0:
+                    if tokens > 0 and (self.layout.fixed_width is None or tokens <= packed):
                         consider(kind, batch, width, expected(request, min(tokens, packed)), True, packed, drafts)
         return (token_rate if token_rate > 0. else None, delivery_rate if delivery_rate > 0. else None)
 
@@ -492,7 +492,12 @@ class Policy:
             ordered = sorted(ready, key=lambda r: (-priority(r), r.slot))
             for count in range(1, min(batch, capacity, len(ordered)) + 1):
                 members = sorted(ordered[:count], key=lambda r: r.slot)
-                lengths = self.packed_lengths(members, width, capacity)
+                if self.layout.fixed_width is None:
+                    lengths = self.packed_lengths(members, width, capacity)
+                else:
+                    lengths = [self.speculative_tokens(r, width) for r in members]
+                    if sum(lengths) > capacity:
+                        continue
                 value = sum(values[r.slot].decode(expected(r, length), duration_ms)
                             for r, length in zip(members, lengths))
                 key = (value, count, -sum(1 << r.slot for r in members))

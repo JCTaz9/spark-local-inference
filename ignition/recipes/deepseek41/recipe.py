@@ -25,6 +25,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
                                    else attention_projection_policy)
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        native_dense_activations=plan.native_dense_activations,
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, compile_decoder=compile_forwards,
@@ -32,7 +33,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
-        dspark=speculation is not None, split_speculation=speculation is not None and speculation.draft_tokens > 0,
+        dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
         mla_compute_mode=plan.mla_compute_mode, attention_projection_policy=attention_projection_policy, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,

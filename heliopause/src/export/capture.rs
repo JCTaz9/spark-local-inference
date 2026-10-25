@@ -13,7 +13,8 @@ use prost::Message;
 
 use super::{
     Allocation, Argument, CaptureRequest, ExportResult, FilePart, FileSource, Kernel, RankOutput,
-    Relocation, cubin, invalid,
+    Relocation, WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources, cubin, invalid,
+    weight_payload,
     reachability::{Reachability, merge_ranges, subtract_ranges},
     recorder::Recorder,
     wire,
@@ -762,6 +763,8 @@ struct Downloader<'a> {
     slots: Vec<DownloadSlot>,
     drained: bool,
     downloaded: u64,
+    #[cfg(test)]
+    copies: u64,
 }
 impl<'a> Downloader<'a> {
     const CHUNK: usize = 8 << 20;
@@ -772,6 +775,8 @@ impl<'a> Downloader<'a> {
             slots: Vec::new(),
             drained: true,
             downloaded: 0,
+            #[cfg(test)]
+            copies: 0,
         };
         cu!(
             cuda,
@@ -829,6 +834,8 @@ impl<'a> Downloader<'a> {
         for (index, chunk) in output.chunks_mut(Self::CHUNK).enumerate() {
             self.drained = false;
             self.downloaded += chunk.len() as u64;
+            #[cfg(test)]
+            { self.copies += 1; }
             let pointer = self.slots[0].pointer;
             cu!(
                 self.cuda,
@@ -887,6 +894,8 @@ impl<'a> Downloader<'a> {
             slot.nbytes = size;
             self.drained = false;
             self.downloaded += size as u64;
+            #[cfg(test)]
+            { self.copies += 1; }
             cu!(
                 self.cuda,
                 "cuMemcpyDtoHAsync_v2",
@@ -1278,6 +1287,8 @@ impl PackedDownload<'_, '_> {
             let bytes = (length - relative).min((count - copied) as u64) as usize;
             self.downloader.drained = false;
             self.downloader.downloaded += bytes as u64;
+            #[cfg(test)]
+            { self.downloader.copies += 1; }
             cu!(
                 self.downloader.cuda,
                 "cuMemcpyDtoHAsync_v2",
@@ -1368,6 +1379,114 @@ impl PackedDownload<'_, '_> {
     }
 }
 
+// Transfer whole chunks while consumers retain owner-relative zero-block boundaries.
+struct WeightDownload<'a, 'cuda> {
+    downloader: &'a mut Downloader<'cuda>,
+    spans: &'a [weight_payload::PayloadSpan],
+    allocations: Vec<&'a Allocation>,
+    next_span: usize,
+    next_offset: u64,
+    pending: std::collections::VecDeque<(usize, usize, usize)>,
+}
+
+impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
+    fn new(
+        downloader: &'a mut Downloader<'cuda>,
+        allocations: &'a [Allocation],
+        spans: &'a [weight_payload::PayloadSpan],
+    ) -> ExportResult<Self> {
+        let allocations = spans.iter().map(|span| {
+            allocations.iter().find(|allocation| allocation.name == span.allocation)
+                .ok_or_else(|| invalid("owner reads require a retained allocation"))
+        }).collect::<ExportResult<Vec<_>>>()?;
+        downloader.drain()?;
+        let mut reader = Self {
+            downloader, spans, allocations, next_span: 0, next_offset: 0,
+            pending: std::collections::VecDeque::new(),
+        };
+        for index in 0..reader.downloader.slots.len() {
+            reader.queue(index)?;
+        }
+        Ok(reader)
+    }
+
+    fn queue(&mut self, index: usize) -> ExportResult<()> {
+        while self.next_span < self.spans.len()
+            && self.next_offset == self.spans[self.next_span].nbytes
+        {
+            self.next_span += 1;
+            self.next_offset = 0;
+        }
+        let Some(span) = self.spans.get(self.next_span) else { return Ok(()); };
+        let allocation = self.allocations[self.next_span];
+        let size = (span.nbytes - self.next_offset).min(Downloader::CHUNK as u64) as usize;
+        let destination = span.destination_offset.checked_add(self.next_offset)
+            .ok_or_else(|| invalid("weight span offset overflow"))?;
+        let downloader = &mut self.downloader;
+        let slot = &mut downloader.slots[index];
+        slot.offset = destination;
+        slot.nbytes = size;
+        let buffer = unsafe { std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>(), size) };
+        let whole = [(0, allocation.nbytes)];
+        let ranges = allocation.snapshot_spans.as_deref().unwrap_or(&whole);
+        copy_recorded_ranges(ranges, allocation.nbytes, destination, buffer, |offset, output| {
+            if allocation.memory == "mapped_host" {
+                unsafe {
+                    std::ptr::copy_nonoverlapping((allocation.address + offset) as *const u8,
+                        output.as_mut_ptr(), output.len());
+                }
+            } else {
+                downloader.drained = false;
+                downloader.downloaded += output.len() as u64;
+                #[cfg(test)]
+                { downloader.copies += 1; }
+                cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
+                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)?;
+            }
+            Ok(())
+        })?;
+        if allocation.memory != "mapped_host" {
+            cu!(downloader.cuda, "cuEventRecord", (Handle, Handle), slot.event, downloader.stream)?;
+        }
+        self.pending.push_back((index, self.next_span, 0));
+        self.next_offset += size as u64;
+        Ok(())
+    }
+
+    fn read_into(&mut self, allocation: &str, mut destination: u64, mut output: &mut [u8]) -> ExportResult<()> {
+        while !output.is_empty() {
+            let (index, span, consumed) = self.pending.front_mut()
+                .ok_or_else(|| invalid("weight read exceeds its declared spans"))?;
+            let slot = &self.downloader.slots[*index];
+            if self.spans[*span].allocation != allocation || slot.offset + *consumed as u64 != destination {
+                return Err(invalid("weight payload reads must follow declared span order"));
+            }
+            if *consumed == 0 && self.allocations[*span].memory != "mapped_host" {
+                cu!(self.downloader.cuda, "cuEventSynchronize", (Handle), slot.event)?;
+            }
+            let count = output.len().min(slot.nbytes - *consumed);
+            output[..count].copy_from_slice(unsafe {
+                std::slice::from_raw_parts(slot.pointer.cast::<u8>().add(*consumed), count)
+            });
+            *consumed += count;
+            destination += count as u64;
+            output = &mut output[count..];
+            if *consumed == slot.nbytes {
+                let (index, _, _) = self.pending.pop_front().unwrap();
+                self.queue(index)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WeightDownload<'_, '_> {
+    fn drop(&mut self) {
+        // A consumer can stop while the next chunk is still being copied.
+        let _ = self.downloader.drain();
+    }
+}
+
 struct AllocationCommit {
     allocation: Allocation,
     spans: Vec<(u64, u64)>,
@@ -1440,6 +1559,7 @@ fn write_allocation(
     store: Option<&super::blob::BlobStore>,
     commits: Option<&std::sync::mpsc::SyncSender<AllocationCommit>>,
     required: bool,
+    persist: bool,
     phase: &helios_core::startup::Phase,
     scanned: &mut u64,
 ) -> ExportResult<(Option<FileSource>, Vec<(u64, u64)>)> {
@@ -1447,10 +1567,10 @@ fn write_allocation(
         return Ok((None, vec![]));
     }
     let mut stored: Vec<(u64, u64)> = Vec::new();
-    let mut file = if store.is_none() {
-        Some(BufWriter::new(File::create(path)?))
-    } else {
+    let mut file = if !persist || store.is_some() {
         None
+    } else {
+        Some(BufWriter::new(File::create(path)?))
     };
     let spans = allocation
         .snapshot_spans
@@ -1493,6 +1613,9 @@ fn write_allocation(
         if path.exists() {
             fs::remove_file(path)?;
         }
+        return Ok((None, stored));
+    }
+    if !persist {
         return Ok((None, stored));
     }
     let source = if let Some(store) = store {
@@ -1609,6 +1732,656 @@ fn write_record(output: &mut impl Write, message: &impl Message) -> ExportResult
     output.write_all(&data)?;
     Ok(())
 }
+/// Resolve the declared semantic weight groups against the retained byte
+/// sources staged for this rank. Group bytes are assembled into their own
+/// staged files with zero blocks elided relative to each owner piece, so a
+/// group's payload identity does not depend on allocation placement. Spans carry
+/// both the destination allocation offset and the offset in the rank's logical
+/// payload concatenation, so the publisher can emit per-group payloads and
+/// initializers without re-reading tensor metadata.
+
+
+/// Platform identifier (gb10/gb202) for the current CUDA device.
+///
+/// CUDA exposes the device's PCI bus location, not its NVIDIA product id, so the
+/// NVML PCI information for the same bus address supplies the product id. The
+/// mapping table itself lives in Helios and is shared with Flare.
+fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
+    let mut device: c_int = -1;
+    unsafe {
+        let get = cuda.symbol::<unsafe extern "C" fn(*mut c_int) -> c_int>(b"cuCtxGetDevice\0")?;
+        cuda.check("cuCtxGetDevice", get(&mut device))?;
+    }
+    let attribute = |name: &str, number: c_int, what: &[u8]| -> ExportResult<c_uint> {
+        let mut value: c_int = 0;
+        unsafe {
+            let get = cuda
+                .symbol::<unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int>(what)?;
+            cuda.check(name, get(&mut value, number, device))?;
+        }
+        Ok(value as c_uint)
+    };
+    // 33/34/50 are the PCI bus, slot, and domain of the device location; the
+    // NVML product id comes from that device's PCI information, never from
+    // these attributes.
+    let bus = attribute("cuDeviceGetAttribute", 33, b"cuDeviceGetAttribute\0")?;
+    let slot = attribute("cuDeviceGetAttribute", 34, b"cuDeviceGetAttribute\0")?;
+    let domain = attribute("cuDeviceGetAttribute", 50, b"cuDeviceGetAttribute\0")?;
+    let bus_id = std::ffi::CString::new(format!("{domain:04x}:{bus:02x}:{slot:02x}.0"))?;
+    let library = unsafe { Library::new("libnvidia-ml.so.1") }
+        .map_err(|error| invalid(format!("NVML is required to name an export: {error}")))?;
+    #[repr(C)]
+    struct PciInfo {
+        _bus_id_legacy: [c_char; 16],
+        _domain: c_uint,
+        _bus: c_uint,
+        _device: c_uint,
+        device_id: c_uint,
+        _subsystem_id: c_uint,
+        _bus_id: [c_char; 32],
+    }
+    unsafe {
+        let init = library.get::<unsafe extern "C" fn() -> c_int>(b"nvmlInit_v2\0")?;
+        let shutdown = library.get::<unsafe extern "C" fn() -> c_int>(b"nvmlShutdown\0")?;
+        cuda.check("nvmlInit_v2", init())?;
+        let result = (|| -> ExportResult<Option<String>> {
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            let get = library
+                .get::<unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> c_int>(
+                    b"nvmlDeviceGetHandleByPciBusId_v2\0",
+                )?;
+            cuda.check(
+                "nvmlDeviceGetHandleByPciBusId_v2",
+                get(bus_id.as_ptr(), &mut handle),
+            )?;
+            let mut pci = std::mem::zeroed::<PciInfo>();
+            let get_pci = library
+                .get::<unsafe extern "C" fn(*mut c_void, *mut PciInfo) -> c_int>(
+                    b"nvmlDeviceGetPciInfo_v3\0",
+                )?;
+            cuda.check("nvmlDeviceGetPciInfo_v3", get_pci(handle, &mut pci))?;
+            match helios_core::package::naming::platform_from_pci(pci.device_id) {
+                Some(platform) => Ok(Some(platform.to_string())),
+                None => Err(invalid(format!(
+                    "NVML reports unsupported GPU PCI id {:#010x}",
+                    pci.device_id
+                ))),
+            }
+        })();
+        let _ = shutdown();
+        result
+    }
+}
+
+fn resolve_weight_payload(
+    request: &CaptureRequest,
+    output: &mut RankOutput,
+    device: Option<(&mut Downloader<'_>, &[Allocation])>,
+) -> ExportResult<Option<WeightPayloadSources>> {
+    let Some(declaration) = request.weight_payload.clone() else {
+        return Ok(None);
+    };
+    let declaration: weight_payload::WeightPayloadDeclaration = serde_json::from_value(declaration)?;
+    let allocations = weight_allocations(&output.allocations);
+    if allocations.is_empty() {
+        return Err(invalid(
+            "weight declarations require retained allocations with recorded addresses",
+        ));
+    }
+    let views: Vec<super::WeightPayloadView> = declaration
+        .views
+        .iter()
+        .map(|view| super::WeightPayloadView {
+            name: view.name.clone(),
+            group: view.group.clone(),
+            storage: view.storage.as_str().to_string(),
+            sources: view.sources.clone(),
+            packing: view.packing.clone(),
+            packing_parameters: view.packing_parameters.clone(),
+            statistics_domain: view.statistics_domain.clone(),
+        })
+        .collect();
+    let catalog = weight_payload::extract(
+        &declaration.into_request(allocations, request.zero_ranges.clone()),
+    )?;
+    let root = match request.options.cache.as_ref() {
+        Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
+        None => None,
+    };
+    let root = match request.options.cache.as_ref() {
+        Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
+        None => None,
+    };
+    let retained = match device {
+        Some(_) => HashMap::new(),
+        None => retained_sources(&output.index.ranks[0])?,
+    };
+    let parts = if device.is_some() { Vec::new() } else { output.payload.clone() };
+    let stage = output
+        .staging
+        .clone()
+        .ok_or_else(|| invalid("weight payload staging requires a stage directory"))?;
+    let (mut device_reader, device_allocations) = match device {
+        Some((downloader, allocations)) => (Some(downloader), allocations),
+        None => (None, &[][..]),
+    };
+    let mut reader = RetainedReader::new(&retained, &parts);
+    let mut payloads: Vec<(bool, String, weight_payload::StorageClass, &[weight_payload::PayloadSpan])> =
+        catalog
+            .groups
+            .iter()
+            .map(|group| (true, group.name.clone(), group.storage, group.spans.as_slice()))
+            .chain(std::iter::once((
+                false,
+                catalog.state.name.clone(),
+                catalog.state.storage,
+                catalog.state.spans.as_slice(),
+            )))
+            .collect();
+    let mut resolved: Vec<(
+        bool,
+        String,
+        weight_payload::StorageClass,
+        Vec<WeightPayloadSourceSpan>,
+        Vec<u8>,
+        u64,
+    )> = Vec::with_capacity(payloads.len());
+    for (is_weight, name, storage, spans) in payloads.drain(..) {
+        if let Some(root) = &root {
+            let (payload_id, length, blocks) = {
+                let mut download = device_reader.as_deref_mut()
+                    .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
+                    .transpose()?;
+                let mut cache_reader = RetainedReader::new(&retained, &parts);
+                scan_group_blocks(&mut |allocation, destination, buffer| {
+                    match download.as_mut() {
+                        Some(download) => download.read_into(allocation, destination, buffer),
+                        None => cache_reader.read_into(allocation, destination, buffer),
+                    }
+                }, spans)?
+            };
+            if length == 0 {
+                // A group with no stored bytes produces no payload object and no
+                // catalog entry; `no_weights` must not look for an empty object.
+                continue;
+            }
+            // `--no-weights` requires cached stable/tuned weight payloads. An
+            // initial-state group is not a weight: graph or capacity changes may
+            // legitimately produce new state bytes, which are written here.
+            let existing = if request.options.no_weights && is_weight {
+                let existing = root.payload(payload_id)?.ok_or_else(|| {
+                    invalid(format!(
+                        "no-weights export is missing cached payload {payload_id} (group {name})"
+                    ))
+                })?;
+                if existing.length() != length {
+                    return Err(invalid(format!(
+                        "cached payload {payload_id} length differs from the captured group {name}"
+                    )));
+                }
+                // Held across the insert below so collection cannot remove the
+                // object between validation and the validating hit.
+                Some(existing)
+            } else {
+                None
+            };
+            let object = {
+                let mut download = device_reader.as_deref_mut()
+                    .map(|downloader| WeightDownload::new(downloader, device_allocations, spans))
+                    .transpose()?;
+                let mut insert_reader = RetainedReader::new(&retained, &parts);
+                root.insert_payload(payload_id, length, ElidedBlocks::new(
+                    |allocation: &str, destination: u64, buffer: &mut [u8]| {
+                        match download.as_mut() {
+                            Some(download) => download.read_into(allocation, destination, buffer),
+                            None => insert_reader.read_into(allocation, destination, buffer),
+                        }
+                    }, spans,
+                ))?
+            };
+            drop(existing);
+            output.payload_leases.0.push(object);
+            resolved.push((
+                is_weight,
+                name,
+                storage,
+                blocks
+                    .into_iter()
+                    .map(|(allocation, destination_offset, source_offset, nbytes)| {
+                        WeightPayloadSourceSpan {
+                            allocation,
+                            destination_offset,
+                            source_offset,
+                            nbytes,
+                        }
+                    })
+                    .collect(),
+                payload_id.as_bytes().to_vec(),
+                length,
+            ));
+            continue;
+        }
+        let file = format!("weight-{}.bin", resolved.len());
+        let path = stage.join(&file);
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut written = 0u64;
+        let mut mapped = Vec::new();
+        weight_payload::for_each_owner_block(
+            spans,
+            &mut |allocation, destination, buffer| {
+                reader.read_into(allocation, destination, buffer)
+            },
+            &mut |span, offset, block| {
+                writer.write_all(block)?;
+                let destination = span
+                    .destination_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("weight span offset overflow"))?;
+                mapped.push((
+                    span.allocation.clone(),
+                    destination,
+                    written,
+                    block.len() as u64,
+                ));
+                written = written
+                    .checked_add(block.len() as u64)
+                    .ok_or_else(|| invalid("staged weight length overflow"))?;
+                Ok(())
+            },
+        )?;
+        writer.flush()?;
+        drop(writer);
+        if written == 0 {
+            let _ = fs::remove_file(&path);
+            resolved.push((is_weight, name, storage, Vec::new(), Vec::new(), 0));
+            continue;
+        }
+        append_resource(
+            output,
+            file.clone(),
+            FileSource {
+                path: path.clone(),
+                offset: 0,
+                nbytes: written,
+            },
+        )?;
+        let base = output.index.ranks[0]
+            .resources
+            .get(&file)
+            .ok_or_else(|| invalid("staged weight resource missing"))?
+            .offset;
+        resolved.push((
+            is_weight,
+            name,
+            storage,
+            mapped
+                .into_iter()
+                .map(|(allocation, destination_offset, file_offset, nbytes)| {
+                    WeightPayloadSourceSpan {
+                        allocation,
+                        destination_offset,
+                        source_offset: base + file_offset,
+                        nbytes,
+                    }
+                })
+                .collect(),
+            Vec::new(),
+            written,
+        ));
+    }
+
+    let mut groups = Vec::new();
+    let mut initial_state = None;
+    for (is_weight, name, storage, spans, payload_id, nbytes) in resolved {
+        let group = WeightPayloadGroup {
+            nbytes,
+            name,
+            storage: storage.as_str().to_string(),
+            spans,
+            payload_id,
+        };
+        if is_weight {
+            groups.push(group);
+        } else {
+            initial_state = Some(group);
+        }
+    }
+    let initial_state = initial_state.unwrap_or_else(|| WeightPayloadGroup {
+        name: weight_payload::INITIAL_STATE_PAYLOAD.to_string(),
+        storage: weight_payload::StorageClass::Stable.as_str().to_string(),
+        nbytes: 0,
+        spans: Vec::new(),
+        payload_id: Vec::new(),
+    });
+    let sources = WeightPayloadSources {
+        groups,
+        initial_state,
+        views,
+    };
+    Ok(Some(sources))
+}
+
+
+
+/// Live capture allocations that can own stored weight bytes.
+///
+/// Ownership extraction uses the addresses observed during capture, so a
+/// relocatable allocation (one whose serialized metadata omits its address)
+/// still resolves its views. Peer and dynamic allocations are excluded.
+pub(crate) fn weight_allocations(
+    allocations: &[Allocation],
+) -> Vec<weight_payload::WeightAllocationInput> {
+    allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.memory != "peer"
+                && allocation.sizing.is_none()
+                && allocation.nbytes > 0
+                && allocation.address != 0
+        })
+        .map(|allocation| weight_payload::WeightAllocationInput {
+            name: allocation.name.clone(),
+            address: allocation.address,
+            nbytes: allocation.nbytes,
+        })
+        .collect()
+}
+
+
+
+/// Copy only ranges that have recorded storage; omitted bytes read as zero.
+///
+/// This mirrors RetainedReader's zero reconstruction for live device reads: an
+/// allocation's snapshot spans (or its whole extent) define readable bytes.
+fn copy_recorded_ranges<R>(
+    ranges: &[(u64, u64)],
+    nbytes: u64,
+    destination: u64,
+    buffer: &mut [u8],
+    mut read: R,
+) -> ExportResult<()>
+where
+    R: FnMut(u64, &mut [u8]) -> ExportResult<()>,
+{
+    buffer.fill(0);
+    let end = destination
+        .checked_add(buffer.len() as u64)
+        .ok_or_else(|| invalid("owner read offset overflow"))?;
+    if end > nbytes {
+        return Err(invalid("owner read exceeds its allocation"));
+    }
+    for &(offset, length) in ranges {
+        let run_end = offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("recorded range overflow"))?;
+        let start = offset.max(destination);
+        let stop = run_end.min(end);
+        if start >= stop {
+            continue;
+        }
+        let local = (start - destination) as usize;
+        let count = (stop - start) as usize;
+        read(start, &mut buffer[local..local + count])?;
+    }
+    Ok(())
+}
+
+/// Visit one group's owner-anchored nonzero 64 KiB blocks.
+///
+/// Reads go through RetainedReader (pinned handles, bounded buffers); zero
+/// blocks are skipped exactly as `weight_payload::for_each_owner_block` does.
+fn for_each_group_block<R, F>(
+    read_into: &mut R,
+    spans: &[weight_payload::PayloadSpan],
+    mut emit: F,
+) -> ExportResult<()>
+where
+    R: FnMut(&str, u64, &mut [u8]) -> ExportResult<()>,
+    F: FnMut(&str, u64, &[u8]) -> ExportResult<()>,
+{
+    let mut buffer = vec![0u8; weight_payload::ELIDE_BLOCK as usize];
+    for span in spans {
+        let mut offset = 0u64;
+        while offset < span.nbytes {
+            let nbytes = weight_payload::ELIDE_BLOCK.min(span.nbytes - offset);
+            let destination = span
+                .destination_offset
+                .checked_add(offset)
+                .ok_or_else(|| invalid("weight span offset overflow"))?;
+            let block = &mut buffer[..nbytes as usize];
+            block.fill(0);
+            read_into(&span.allocation, destination, block)?;
+            if block.iter().any(|byte| *byte != 0) {
+                emit(&span.allocation, destination, block)?;
+            }
+            offset += nbytes;
+        }
+    }
+    Ok(())
+}
+
+/// Sequential reader over the same blocks, for `Root::insert_payload`.
+struct ElidedBlocks<'a, R> {
+    read_into: R,
+    spans: &'a [weight_payload::PayloadSpan],
+    span: usize,
+    offset: u64,
+    block: Vec<u8>,
+    position: usize,
+    length: usize,
+}
+
+impl<'a, R> ElidedBlocks<'a, R>
+where
+    R: FnMut(&str, u64, &mut [u8]) -> ExportResult<()>,
+{
+    fn new(read_into: R, spans: &'a [weight_payload::PayloadSpan]) -> Self {
+        Self {
+            read_into,
+            spans,
+            span: 0,
+            offset: 0,
+            block: Vec::new(),
+            position: 0,
+            length: 0,
+        }
+    }
+
+    fn next_block(&mut self) -> ExportResult<bool> {
+        while self.span < self.spans.len() {
+            let span = &self.spans[self.span];
+            let nbytes = weight_payload::ELIDE_BLOCK.min(span.nbytes - self.offset);
+            let destination = span
+                .destination_offset
+                .checked_add(self.offset)
+                .ok_or_else(|| invalid("weight span offset overflow"))?;
+            self.block.resize(nbytes as usize, 0);
+            self.block.fill(0);
+            (self.read_into)(&span.allocation, destination, &mut self.block)?;
+            self.offset += nbytes;
+            if self.offset == span.nbytes {
+                self.span += 1;
+                self.offset = 0;
+            }
+            if self.block.iter().any(|byte| *byte != 0) {
+                self.position = 0;
+                self.length = nbytes as usize;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl<R> std::io::Read for ElidedBlocks<'_, R>
+where
+    R: FnMut(&str, u64, &mut [u8]) -> ExportResult<()>,
+{
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        while self.position == self.length {
+            if !self.next_block().map_err(std::io::Error::other)? {
+                return Ok(0);
+            }
+        }
+        let count = (self.length - self.position).min(output.len());
+        output[..count].copy_from_slice(&self.block[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+/// Hash and size one group's block stream, recording each stored block.
+#[allow(clippy::type_complexity)]
+fn scan_group_blocks<R>(
+    read_into: &mut R,
+    spans: &[weight_payload::PayloadSpan],
+) -> ExportResult<(
+    helios_core::package::PayloadId,
+    u64,
+    Vec<(String, u64, u64, u64)>,
+)>
+where
+    R: FnMut(&str, u64, &mut [u8]) -> ExportResult<()>,
+{
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut blocks = Vec::new();
+    let mut total = 0u64;
+    for_each_group_block(read_into, spans, |allocation, destination, block| {
+        hasher.update(block);
+        blocks.push((
+            allocation.to_string(),
+            destination,
+            total,
+            block.len() as u64,
+        ));
+        total = total
+            .checked_add(block.len() as u64)
+            .ok_or_else(|| invalid("group payload length overflow"))?;
+        Ok(())
+    })?;
+    Ok((
+        helios_core::package::PayloadId::from_bytes(hasher.finalize().into()),
+        total,
+        blocks,
+    ))
+}
+
+/// Retained byte sources of one rank: for each allocation, its stored spans with
+/// the logical payload offset of each span start.
+fn retained_sources(
+    index: &wire::BundleIndex,
+) -> ExportResult<HashMap<String, (u64, Vec<(u64, u64, u64)>)>> {
+    let mut retained = HashMap::new();
+    for allocation in &index.allocations {
+        let Some(file) = allocation.file.as_ref() else {
+            continue;
+        };
+        let resource = index
+            .resources
+            .get(file)
+            .ok_or_else(|| invalid(format!("allocation names unknown resource {file:?}")))?;
+        let mut spans = Vec::new();
+        let mut cursor = resource.offset;
+        for span in &allocation.data_spans {
+            if span.nbytes == 0 {
+                continue;
+            }
+            if !span.filename.is_empty() {
+                return Err(invalid("allocation destination spans cannot name a file"));
+            }
+            spans.push((span.offset, span.nbytes, cursor));
+            cursor = cursor
+                .checked_add(span.nbytes)
+                .ok_or_else(|| invalid("retained span offset overflow"))?;
+        }
+        if cursor != resource.offset + resource.nbytes {
+            return Err(invalid(
+                "allocation resource length disagrees with its stored spans",
+            ));
+        }
+        retained.insert(allocation.name.clone(), (resource.offset, spans));
+    }
+    Ok(retained)
+}
+
+/// Reads allocation bytes back from the staged payload parts, returning zero for
+/// bytes the emitter elided.
+struct RetainedReader<'a> {
+    retained: &'a HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
+    parts: &'a [FilePart],
+    open: HashMap<PathBuf, File>,
+}
+
+impl<'a> RetainedReader<'a> {
+    fn new(
+        retained: &'a HashMap<String, (u64, Vec<(u64, u64, u64)>)>,
+        parts: &'a [FilePart],
+    ) -> Self {
+        Self {
+            retained,
+            parts,
+            open: HashMap::new(),
+        }
+    }
+
+    fn read_into(
+        &mut self,
+        allocation: &str,
+        destination: u64,
+        buffer: &mut [u8],
+    ) -> ExportResult<()> {
+        buffer.fill(0);
+        let Some((_base, stored)) = self.retained.get(allocation) else {
+            return Ok(());
+        };
+        let end = destination
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| invalid("retained read overflow"))?;
+        let first = stored.partition_point(|&(start, len, _)| start + len <= destination);
+        for &(stored_start, stored_len, payload_offset) in &stored[first..] {
+            let stored_end = stored_start + stored_len;
+            if stored_start >= end {
+                break;
+            }
+            let start = stored_start.max(destination);
+            let stop = stored_end.min(end);
+            if start >= stop {
+                continue;
+            }
+            let offset = payload_offset
+                .checked_add(start - stored_start)
+                .ok_or_else(|| invalid("retained payload offset overflow"))?;
+            let local = (start - destination) as usize;
+            self.read_payload(offset, &mut buffer[local..local + (stop - start) as usize])?;
+        }
+        Ok(())
+    }
+
+    fn read_payload(&mut self, offset: u64, buffer: &mut [u8]) -> ExportResult<()> {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| invalid("payload read overflow"))?;
+        let part = self
+            .parts
+            .iter()
+            .find(|part| part.offset <= offset && end <= part.offset + part.source.nbytes)
+            .ok_or_else(|| invalid("retained bytes are not covered by staged payload parts"))?;
+        let file = match self.open.get_mut(&part.source.path) {
+            Some(file) => file,
+            None => self
+                .open
+                .entry(part.source.path.clone())
+                .or_insert(File::open(&part.source.path)?),
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(part.source.offset + (offset - part.offset)))?;
+        file.read_exact(buffer)?;
+        Ok(())
+    }
+}
+
 fn append_resource(output: &mut RankOutput, name: String, source: FileSource) -> ExportResult<()> {
     let cursor = output
         .payload
@@ -1973,6 +2746,9 @@ pub(crate) fn capture_rank(
         module_globals: vec![],
         external,
         staging: Some(stage.path.clone()),
+        weight_payload: None,
+        hardware: None,
+        payload_leases: Default::default(),
     };
     let mut roots = request.roots.clone();
     roots.extend(
@@ -2068,18 +2844,10 @@ pub(crate) fn capture_rank(
     let mut downloader = Downloader::new(&cuda)?;
     for (index, (name, image)) in modules.into_iter().enumerate() {
         let file = format!("module-{index}.cubin");
-        let (exported, symbols) = cubin::redact_symbols(&cubin::strip_debug(&image)?)?;
+        let exported = cubin::strip_debug(&image)?;
         module_bytes += exported.len() as u64;
         module_phase.advance_bytes(exported.len() as u64);
         fs::write(stage.path.join(&file), exported)?;
-        for function in &mut output.index.ranks[0].functions {
-            if function.module == name {
-                function.symbol = symbols
-                    .get(&function.symbol)
-                    .unwrap_or(&function.symbol)
-                    .clone();
-            }
-        }
         let kernel = kernels
             .iter()
             .find(|k| k.module == name)
@@ -2149,7 +2917,7 @@ pub(crate) fn capture_rank(
             writer.flush()?;
             other_resources.push((data_file.clone(), file_source(path)?));
             globals.push(wire::Global {
-                symbol: symbols.get(&symbol).unwrap_or(&symbol).clone(),
+                symbol,
                 file: data_file,
                 nbytes: size as u64,
                 relocations: vec![],
@@ -2184,13 +2952,21 @@ pub(crate) fn capture_rank(
     let storage_download_start = downloader.downloaded;
     let mut scanned = 0u64;
     let mut stored_bytes = 0u64;
+    // Declared captures with a cache persist only semantic objects; the scan
+    // validates reachability and records sparse spans, and owner bytes are read
+    // through the live downloader later.
+    let cache_scan = request.weight_payload.is_some() && request.options.cache.is_some();
     let budget = super::io::IoBudget::for_capture(local_ranks)?;
-    let store = request
-        .options
-        .cache
-        .as_ref()
-        .map(|root| super::blob::BlobStore::new(root, budget))
-        .transpose()?;
+    let store = if cache_scan {
+        None
+    } else {
+        request
+            .options
+            .cache
+            .as_ref()
+            .map(|root| super::blob::BlobStore::new(root, budget))
+            .transpose()?
+    };
     let (_, committed_downloads) = with_allocation_commits(
         request.context,
         store.as_ref(),
@@ -2211,9 +2987,10 @@ pub(crate) fn capture_rank(
                     &allocation,
                     &stage.path.join(&file),
                     &mut reach,
-                    store.as_ref(),
+                    if cache_scan { None } else { store.as_ref() },
                     commits,
                     request.options.no_weights,
+                    !cache_scan,
                     &storage_phase,
                     &mut scanned,
                 )?;
@@ -2230,14 +3007,14 @@ pub(crate) fn capture_rank(
                     relative.offset = 0;
                     check_bindings(&cuda, &allocations, &data, &[relative])?;
                 }
-                if source.is_none()
+                if spans.is_empty()
                     && allocation
                         .relocations
                         .iter()
                         .any(|r| r.kind == "tensor_map")
                 {
                     return Err(invalid(
-                        "tensor-map storage requires a snapshot initializer",
+                        "tensor-map storage requires stored initialization coverage",
                     ));
                 }
                 let sizing = allocation
@@ -2286,6 +3063,19 @@ pub(crate) fn capture_rank(
     downloader.drain()?;
     cuda.synchronize()?;
     storage_phase.finish(format!("{scanned} bytes scanned, {} bytes downloaded, {stored_bytes} bytes stored; {} allocations omitted", downloader.downloaded - storage_download_start + committed_downloads, allocations.len() - output.allocations.len()));
+    let weight_phase = progress.phase("Materialize weight payloads", None);
+    let device_allocations = output.allocations.clone();
+    output.weight_payload = resolve_weight_payload(
+        &request,
+        &mut output,
+        if cache_scan {
+            Some((&mut downloader, device_allocations.as_slice()))
+        } else {
+            None
+        },
+    )?;
+    weight_phase.finish("");
+    output.hardware = current_platform(&cuda)?;
     drop(store);
     drop(downloader);
     let granule = request.granularity.max(1 << 30);
@@ -2377,6 +3167,466 @@ mod tests {
         }
     }
     #[test]
+    fn weight_allocations_use_live_addresses_for_relocatable_storage() {
+        let measure = allocation("input", 0x4000, 0x1000);
+        let mut relocatable = allocation("weights", 0x9000, 0x2000);
+        // Serialized metadata would omit this address; extraction uses capture.
+        relocatable.preserve_address = false;
+        let mut peer = allocation("peer", 0x9000, 0x1000);
+        peer.memory = "peer".into();
+        peer.preserve_address = true;
+        let mut dynamic = allocation("cache", 0x10000, 0x1000);
+        dynamic.initialize = "zero".into();
+        dynamic.sizing = Some(serde_json::json!({"capacity": 0, "unit_bytes": 4096, "maximum": 4}));
+        let selected = weight_allocations(&[measure, relocatable, peer, dynamic]);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].name, "input");
+        assert_eq!(selected[1].name, "weights");
+        assert_eq!(selected[1].address, 0x9000);
+        assert_eq!(selected[1].nbytes, 0x2000);
+    }
+
+    fn declared_capture(
+        directory: &Path,
+        bytes: &[u8],
+        no_weights: bool,
+    ) -> ExportResult<(CaptureRequest, RankOutput)> {
+        declared_capture_view(directory, bytes, bytes.len(), no_weights)
+    }
+
+    fn declared_capture_view(
+        directory: &Path,
+        bytes: &[u8],
+        view_bytes: usize,
+        no_weights: bool,
+    ) -> ExportResult<(CaptureRequest, RankOutput)> {
+        let source = directory.join("storage.bin");
+        fs::write(&source, bytes)?;
+        let cache = directory.join("cache");
+        fs::create_dir_all(&cache)?;
+        let (address, nbytes) = (0x1000u64, bytes.len() as u64);
+        let mut bundle = wire::BundleIndex {
+            architecture: vec![12, 0],
+            ..Default::default()
+        };
+        bundle.allocations.push(wire::Allocation {
+            name: "device-0".into(),
+            nbytes,
+            alignment: 256,
+            address: Some(address),
+            file: Some("storage.bin".into()),
+            data_spans: vec![wire::Span { offset: 0, nbytes, filename: String::new() }],
+            ..Default::default()
+        });
+        bundle.resources.insert(
+            "storage.bin".into(),
+            wire::Span { offset: 0, nbytes, filename: String::new() },
+        );
+        let request: CaptureRequest = serde_json::from_value(serde_json::json!({
+            "path": directory.join("package"),
+            "context": 0,
+            "graphs": [],
+            "allocations": [],
+            "weight_payload": {"version": 1, "views": [{
+                "name": "weights.embedding", "group": "embedding", "storage": "stable",
+                "element_bytes": 1, "shape": [view_bytes], "stride": [1], "address": address
+            }]},
+            "options": {"cache": cache, "no_weights": no_weights},
+        }))?;
+        let output = RankOutput {
+            hardware: Some("gb202".to_string()),
+            payload_leases: Default::default(),
+            index: wire::ModelIndex {
+                version: 4,
+                ranks: vec![bundle],
+                contract: Some(Default::default()),
+                frontend: Some(Default::default()),
+                sampling_defaults: Some(Default::default()),
+                ..Default::default()
+            },
+            payload: vec![FilePart {
+                offset: 0,
+                source: FileSource { path: source, offset: 0, nbytes },
+            }],
+            allocations: vec![Allocation {
+                name: "device-0".into(),
+                address,
+                nbytes,
+                alignment: 256,
+                initialize: "snapshot".into(),
+                relocations: vec![],
+                preserve_address: false,
+                memory: "device".into(),
+                snapshot_spans: None,
+                sizing: None,
+            }],
+            module_globals: vec![],
+            external: vec![],
+            staging: Some(directory.join("stage")),
+            weight_payload: None,
+        };
+        fs::create_dir_all(directory.join("stage"))?;
+        Ok((request, output))
+    }
+
+    #[test]
+    fn recorded_range_reads_zero_fill_omitted_bytes() -> ExportResult<()> {
+        let mut read_ranges = Vec::new();
+        let mut buffer = [0xAAu8; 16];
+        copy_recorded_ranges(
+            &[(0, 4), (8, 4)],
+            32,
+            0,
+            &mut buffer,
+            |offset, output| {
+                read_ranges.push((offset, output.len() as u64));
+                for byte in output.iter_mut() {
+                    *byte = 0x7F;
+                }
+                Ok(())
+            },
+        )?;
+        assert_eq!(&buffer[..4], &[0x7F; 4]);
+        assert_eq!(&buffer[4..8], &[0; 4], "omitted bytes must be zero");
+        assert_eq!(&buffer[8..12], &[0x7F; 4]);
+        assert_eq!(&buffer[12..], &[0; 4], "omitted tail must be zero");
+        assert_eq!(read_ranges, vec![(0, 4), (8, 4)]);
+        // Reads outside the allocation are rejected, not silently zeroed.
+        assert!(copy_recorded_ranges(&[(0, 4)], 8, 6, &mut buffer[..4], |_, _| Ok(())).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn no_weights_reuses_weights_and_allows_new_initial_state() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-state-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let total = 8192usize;
+        let view = 4096usize;
+        let mut bytes = vec![0x11u8; total];
+        let (request, mut output) = declared_capture_view(&directory, &bytes, view, false)?;
+        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let weight_id = catalog.groups[0].payload_id.clone();
+        assert_eq!(catalog.groups.len(), 1);
+        assert!(!catalog.initial_state.payload_id.is_empty());
+        let state_id = catalog.initial_state.payload_id.clone();
+        drop(output);
+        // Same stable weights, different residual state.
+        for byte in &mut bytes[view..] {
+            *byte = 0x22;
+        }
+        let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
+        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        assert_eq!(catalog.groups[0].payload_id, weight_id);
+        assert_ne!(catalog.initial_state.payload_id, state_id);
+        // Missing stable weight data still fails under no_weights.
+        drop(output);
+        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let id: [u8; 32] = weight_id.as_slice().try_into().unwrap();
+        let object = root
+            .payload(helios_core::package::PayloadId::from_bytes(id))?
+            .unwrap();
+        let path = object.path().to_path_buf();
+        drop(object);
+        fs::remove_file(&path)?;
+        let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
+        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        assert!(error.to_string().contains("missing cached payload"), "{error}");
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn declared_capture_leases_objects_through_collection() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-lease-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let block = weight_payload::ELIDE_BLOCK as usize;
+        let mut bytes = vec![0u8; block + 8];
+        bytes[0] = 3;
+        let (request, mut output) = declared_capture(&directory, &bytes, false)?;
+        let catalog = resolve_weight_payload(&request, &mut output, None)?
+            .ok_or_else(|| invalid("declared capture missing catalog"))?;
+        let group = &catalog.groups[0];
+        assert!(!group.payload_id.is_empty());
+        assert_eq!(group.nbytes, block as u64);
+        assert!(!output.payload_leases.0.is_empty());
+        let staged: Vec<_> = fs::read_dir(directory.join("stage"))?
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(staged.is_empty(), "{staged:?}");
+        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        root.collect()?;
+        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+            group.payload_id.clone().try_into().unwrap()
+        ))?.is_some(), "lease must keep the object during capture");
+        drop(output);
+        root.collect()?;
+        assert!(root.payload(helios_core::package::PayloadId::from_bytes(
+            group.payload_id.clone().try_into().unwrap()
+        ))?.is_none(), "released lease lets collection reclaim the object");
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn declared_capture_no_weights_requires_the_exact_cached_object() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-noweights-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let bytes = vec![5u8; 4096];
+        let (request, mut output) = declared_capture(&directory, &bytes, false)?;
+        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let id: [u8; 32] = catalog.groups[0].payload_id.clone().try_into().unwrap();
+        let payload = helios_core::package::PayloadId::from_bytes(id);
+        drop(output);
+        // Warm: an existing object validates.
+        let (request, mut output) = declared_capture(&directory, &bytes, true)?;
+        assert!(resolve_weight_payload(&request, &mut output, None)?.is_some());
+        drop(output);
+        // Corrupted cached bytes are rejected even with the right length.
+        let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
+        let object = root.payload(payload)?.unwrap();
+        let length = object.length();
+        let path = object.path().to_path_buf();
+        drop(object);
+        fs::remove_file(&path)?;
+        fs::write(&path, vec![0u8; length as usize])?;
+        let (request, mut output) = declared_capture(&directory, &bytes, true)?;
+        assert!(resolve_weight_payload(&request, &mut output, None).is_err());
+        drop(output);
+        // Absent object fails rather than publishing fresh weights.
+        fs::remove_file(&path)?;
+        let (request, mut output) = declared_capture(&directory, &bytes, true)?;
+        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        assert!(error.to_string().contains("missing cached payload"), "{error}");
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn declared_capture_all_zero_group_requires_no_object() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-zero-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let (request, mut output) = declared_capture(&directory, &vec![0u8; 4096], false)?;
+        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        assert!(catalog.groups.is_empty());
+        assert!(catalog.initial_state.payload_id.is_empty());
+        assert!(output.payload_leases.0.is_empty());
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn group_blocks_record_stored_offsets_and_match_the_insert_stream() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-blocks-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("storage.bin");
+        let block = weight_payload::ELIDE_BLOCK as usize;
+        let mut bytes = vec![0u8; 3 * block];
+        bytes[0] = 7;
+        // The middle block stays zero and must be elided.
+        bytes[2 * block + 7] = 11;
+        fs::write(&path, &bytes)?;
+        let parts = vec![FilePart {
+            offset: 0,
+            source: FileSource {
+                path,
+                offset: 0,
+                nbytes: bytes.len() as u64,
+            },
+        }];
+        let mut retained = HashMap::new();
+        retained.insert(
+            "device-0".to_string(),
+            (0u64, vec![(0u64, bytes.len() as u64, 0u64)]),
+        );
+        let spans = vec![weight_payload::PayloadSpan {
+            payload_offset: 0,
+            allocation: "device-0".into(),
+            destination_offset: 0,
+            nbytes: bytes.len() as u64,
+        }];
+        let mut reader = RetainedReader::new(&retained, &parts);
+        let (id, length, blocks) = scan_group_blocks(
+            &mut |allocation: &str, destination: u64, buffer: &mut [u8]| {
+                reader.read_into(allocation, destination, buffer)
+            },
+            &spans,
+        )?;
+        assert_eq!(length, 2 * weight_payload::ELIDE_BLOCK);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].2, 0);
+        assert_eq!(blocks[1].2, weight_payload::ELIDE_BLOCK);
+        assert_eq!(blocks[0].3, weight_payload::ELIDE_BLOCK);
+        let mut stream = Vec::new();
+        let mut reader = RetainedReader::new(&retained, &parts);
+        let mut blocks_reader = ElidedBlocks::new(
+            move |allocation: &str, destination: u64, buffer: &mut [u8]| {
+                reader.read_into(allocation, destination, buffer)
+            },
+            &spans,
+        );
+        std::io::Read::read_to_end(&mut blocks_reader, &mut stream)?;
+        assert_eq!(stream.len() as u64, length);
+        assert_eq!(helios_core::package::PayloadId::of(&stream), id);
+        assert_eq!(stream[0], 7);
+        assert_eq!(stream[weight_payload::ELIDE_BLOCK as usize + 7], 11);
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_reader_reconstructs_elided_zero_bytes() -> ExportResult<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "flare-capture-retained-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("storage-0.bin");
+        fs::write(&path, b"0123456789abcdef")?;
+        let parts = vec![FilePart {
+            offset: 0,
+            source: FileSource {
+                path: path.clone(),
+                offset: 0,
+                nbytes: 16,
+            },
+        }];
+        let mut retained = HashMap::new();
+        retained.insert(
+            "device-0".to_string(),
+            (0u64, vec![(0x1000u64, 4u64, 0u64), (0x1100u64, 8u64, 4u64)]),
+        );
+        let mut reader = RetainedReader::new(&retained, &parts);
+        let mut buffer = [0u8; 0x110];
+        reader.read_into("device-0", 0x1000, &mut buffer)?;
+        assert_eq!(&buffer[..4], b"0123");
+        assert!(buffer[4..0x100].iter().all(|byte| *byte == 0));
+        assert_eq!(&buffer[0x100..0x108], b"456789ab");
+        assert!(buffer[0x108..].iter().all(|byte| *byte == 0));
+        let mut missing = [0u8; 4];
+        reader.read_into("device-absent", 0x1000, &mut missing)?;
+        assert_eq!(missing, [0u8; 4]);
+        let _ = fs::remove_dir_all(&directory);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn weight_payload_device_materialization_matches_staged_bytes() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        let size = (256 << 20) + 97;
+        let mut address = 0u64;
+        let result = (|| -> ExportResult<()> {
+            let mut bytes = vec![0x37; size];
+            let block = weight_payload::ELIDE_BLOCK as usize;
+            bytes[13 + block..13 + 2 * block].fill(0);
+            let hole = (Downloader::CHUNK - 19, Downloader::CHUNK + 35);
+            bytes[hole.0..hole.1].fill(0);
+            cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, size)?;
+            cu!(&cuda, "cuMemcpyHtoD_v2", (u64, *const u8, usize), address, bytes.as_ptr(), size)?;
+            // Omitted storage must read as zero even when its backing is poisoned.
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), address + hole.0 as u64, 0xAA, hole.1 - hole.0)?;
+            cuda.synchronize()?;
+            let reference = tempfile::tempdir()?;
+            let device = tempfile::tempdir()?;
+            let prepare = |directory: &Path| -> ExportResult<(CaptureRequest, RankOutput)> {
+                let (mut request, mut output) = declared_capture(directory, &bytes, false)?;
+                let view = &mut request.weight_payload.as_mut().unwrap()["views"][0];
+                view["address"] = (address + 13).into();
+                view["shape"] = serde_json::json!([size - 29]);
+                output.allocations[0].address = address;
+                output.allocations[0].snapshot_spans = Some(vec![
+                    (0, hole.0 as u64), (hole.1 as u64, (size - hole.1) as u64),
+                ]);
+                output.index.ranks[0].allocations[0].address = Some(address);
+                Ok((request, output))
+            };
+            let (reference_request, mut reference_output) = prepare(reference.path())?;
+            let expected = resolve_weight_payload(&reference_request, &mut reference_output, None)?.unwrap();
+            let (mut request, mut output) = prepare(device.path())?;
+            let allocations = output.allocations.clone();
+            let mut downloader = Downloader::new(&cuda)?;
+            for pass in 0..2 {
+                request.options.no_weights = pass == 1;
+                let copies = downloader.copies;
+                let downloaded = downloader.downloaded;
+                let started = std::time::Instant::now();
+                let actual = resolve_weight_payload(&request, &mut output,
+                    Some((&mut downloader, &allocations)))?.unwrap();
+                downloader.drain()?;
+                eprintln!("weight materialization: bytes={size}, cached={}, copies={}, elapsed={:?}",
+                    pass == 1, downloader.copies - copies, started.elapsed());
+                assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(&expected)?);
+                assert_eq!(downloader.downloaded - downloaded, 2 * (size - (hole.1 - hole.0)) as u64);
+                assert!(downloader.copies - copies <= 2 * (size.div_ceil(Downloader::CHUNK) + 4) as u64);
+            }
+            let mut host = allocation("host", bytes.as_ptr() as u64, size as u64);
+            host.memory = "mapped_host".into();
+            let mixed = [allocations[0].clone(), host];
+            let spans: Vec<_> = [
+                ("device-0", (size - 7) as u64, 7),
+                ("host", 13, 2 * block as u64 + 1),
+                ("device-0", 17, (2 * Downloader::CHUNK + 97) as u64),
+                ("host", 0, 0),
+                ("device-0", 0, 13),
+            ].into_iter().map(|(allocation, destination_offset, nbytes)| weight_payload::PayloadSpan {
+                payload_offset: 0, allocation: allocation.into(), destination_offset, nbytes,
+            }).collect();
+            {
+                let mut reader = WeightDownload::new(&mut downloader, &mixed, &spans)?;
+                for span in &spans {
+                    let mut offset = 0usize;
+                    for amount in [7, block, 2 * Downloader::CHUNK + 97] {
+                        let amount = amount.min(span.nbytes as usize - offset);
+                        let mut actual = vec![0xAA; amount];
+                        reader.read_into(&span.allocation, span.destination_offset + offset as u64, &mut actual)?;
+                        let begin = span.destination_offset as usize + offset;
+                        assert_eq!(actual, bytes[begin..begin + amount]);
+                        offset += amount;
+                    }
+                    assert_eq!(offset as u64, span.nbytes);
+                }
+            }
+            {
+                let mut reader = WeightDownload::new(&mut downloader, &mixed, &spans)?;
+                assert!(reader.read_into("wrong allocation", 0, &mut [0]).is_err());
+            }
+            assert!(downloader.drained);
+            Ok(())
+        })();
+        cuda.synchronize()?;
+        if address != 0 { cu!(&cuda, "cuMemFree_v2", (u64), address)?; }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
+    }
+
+    #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
     fn allocation_commit_worker_binds_context_reuses_cache_and_rejects_mutation() -> ExportResult<()>
     {
@@ -2442,6 +3692,7 @@ mod tests {
                                 Some(&store),
                                 commits,
                                 false,
+                                true,
                                 &phase,
                                 &mut scanned,
                             )?;
@@ -2475,6 +3726,7 @@ mod tests {
                         Some(&store),
                         commits,
                         false,
+                        true,
                         &phase,
                         &mut scanned,
                     )?;

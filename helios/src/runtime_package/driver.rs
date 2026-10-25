@@ -107,6 +107,7 @@ driver! {
     device_attribute: "cuDeviceGetAttribute"(*mut c_int, c_int, c_int);
     context_create: "cuCtxCreate_v2"(*mut Handle, c_uint, c_int);
     context_set: "cuCtxSetCurrent"(Handle);
+    context_pop: "cuCtxPopCurrent_v2"(*mut Handle);
     context_get: "cuCtxGetCurrent"(*mut Handle);
     context_sync: "cuCtxSynchronize"();
     context_destroy: "cuCtxDestroy_v2"(Handle);

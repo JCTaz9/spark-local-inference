@@ -19,6 +19,10 @@ use flare_helios::{
     about = "Serve prepared models on NVIDIA GPUs"
 )]
 pub struct Cli {
+    /// Configuration file [default: ~/.config/flare/config.toml].
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -51,11 +55,84 @@ pub enum Command {
         #[command(subcommand)]
         command: TrustCommand,
     },
+    /// List, inspect, and manage locally prepared models.
+    Models(CacheArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub command: CacheCommand,
+
+    /// Model storage directory [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(
+        long,
+        value_name = "PATH",
+        global = true,
+        help_heading = "Model storage"
+    )]
+    pub model_cache: Option<PathBuf>,
+
+    /// Disable terminal styling.
+    #[arg(long, global = true)]
+    pub plain: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// List local models, versions, and storage usage.
+    List(CacheList),
+    /// Show details for a local model, version, or package.
+    Inspect(Inspect),
+    /// Download a prepared model from Hugging Face.
+    Download(Download),
+    /// Choose the default version of a model.
+    Select(CacheSpec),
+    /// Remove a local model version.
+    Remove(CacheRemove),
+    /// Free unused model storage.
+    Gc(CacheGc),
+}
+
+#[derive(Debug, Args)]
+pub struct CacheList {
+    /// Model to list; all local models when omitted.
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Print the listing as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheSpec {
+    /// Model and version, as MODEL@VERSION.
+    #[arg(value_name = "MODEL@VERSION")]
+    pub spec: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheRemove {
+    /// Model and version, as MODEL@VERSION.
+    #[arg(value_name = "MODEL@VERSION")]
+    pub spec: String,
+
+    /// Allow removing the model's default version.
+    #[arg(long)]
+    pub clear_default: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CacheGc {
+    /// Print the cleanup results as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HubOptions {
-    /// Hub revision; defaults to gb10 or gb202 detected from the selected GPUs.
+    /// Hub revision; uses the model origin when cached, otherwise detects gb10 or gb202.
     #[arg(long, value_name = "REVISION", help_heading = "Download options")]
     pub revision: Option<String>,
 
@@ -63,7 +140,9 @@ pub struct HubOptions {
     #[arg(long, value_name = "FILE", help_heading = "Download options")]
     pub filename: Option<String>,
 
-    /// Hugging Face hub cache [default: ~/.cache/huggingface/hub].
+    /// Parent directory for operation-scoped transport staging of prepared
+    /// packages. The tree is cleaned when the acquisition ends; source checkpoint
+    /// and publisher-profile caches are configured separately.
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub cache_dir: Option<PathBuf>,
 
@@ -71,16 +150,33 @@ pub struct HubOptions {
     #[arg(long, value_name = "PATH", help_heading = "Download options")]
     pub token_file: Option<PathBuf>,
 
-    /// Use only cached files, without contacting Hugging Face.
+    /// Resolve prepared packages only from the Flare model cache, without contacting Hugging Face.
     #[arg(long, help_heading = "Download options")]
     pub offline: bool,
+
+    /// Tensor-parallel sizes to prepare, as N[,N...]; defaults to the requested GPU count.
+    #[arg(
+        long,
+        value_name = "N[,N...]",
+        value_delimiter = ',',
+        help_heading = "Download options"
+    )]
+    pub tensor_parallel: Vec<u32>,
+
+    /// Prepared-model cache root [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(long, value_name = "PATH", help_heading = "Download options")]
+    pub model_cache: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct Inspect {
-    /// Local prepared .safetensors package.
-    #[arg(value_name = "PACKAGE")]
+    /// Local package path or MODEL[@VERSION]; omitting the version selects the model's default.
+    #[arg(value_name = "PACKAGE|MODEL[@VERSION]")]
     pub package: PathBuf,
+
+    /// Model storage directory [default: paths.package_cache, else ~/.cache/flare/packages].
+    #[arg(long, value_name = "PATH", help_heading = "Model storage")]
+    pub model_cache: Option<PathBuf>,
 
     /// Print the selected sections as JSON.
     #[arg(long)]
@@ -114,6 +210,10 @@ pub struct Inspect {
     #[arg(long, value_name = "N")]
     pub rank: Option<usize>,
 
+    /// Select a deployment by tensor-parallel size for a multi-deployment payload package.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub tensor_parallel: Option<u32>,
+
     /// Additional publisher verification profiles (JSON).
     /// Development packages default to ~/.config/flare/development-publisher.json.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
@@ -135,6 +235,14 @@ pub struct Download {
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
         default_value = "0", value_parser = clap::value_parser!(i32).range(0..))]
     pub gpus: Vec<i32>,
+
+    /// Additional publisher verification profiles (JSON); repeatable.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub publisher_keys: Vec<PathBuf>,
+
+    /// Persistent trust file whose remembered keys also verify.
+    #[arg(long, value_name = "PATH")]
+    pub trust_store: Option<PathBuf>,
 
     #[command(flatten)]
     pub hub: HubOptions,
@@ -311,6 +419,8 @@ impl OrbitPush {
             stage_only: false,
             api_key_file: None,
             scheduler_policy: "balanced".into(),
+            scheduler_terminal_value: None,
+            scheduler_terminal_age_price: None,
             serving: self.serving.clone(),
         }
     }
@@ -380,7 +490,11 @@ pub struct OrbitRun {
 
     /// Experimental chain in rank order: like --roce-ring, with no link between the first and
     /// last rank; hosts cabled directly as a chain.
-    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    #[arg(
+        long,
+        conflicts_with = "roce_ring",
+        help_heading = "Multi-host options"
+    )]
     pub roce_chain: bool,
 
     /// IP address for rank zero's HTTP server [default: saved group or 127.0.0.1].
@@ -400,7 +514,15 @@ pub struct OrbitRun {
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: Option<String>,
 
-    /// File on rank zero's node containing the serving API key; omit to disable authentication.
+    /// Value per terminal retirement in prompt-token units [default: 256].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_value: Option<f64>,
+
+    /// Terminal waiting cost in value/ms², independent of output cadence [default: 1].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_age_price: Option<f64>,
+
+    /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
@@ -411,7 +533,9 @@ pub struct OrbitRun {
 impl OrbitRun {
     /// Serving options every rank loads with.
     pub fn rank_options(&self, matches: &clap::ArgMatches) -> Vec<String> {
-        let mut options = self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
+        let mut options = self
+            .serving
+            .rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
         // Explicit defaults must override saved values, while omitted defaults must not.
         if self.serving.kv_cache_limit == KvCacheLimit::Memory
             && matches.value_source("kv_cache_limit")
@@ -436,6 +560,12 @@ impl OrbitRun {
         }
         if let Some(policy) = &self.scheduler_policy {
             options.extend(["--scheduler-policy".into(), policy.clone()]);
+        }
+        if let Some(value) = self.scheduler_terminal_value {
+            options.extend(["--scheduler-terminal-value".into(), value.to_string()]);
+        }
+        if let Some(price) = self.scheduler_terminal_age_price {
+            options.extend(["--scheduler-terminal-age-price".into(), price.to_string()]);
         }
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
@@ -465,6 +595,8 @@ impl OrbitRun {
                 .scheduler_policy
                 .clone()
                 .unwrap_or_else(|| "balanced".into()),
+            scheduler_terminal_value: self.scheduler_terminal_value,
+            scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             serving: self.serving.clone(),
         }
     }
@@ -483,14 +615,14 @@ pub enum TrustCommand {
 #[derive(Debug, Args)]
 #[command(
     args_override_self = true,
-    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the package's prepared capacities.\nOmitted concurrency and speculation options use package defaults."
+    after_help = "Examples:\n  flare run model.safetensors --gpus 0 --host 127.0.0.1 --port 8000\n  flare run model.safetensors --embedding-table-storage ram --mtp-draft-tokens 3\n\nConcurrency and draft limits must fit the package's prepared capacities.\nOmitted options use host configuration, then package defaults."
 )]
 pub struct Run {
-    /// Local prepared .safetensors package or Hugging Face ORG/NAME[@REVISION].
+    /// Local package, MODEL[@VERSION], or Hugging Face repository; local models resolve first.
     #[arg(value_name = "PACKAGE", required_unless_present = "rank")]
     pub package: Option<PathBuf>,
 
-    /// IP address for the HTTP server.
+    /// IP address for the HTTP server [default: server.host, else 127.0.0.1].
     #[arg(
         long,
         value_name = "ADDR",
@@ -499,7 +631,7 @@ pub struct Run {
     )]
     pub host: IpAddr,
 
-    /// Port for the HTTP server.
+    /// Port for the HTTP server [default: server.port, else 8000].
     #[arg(
         long,
         value_name = "N",
@@ -519,7 +651,11 @@ pub struct Run {
 
     /// Experimental chain in rank order: like --roce-ring, with no link between the first and
     /// last rank; hosts cabled directly as a chain.
-    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    #[arg(
+        long,
+        conflicts_with = "roce_ring",
+        help_heading = "Multi-host options"
+    )]
     pub roce_chain: bool,
 
     /// Rank zero's rendezvous address: where rank zero listens, or on a peer, where it joins rank zero.
@@ -561,7 +697,8 @@ pub struct Run {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64), help_heading = "Multi-host options")]
     pub transfer_streams: Option<u8>,
 
-    /// Cache root for received rank packages [default: ~/.cache/flare].
+    /// Fallback prepared-model cache root when --model-cache is absent
+    /// [default: paths.package_cache, else ~/.cache/flare/packages].
     #[arg(long, value_name = "PATH", help_heading = "Multi-host options")]
     pub package_cache: Option<PathBuf>,
 
@@ -569,7 +706,7 @@ pub struct Run {
     #[arg(long, help_heading = "Multi-host options")]
     pub stage_only: bool,
 
-    /// File containing the serving API key; omit to disable authentication.
+    /// File containing the serving API key; overrides [server].api_key, including with an empty file.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
 
@@ -577,6 +714,14 @@ pub struct Run {
     #[arg(long, value_name = "MODE", default_value = "balanced",
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: String,
+
+    /// Value per terminal retirement in prompt-token units [default: 256].
+    #[arg(long, value_name = "VALUE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_value: Option<f64>,
+
+    /// Terminal waiting cost in value/ms², independent of output cadence [default: 1].
+    #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
+    pub scheduler_terminal_age_price: Option<f64>,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -633,7 +778,7 @@ pub struct ServingOptions {
     pub kv_cache_limit: KvCacheLimit,
 
     /// Per-GPU serving memory: occupied size (30G), free reserve (-30G), or total fraction (0.8).
-    /// Omitted: package serving reserve.
+    /// Omitted: memory.reserve from configuration, then the package serving reserve.
     #[arg(
         long,
         allow_hyphen_values = true,
@@ -642,7 +787,7 @@ pub struct ServingOptions {
     )]
     pub memory_limit: Option<MemoryLimit>,
 
-    /// Maximum simultaneous requests [default: package setting].
+    /// Maximum simultaneous requests [default: model/default configuration, then package setting].
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
@@ -671,11 +816,19 @@ pub struct ServingOptions {
     pub mtp_draft_tokens: Option<usize>,
 
     /// Augment learned drafts with shared decoded history; requires prepared history inputs.
-    #[arg(long, overrides_with = "no_history_drafts", help_heading = "Speculation options")]
+    #[arg(
+        long,
+        overrides_with = "no_history_drafts",
+        help_heading = "Speculation options"
+    )]
     pub history_drafts: bool,
 
     /// Disable shared decoded history proposals.
-    #[arg(long, overrides_with = "history_drafts", help_heading = "Speculation options")]
+    #[arg(
+        long,
+        overrides_with = "history_drafts",
+        help_heading = "Speculation options"
+    )]
     pub no_history_drafts: bool,
 
     /// Advanced: fix the total verification-row budget, including pending inputs, using
@@ -711,24 +864,24 @@ pub struct ServingOptions {
     )]
     pub no_mtp_adaptive_verification: bool,
 
-    /// Exponent on split-proposal prefix-survival scores; below 1 favors longer verification [default: 1.0].
+    /// Exponent on completed prefix-survival scores; below 1 favors longer prefixes [default: 1.0].
     #[arg(long, value_name = "ALPHA", value_parser = verification_alpha,
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
-    /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: disabled].
+    /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
 
-    /// Directory for prefix checkpoints and prepared inputs on disk [default: disabled].
+    /// Directory for prefix checkpoints and prepared inputs on disk [default: paths.prefix_cache, else disabled].
     #[arg(long, value_name = "DIR", help_heading = "Prefix cache options")]
     pub prefix_cache_disk: Option<PathBuf>,
 
-    /// Disk retention limit, e.g. 100G; 0 disables [default: 10% of free space].
+    /// Disk retention limit, e.g. 100G; 0 disables [default: prefix_cache.disk_limit, else 10% of free space].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: staged].
+    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: prefix_cache.disk_transport, else staged].
     #[arg(long, value_name = "MODE", help_heading = "Prefix cache options",
         value_parser = PossibleValuesParser::new(["staged", "direct"])
             .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
@@ -743,8 +896,17 @@ fn served_model_name(value: &str) -> Result<String, String> {
     }
 }
 
+fn scheduler_coefficient(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| "scheduler coefficient must be finite and nonnegative".into())
+}
+
 fn verification_alpha(value: &str) -> Result<f64, String> {
-    value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| "adaptive verification alpha must be finite and greater than zero".into())
 }
 
@@ -765,7 +927,8 @@ impl Run {
     /// graphs and capacities on every host.
     #[cfg(test)]
     pub fn rank_options(&self) -> Vec<String> {
-        self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
+        self.serving
+            .rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
     }
 
     pub fn load_options(&self) -> LoadOptions {
@@ -822,7 +985,10 @@ impl ServingOptions {
             options.push("--no-mtp-adaptive-verification".into());
         }
         if let Some(alpha) = self.mtp_adaptive_verification_alpha {
-            options.extend(["--mtp-adaptive-verification-alpha".into(), alpha.to_string()]);
+            options.extend([
+                "--mtp-adaptive-verification-alpha".into(),
+                alpha.to_string(),
+            ]);
         }
         if let Some(storage) = self.embedding_table_storage {
             options.extend([
@@ -839,10 +1005,7 @@ impl ServingOptions {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
         }
         if let Some(bytes) = self.embedding_table_cache_size {
-            options.extend([
-                "--embedding-table-cache-size".into(),
-                bytes.to_string(),
-            ]);
+            options.extend(["--embedding-table-cache-size".into(), bytes.to_string()]);
         }
         if self.embedding_table_resident_scales {
             options.push("--embedding-table-resident-scales".into());
@@ -853,7 +1016,10 @@ impl ServingOptions {
             options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
         }
         if let Some(directory) = &self.prefix_cache_disk {
-            options.extend(["--prefix-cache-disk".into(), directory.display().to_string()]);
+            options.extend([
+                "--prefix-cache-disk".into(),
+                directory.display().to_string(),
+            ]);
         }
         if let Some(bytes) = self.prefix_cache_disk_limit {
             options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
@@ -931,6 +1097,10 @@ mod tests {
                     "8000",
                     "--scheduler-policy",
                     "balanced",
+                    "--scheduler-terminal-value",
+                    "256",
+                    "--scheduler-terminal-age-price",
+                    "0",
                     "--mtp-adaptive-verification-alpha",
                     "1.0",
                     "--kv-cache-limit",
@@ -964,6 +1134,10 @@ mod tests {
                 "8001".into(),
                 "--scheduler-policy".into(),
                 "throughput".into(),
+                "--scheduler-terminal-value".into(),
+                "512".into(),
+                "--scheduler-terminal-age-price".into(),
+                "2".into(),
                 "--mtp-adaptive-verification-alpha".into(),
                 "0.5".into(),
                 "--kv-cache-limit".into(),
@@ -977,7 +1151,14 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
-            assert_eq!(effective.mtp_adaptive_verification_alpha, Some(if explicit { 1.0 } else { 0.5 }));
+            assert_eq!(effective.scheduler_terminal_value, Some(if explicit { 256.0 } else { 512.0 }));
+            assert_eq!(effective.scheduler_terminal_age_price, Some(if explicit { 0.0 } else { 2.0 }));
+            assert_eq!(orbit.run_args().scheduler_terminal_value, orbit.scheduler_terminal_value);
+            assert_eq!(orbit.run_args().scheduler_terminal_age_price, orbit.scheduler_terminal_age_price);
+            assert_eq!(
+                effective.mtp_adaptive_verification_alpha,
+                Some(if explicit { 1.0 } else { 0.5 })
+            );
             assert_eq!(
                 effective.host.to_string(),
                 if explicit { "127.0.0.1" } else { "0.0.0.0" }
@@ -1002,6 +1183,21 @@ mod tests {
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
                 explicit
             );
+        }
+    }
+
+    #[test]
+    fn terminal_preferences_parse_independently_and_reject_invalid_numbers() {
+        let defaults = run(&["flare", "run", "model"]);
+        assert_eq!(defaults.scheduler_terminal_value, None);
+        assert_eq!(defaults.scheduler_terminal_age_price, None);
+        for flag in ["--scheduler-terminal-value", "--scheduler-terminal-age-price"] {
+            for value in ["0", "0.5", "256", "1024"] {
+                assert!(Cli::try_parse_from(["flare", "run", "model", flag, value]).is_ok());
+            }
+            for value in ["-1", "NaN", "inf", "garbage"] {
+                assert!(Cli::try_parse_from(["flare", "run", "model", &format!("{flag}={value}")]).is_err());
+            }
         }
     }
 
@@ -1091,7 +1287,11 @@ mod tests {
         assert_eq!(options.device_labels, None);
         assert_eq!(options.embedding_table_storage, None);
         assert_eq!(options.embedding_table_cache_bytes, None);
-        assert!(!args.rank_options().contains(&"--embedding-table-cache-size".to_owned()));
+        assert!(
+            !args
+                .rank_options()
+                .contains(&"--embedding-table-cache-size".to_owned())
+        );
         assert_eq!(options.max_concurrency, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
@@ -1116,8 +1316,26 @@ mod tests {
             let args = run(&command);
             assert_eq!(args.load_options().history_drafts, Some(expected));
             let options = args.rank_options();
-            assert!(options.contains(&if expected { "--history-drafts" } else { "--no-history-drafts" }.to_owned()));
-            assert!(!options.contains(&if expected { "--no-history-drafts" } else { "--history-drafts" }.to_owned()));
+            assert!(
+                options.contains(
+                    &if expected {
+                        "--history-drafts"
+                    } else {
+                        "--no-history-drafts"
+                    }
+                    .to_owned()
+                )
+            );
+            assert!(
+                !options.contains(
+                    &if expected {
+                        "--no-history-drafts"
+                    } else {
+                        "--history-drafts"
+                    }
+                    .to_owned()
+                )
+            );
         }
     }
 
@@ -1255,7 +1473,14 @@ mod tests {
         assert_eq!(push.to, ["zero", "one", "two", "three"]);
         assert_eq!(push.transfer_streams, Some(8));
         assert!(push.run_args().roce_ring);
-        let arguments = ["flare", "orbit", "push", "model.safetensors", "--to", "zero,one,two"];
+        let arguments = [
+            "flare",
+            "orbit",
+            "push",
+            "model.safetensors",
+            "--to",
+            "zero,one,two",
+        ];
         let parsed = Cli::try_parse_from([&arguments[..], &["--roce-chain"]].concat()).unwrap();
         let Command::Orbit(OrbitArgs {
             command: OrbitCommand::Push(push),
@@ -1267,7 +1492,8 @@ mod tests {
         let run = push.run_args();
         assert!(run.roce_chain && !run.roce_ring);
         assert!(
-            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat()).is_err()
+            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat())
+                .is_err()
         );
     }
 
@@ -1419,16 +1645,37 @@ mod tests {
     #[test]
     fn adaptive_verification_alpha_is_validated_and_forwarded() {
         for value in ["0.5", "1.0", "2.0"] {
-            let args = run(&["flare", "run", "model.safetensors", "--mtp-adaptive-verification-alpha", value]);
-            assert_eq!(args.mtp_adaptive_verification_alpha, Some(value.parse().unwrap()));
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--mtp-adaptive-verification-alpha",
+                value,
+            ]);
+            assert_eq!(
+                args.mtp_adaptive_verification_alpha,
+                Some(value.parse().unwrap())
+            );
             let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
             forwarded.extend(args.rank_options());
-            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
-            assert_eq!(peer.mtp_adaptive_verification_alpha, args.mtp_adaptive_verification_alpha);
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+                panic!()
+            };
+            assert_eq!(
+                peer.mtp_adaptive_verification_alpha,
+                args.mtp_adaptive_verification_alpha
+            );
         }
         for value in ["0", "-0.5", "NaN", "inf", "-inf", "invalid"] {
-            assert!(Cli::try_parse_from(["flare", "run", "model.safetensors",
-                &format!("--mtp-adaptive-verification-alpha={value}")]).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    &format!("--mtp-adaptive-verification-alpha={value}")
+                ])
+                .is_err()
+            );
         }
     }
 
@@ -1493,14 +1740,25 @@ mod tests {
     #[test]
     fn embedding_row_cache_accepts_a_binary_memory_budget() {
         for (size, bytes) in [("0", 0), ("1G", 1 << 30), ("4GiB", 4 << 30)] {
-            let args = run(&["flare", "run", "model.safetensors", "--embedding-table-cache-size", size]);
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--embedding-table-cache-size",
+                size,
+            ]);
             let options = args.load_options();
             assert_eq!(options.embedding_table_cache_bytes, Some(bytes));
             assert_eq!(options.embedding_table_storage, None);
-            assert_eq!(args.rank_options(), ["--embedding-table-cache-size".to_owned(), bytes.to_string()]);
+            assert_eq!(
+                args.rank_options(),
+                ["--embedding-table-cache-size".to_owned(), bytes.to_string()]
+            );
             let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
             forwarded.extend(args.rank_options());
-            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+                panic!()
+            };
             assert_eq!(peer.load_options().embedding_table_cache_bytes, Some(bytes));
         }
     }
@@ -1540,22 +1798,42 @@ mod tests {
             run(&forwarded).load_options().prefix_cache,
             args.load_options().prefix_cache
         );
-        assert!(run(&["flare", "run", "model.safetensors"]).rank_options().is_empty());
+        assert!(
+            run(&["flare", "run", "model.safetensors"])
+                .rank_options()
+                .is_empty()
+        );
     }
 
     #[test]
     fn resident_embedding_scales_are_forwarded_to_every_rank() {
-        let args = run(&["flare", "run", "model.safetensors", "--embedding-table-resident-scales",
-                         "--embedding-table-cache-size", "1G"]);
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--embedding-table-resident-scales",
+            "--embedding-table-cache-size",
+            "1G",
+        ]);
         assert!(args.load_options().embedding_table_resident_scales);
-        assert_eq!(args.load_options().embedding_table_cache_bytes, Some(1 << 30));
-        assert!(args.rank_options().contains(&"--embedding-table-resident-scales".to_owned()));
-        assert!(!run(&["flare", "run", "model.safetensors"]).load_options().embedding_table_resident_scales);
+        assert_eq!(
+            args.load_options().embedding_table_cache_bytes,
+            Some(1 << 30)
+        );
+        assert!(
+            args.rank_options()
+                .contains(&"--embedding-table-resident-scales".to_owned())
+        );
+        assert!(
+            !run(&["flare", "run", "model.safetensors"])
+                .load_options()
+                .embedding_table_resident_scales
+        );
     }
 
     #[test]
     fn memory_limits_accept_signed_values_and_reach_every_rank() {
-        for value in ["30g", "-30g", "0.8"] {
+        for value in ["30g", "-30g", "0.8", "-0G"] {
             for flags in [
                 vec!["--memory-limit".to_owned(), value.to_owned()],
                 vec![format!("--memory-limit={value}")],
@@ -1582,7 +1860,7 @@ mod tests {
                 assert_eq!(peer.kv_cache_limit, KvCacheLimit::Context);
             }
         }
-        for value in ["0", "-0.8", "2", "NaN", "1e-1", "-0G"] {
+        for value in ["0", "-0.8", "2", "NaN", "1e-1"] {
             assert!(
                 Cli::try_parse_from(["flare", "run", "model.safetensors", "--memory-limit", value])
                     .is_err()
@@ -1598,5 +1876,78 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_cli_tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> CacheArgs {
+        let parsed = Cli::try_parse_from(arguments).unwrap();
+        match parsed.command {
+            Command::Models(args) => args,
+            other => panic!("expected cache command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_commands_parse_with_the_shared_model_cache_flag() {
+        let list = parse(&[
+            "flare",
+            "models",
+            "--model-cache",
+            "/cache",
+            "list",
+            "--json",
+        ]);
+        assert_eq!(
+            list.model_cache.as_deref(),
+            Some(std::path::Path::new("/cache"))
+        );
+        match list.command {
+            CacheCommand::List(CacheList {
+                model: None,
+                json: true,
+            }) => {}
+            other => panic!("unexpected list command: {other:?}"),
+        }
+        let inspect = parse(&[
+            "flare",
+            "models",
+            "inspect",
+            "model@v1",
+            "--json",
+            "--unverified",
+        ]);
+        match inspect.command {
+            CacheCommand::Inspect(Inspect {
+                package,
+                json: true,
+                unverified: true,
+                ..
+            }) => {
+                assert_eq!(package, PathBuf::from("model@v1"));
+            }
+            other => panic!("unexpected inspect command: {other:?}"),
+        }
+        let remove = parse(&["flare", "models", "remove", "model@v1", "--clear-default"]);
+        match remove.command {
+            CacheCommand::Remove(CacheRemove {
+                spec,
+                clear_default: true,
+            }) => {
+                assert_eq!(spec, "model@v1");
+            }
+            other => panic!("unexpected remove command: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&["flare", "models", "select", "model@v1"]).command,
+            CacheCommand::Select(CacheSpec { spec }) if spec == "model@v1"
+        ));
+        assert!(matches!(
+            parse(&["flare", "models", "gc", "--json"]).command,
+            CacheCommand::Gc(CacheGc { json: true })
+        ));
     }
 }

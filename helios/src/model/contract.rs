@@ -58,7 +58,7 @@ contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xt
 contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, Proposal = 10, Verification = 11, ScoredPrefill = 12, PackedSpeculative = 13 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -75,9 +75,6 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Vision => Self::Vision,
             GraphKind::Speculative => Self::Speculative,
             GraphKind::Mixed => Self::Mixed,
-            GraphKind::Proposal => Self::Proposal,
-            GraphKind::Verification => Self::Verification,
-            GraphKind::PackedSpeculative => Self::PackedSpeculative,
         })
     }
 }
@@ -341,14 +338,16 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if self.version != 1
-            || self.vocabulary == 0
+        if self.version != 2 {
+            return Err("unsupported prepared model contract version; re-export the model package".into());
+        }
+        if self.vocabulary == 0
             || self.input_vocabulary < self.vocabulary
             || self.input_vocabulary > u32::MAX as usize
             || self.cache.page_tokens == 0
             || !matches!(self.frontend.position_dimensions, 0 | 3)
         {
-            return Err("invalid prepared model contract version, vocabulary, or geometry".into());
+            return Err("invalid prepared model contract vocabulary or geometry".into());
         }
         self.vision.validate()?;
         self.frontend.validate()?;
@@ -442,15 +441,23 @@ impl PreparedContract {
                 }
             }
             let prefix: Vec<_> = graph.inputs.iter().filter(|input| input.source == ValueSource::SpeculativePrefixLimit).collect();
-            if descriptor.kind == GraphKind::PackedSpeculative {
-                if prefix.len() != 1 || graph.inputs.iter().any(|b| b.source == ValueSource::QueryLength)
-                    || prefix[0].indexing != InputIndexing::SubmissionRow
-                    || prefix[0].value_offset != 0 || prefix[0].padding != 0
-                    || manifest.buffer(&prefix[0].buffer)?.dtype != crate::execution::Dtype::Int32 {
-                    return Err("packed combined graph requires one int32 submission prefix ceiling and device-owned query lengths".into());
+            let query: Vec<_> = graph.inputs.iter().filter(|input| input.source == ValueSource::QueryLength).collect();
+            if descriptor.kind == GraphKind::Speculative {
+                let binding = match (prefix.as_slice(), query.as_slice()) {
+                    ([binding], []) | ([], [binding]) => binding,
+                    _ => return Err("speculative operation requires exact query lengths or prefix ceilings exclusively".into()),
+                };
+                if binding.indexing != InputIndexing::SubmissionRow
+                    || binding.value_offset != 0 || binding.padding != 0
+                    || manifest.buffer(&binding.buffer)?.dtype != crate::execution::Dtype::Int32 {
+                    return Err("speculative lengths require one int32 submission-row binding".into());
+                }
+                if !prefix.is_empty() && descriptor.draft_tokens > 0
+                    && descriptor.confidence_width != descriptor.draft_tokens {
+                    return Err("device prefix allocation requires declared proposal confidence output".into());
                 }
             } else if !prefix.is_empty() {
-                return Err("speculative prefix ceilings require a packed combined operation".into());
+                return Err("speculative prefix ceilings require a speculative operation".into());
             }
             for access in &graph.state {
                 access.view.validate(manifest)?;
@@ -491,14 +498,19 @@ impl PreparedContract {
                     GraphOperation::Init,
                     GraphOperation::Restore,
                     GraphOperation::Prefill,
+                    GraphOperation::ScoredPrefill,
+                    GraphOperation::Resume,
+                    GraphOperation::Decode,
+                    GraphOperation::Speculative,
+                    GraphOperation::Mixed,
                 ] {
                     let mut producers = self
                         .graphs
                         .iter()
                         .filter(|producer| producer.kind == operation)
                         .peekable();
-                    if producers.peek().is_none()
-                        || producers.any(|producer| {
+                    let required = matches!(operation, GraphOperation::Init | GraphOperation::Restore | GraphOperation::Prefill);
+                    if (required && producers.peek().is_none()) || producers.any(|producer| {
                             !producer.state.iter().any(|s| {
                                 s.access != StateAccessKind::Read && s.view.contains(pending)
                             })
@@ -515,9 +527,6 @@ impl PreparedContract {
                 descriptor.kind,
                 GraphKind::Decode
                     | GraphKind::Speculative
-                    | GraphKind::Proposal
-                    | GraphKind::Verification
-                    | GraphKind::PackedSpeculative
                     | GraphKind::Mixed
             ) && !graph.inputs.iter().any(|b| {
                 matches!(
@@ -627,6 +636,48 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_token_admission_writes_are_distinct_from_generation_reads() {
+        let mut config = crate::model::tests::config();
+        let manifest = crate::model::testing::manifest(&config);
+        let pending = config.contract.graphs.iter()
+            .find_map(|graph| graph.pending_token.clone()).unwrap();
+        for graph in &mut config.contract.graphs {
+            if matches!(graph.kind, GraphOperation::Init | GraphOperation::Restore) {
+                graph.pending_token = None;
+                for state in &mut graph.state {
+                    if state.view.contains(&pending) {
+                        state.access = StateAccessKind::Write;
+                    }
+                }
+            }
+        }
+        config.contract.validate(&manifest).unwrap();
+        for operation in [GraphOperation::Init, GraphOperation::Restore] {
+            let mut invalid = config.contract.clone();
+            invalid.graphs.iter_mut().find(|graph| graph.kind == operation)
+                .unwrap().pending_token = Some(pending.clone());
+            assert!(invalid.validate(&manifest).unwrap_err().to_string()
+                .contains("pending token requires a declared device-state read"));
+
+            let mut missing_producer = config.contract.clone();
+            missing_producer.graphs.iter_mut().find(|graph| graph.kind == operation)
+                .unwrap().state.retain(|state| !state.view.contains(&pending));
+            assert!(missing_producer.validate(&manifest).unwrap_err().to_string()
+                .contains("device pending-token input lacks an admission or sampling producer"));
+        }
+        let mut invalid = config.contract.clone();
+        for state in &mut invalid.graphs.iter_mut()
+            .find(|graph| graph.kind == GraphOperation::Decode).unwrap().state
+        {
+            if state.view.contains(&pending) {
+                state.access = StateAccessKind::Write;
+            }
+        }
+        assert!(invalid.validate(&manifest).unwrap_err().to_string()
+            .contains("pending token requires a declared device-state read"));
+    }
 
     #[test]
     fn reasoning_terminal_markers_follow_the_declared_tool_opener() {

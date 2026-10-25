@@ -19,18 +19,18 @@ def _execution(*, model_class=PreparedExecution, **changes):
                     "prefill": GraphSignature("prefill", 1, 16, ("tokens", "fresh"))},
         buffers={"frame_index": _tensor("int32", (1,)),
                  "submission_sequence": _tensor("int64", (1,)),
-                 "completion_records": _tensor("int64", (2, 4, 8)),
+                 "completion_records": _tensor("int64", (2, 4, 24)),
                  "tokens": _tensor("int64", (16,)), "fresh": _tensor("bool", (1,))})
     return model_class(**(arguments | changes))
 
 
 def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     execution = _execution(estimated_durations_ns={"decode": 123_000, "prefill": 456_000})
-    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = execution.manifest()
     assert manifest["context"] == 9
-    assert manifest["abi_version"] == 2
+    assert manifest["abi_version"] == 4
     assert manifest["input_frame_bytes"] == 152
     decode, prefill = manifest["graphs"]
     assert decode["estimated_duration_ns"] == 123_000
@@ -49,26 +49,44 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
 
 
 def test_verification_keeps_prefix_width_separate_from_total_rows(monkeypatch):
-    signature = GraphSignature('verification', 4, 6, ('tokens',), packed_token_capacity=12)
+    signature = GraphSignature('speculative', 4, 6, ('tokens',), packed_token_capacity=12)
     execution = _execution(graphs={'verify':object()}, signatures={'verify':signature})
-    spans = [(4096,4),(8192,8),(12288,512),(16384,128),(20480,1)]
+    spans = [(4096,4),(8192,8),(12288,1536),(16384,128),(20480,1)]
     monkeypatch.setattr(execution, '_validate_resources', lambda:(9,[11],spans))
     graph = execution.manifest()['graphs'][0]
     assert (graph['batch_capacity'],graph['token_capacity'],graph['packed_token_capacity']) == (4,6,12)
     for capacity in (3,25):
         with pytest.raises(ValueError,match='packed verification capacity'):
-            GraphSignature('verification',4,6,packed_token_capacity=capacity)
+            GraphSignature('speculative',4,6,packed_token_capacity=capacity)
     with pytest.raises(ValueError,match='packed verification capacity'):
         GraphSignature('decode',4,1,packed_token_capacity=4)
 
 
-def test_execution_manifest_preserves_declared_legacy_producer_geometry(monkeypatch):
-    signatures = {f"proposal{width}": GraphSignature("proposal", 4, width, ("tokens",),
-                  speculation_enabled=True) for width in (2, 4, 6)}
-    execution = _execution(graphs={name: object() for name in signatures}, signatures=signatures)
-    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
-    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12, 13], spans))
-    assert [g["token_capacity"] for g in execution.manifest()["graphs"]] == [2, 4, 6]
+@pytest.mark.parametrize("kind", ("proposal", "verification", "packed_speculative"))
+def test_execution_rejects_partial_speculative_operations(kind):
+    with pytest.raises(ValueError, match="unknown prepared graph operation"):
+        GraphSignature(kind, 4, 4)
+
+
+def test_speculative_metadata_keeps_actual_draft_depth_independent_of_target_width():
+    graph = GraphSignature("speculative", 4, 3, ("query_lengths",),
+                           draft_tokens=7, packed_token_capacity=5)
+    assert (graph.draft_tokens, graph.token_capacity, graph.packed_token_capacity) == (7, 3, 5)
+    with pytest.raises(ValueError, match="width-one rounds require zero"):
+        GraphSignature("speculative", 4, 1, draft_tokens=1)
+    width_one = GraphSignature("speculative", 4, 1, ("speculative_prefix_limits",),
+                               draft_tokens=0, packed_token_capacity=4)
+    assert width_one.draft_tokens == width_one.confidence_width == 0
+
+
+def test_rectangular_round_declares_complete_geometry(monkeypatch):
+    signature = GraphSignature("speculative", 4, 6, ("tokens",))
+    execution = _execution(graphs={"round": object()}, signatures={"round": signature})
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11], spans))
+    graph = execution.manifest()["graphs"][0]
+    assert (graph["batch_capacity"], graph["draft_tokens"], graph["verify_tokens"],
+            graph["packed_token_capacity"]) == (4, 5, 6, 24)
 
 
 def test_resident_binding_is_retained_for_diagnostics_and_excluded_from_export(monkeypatch):
@@ -90,7 +108,7 @@ def test_resident_binding_is_retained_for_diagnostics_and_excluded_from_export(m
     monkeypatch.setattr(flare_heliopause, "EmbeddingTables", Resident)
     model = _execution(model_class=PreparedModel, server_config={}, memory_report={}, session=None,
                        embedding_catalog=catalog, export_events=events)
-    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(model, "_validate_resources", lambda: (9, [11, 12], spans))
     owner = model.prepare_embedding_tables(descriptors=[31, 32])
     assert calls == [(catalog, [31, 32])]
@@ -156,7 +174,7 @@ def test_speculative_manifest_exports_vector_abi(monkeypatch):
     spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = execution.manifest()
-    assert manifest["abi_version"] == 3
+    assert manifest["abi_version"] == 4
     assert manifest["graphs"][0]["kind"] == "speculative"
     assert manifest["graphs"][0]["token_capacity"] == 8
     assert manifest["input_frame_bytes"] == 152
@@ -170,7 +188,7 @@ def test_export_includes_ordinary_graphs_while_diagnostics_select_speculation(mo
         "speculative": GraphSignature("speculative", 1, 2, speculation_enabled=True),
     }
     execution = _execution(graphs=dict.fromkeys(signatures, object()), signatures=signatures)
-    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12, 13, 14], spans))
     exported = execution.manifest(all_variants=True)["graphs"]
     assert {g["name"]: g["speculation_enabled"] for g in exported} == {
@@ -186,7 +204,7 @@ def test_diagnostic_manifest_selects_fixed_width_without_discarding_export_graph
     signatures.update({f"verify-{w}": GraphSignature("speculative", 1, w) for w in range(1, 5)})
     model = _execution(model_class=PreparedModel, graphs=dict.fromkeys(signatures, object()),
         signatures=signatures, server_config={"speculative_fixed_width": width}, memory_report={}, session=None)
-    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(model, "_validate_resources", lambda: (9, list(range(11, 16)), spans))
     selected = model.manifest()["graphs"]
     assert selected[0]["kind"] == "prefill"
@@ -200,6 +218,7 @@ def test_diagnostic_manifest_selects_fixed_width_without_discarding_export_graph
     lambda: GraphSignature("decode", True, 1),
     lambda: GraphSignature("decode", 1, 0),
     lambda: GraphSignature("decode", 1, 1, ("tokens", "tokens")),
+    lambda: GraphSignature("decode", 1, 1, ("token_ids", "token_ids")),
     lambda: GraphSignature("decode", 1, 1, ("completion_records",)),
     lambda: GraphSignature("decode", 1, 1, sampling_mode="automatic"),
     lambda: GraphSignature("speculative", 3, 4),
@@ -239,7 +258,7 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
     spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1), (24576, 4)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11], spans))
     manifest = execution.manifest(all_variants=True)
-    assert manifest["abi_version"] == 3
+    assert manifest["abi_version"] == 4
     graph, = manifest["graphs"]
     from ignition.preparation.runtime_package_pb2 import ExecutionGraph
     encoded = ExecutionGraph(**{k: v for k, v in graph.items() if k != "handle"})
@@ -253,7 +272,8 @@ def test_verification_protobuf_preserves_physical_rows_and_legacy_width_bounds()
     from ignition.preparation.runtime_package_pb2 import ExecutionGraph
     legacy = ExecutionGraph.FromString(b"\x12\x0cverification\x20\x08\x28\x06")
     assert (legacy.batch_capacity, legacy.token_capacity, legacy.packed_token_capacity) == (8, 6, 0)
-    graph = ExecutionGraph(kind="verification", batch_capacity=8, token_capacity=6, packed_token_capacity=24)
+    graph = ExecutionGraph(kind="speculative", batch_capacity=8, token_capacity=6, packed_token_capacity=24,
+                           draft_tokens=5, verify_tokens=6)
     decoded = ExecutionGraph.FromString(graph.SerializeToString())
     assert (decoded.batch_capacity, decoded.token_capacity, decoded.packed_token_capacity) == (8, 6, 24)
 
@@ -271,8 +291,8 @@ def test_mixed_signature_rejects_ambiguous_or_invalid_row_contracts(changes):
         GraphSignature(**(args | changes))
 
 
-def test_mixed_execution_requires_vector_completions():
-    with pytest.raises(ValueError, match="ABI3"):
-        _execution(signatures={"decode": GraphSignature("mixed", 2, 1, ("prefill_row",),
-                    speculation_enabled=False, prefill_capacity=64),
-                    "prefill": GraphSignature("prefill", 1, 16)})
+def test_execution_requires_vector_completions():
+    buffers = dict(_execution().buffers)
+    buffers["completion_records"] = _tensor("int64", (2, 4, 8))
+    with pytest.raises(ValueError, match="completion vectors"):
+        _execution(buffers=buffers)

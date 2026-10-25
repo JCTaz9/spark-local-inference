@@ -22,6 +22,46 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+pub(crate) use crate::cache_support::model_root_from;
+pub use crate::cache_support::{model_root, requested_tensor_parallel, select_deployments};
+
+/// Streams one verified payload slice into the model cache object store.
+struct SliceReader {
+    slice: flare_helios::package::container::Slice,
+    offset: u64,
+}
+
+impl Read for SliceReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.slice.len().saturating_sub(self.offset);
+        let count = (output.len() as u64).min(remaining) as usize;
+        if count == 0 {
+            return Ok(0);
+        }
+        self.slice
+            .read_at(self.offset, &mut output[..count])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+
+/// Install the selected deployment's ready closure into the configured model cache.
+///
+/// Verification, payload hashing, primary rewriting, publication, and the
+/// eviction-safety lease all live in `flare_helios::package::cache`.
+pub fn install_selected(
+    verified: flare_helios::package::protection::VerifiedPackage,
+    metadata: flare_helios::package::reader::Metadata,
+    root: &Path,
+    model_key: &str,
+    entry: &str,
+) -> Result<flare_helios::package::cache::Entry, Failure> {
+    let store = flare_helios::package::cache::Root::open(root)?;
+    let source = flare_helios::package::cache::PackageSource::new(metadata, verified)?;
+    Ok(store.install_package(source, model_key, entry)?)
+}
+
 pub fn default_root() -> PathBuf {
     crate::environment::home_directory()
         .expect("home directory")
@@ -123,8 +163,11 @@ fn component_valid(part: &str) -> bool {
 /// A cache entry path: `bin/NAME` or `packages/DIRECTORY/FILENAME`, with no traversal.
 pub fn entry(cache: &Path, directory: &str, name: &str) -> Result<PathBuf, Failure> {
     let components: Vec<_> = name.split('/').collect();
-    let expected = if directory == "packages" { 2 } else { 1 };
-    if components.len() != expected || !components.iter().all(|part| component_valid(part)) {
+    // Package companions may nest canonical paths; binaries stay a single validated component.
+    if (directory == "packages" && components.len() < 2)
+        || (directory != "packages" && components.len() != 1)
+        || !components.iter().all(|part| component_valid(part))
+    {
         return Err(format!("invalid cache entry name {name:?}").into());
     }
     Ok(cache.join(directory).join(name))
@@ -133,11 +176,16 @@ pub fn entry(cache: &Path, directory: &str, name: &str) -> Result<PathBuf, Failu
 /// The unit eviction removes: a package directory, or an executable file.
 pub fn unit(cache: &Path, path: &Path) -> PathBuf {
     let packages = cache.join("packages");
-    if path.parent().and_then(Path::parent) == Some(packages.as_path()) {
-        path.parent().unwrap().to_owned()
-    } else {
-        path.to_owned()
+    if let Some(stripped) = path.strip_prefix(&packages).ok() {
+        let components: Vec<_> = stripped.components().collect();
+        if components.len() >= 2 {
+            let mut unit = packages;
+            unit.push(components[0]);
+            return unit;
+        }
     }
+    let _ = packages;
+    path.to_owned()
 }
 
 /// Pinned units with their pin counts.
@@ -567,13 +615,12 @@ mod tests {
             assert!(entry(cache, "bin", name).is_err(), "{name}");
         }
         for name in [
-            "a",
-            "a/../escape",
-            "a/b/c",
-            "a/",
-            "a/hidden\\name",
-            "a/.hidden",
+            "export-1/weights/layer-000.safetensors",
+            "export-1/deployments/sm120-tp1/rank-0/graphs.safetensors",
         ] {
+            assert!(entry(cache, "packages", name).is_ok(), "{name}");
+        }
+        for name in ["a", "a/../escape", "a/", "a/hidden\\name", "a/.hidden"] {
             assert!(entry(cache, "packages", name).is_err(), "{name}");
         }
         assert_eq!(
@@ -710,8 +757,37 @@ mod tests {
                 assert_eq!(copied[span.clone()], bytes[span]);
             }
             assert!(copied[108..3_000_000].iter().all(|&b| b == 0));
-            assert!(fs::metadata(path).unwrap().blocks() * 512 < bytes.len() as u64);
         }
+        // Physical sparseness is checked on a separate workload with a large
+        // untouched interior hole. The original transfer above covers the full
+        // parallel/range workload but tmpfs can allocate its large written span
+        // at huge-page granularity, making that path an invalid st_blocks probe.
+        let sparse_size = 1u64 << 30;
+        let sparse_ranges = [(0u64, 4096u64), (sparse_size - 4096, 4096)];
+        let sparse_path = store_parallel(
+            temp.path(),
+            "sparse/m.safetensors",
+            sparse_size,
+            &sparse_ranges,
+            1,
+            |_, part| {
+                Ok(std::io::Cursor::new(vec![
+                    0u8;
+                    part.iter()
+                        .map(|(_, n)| *n as usize)
+                        .sum()
+                ]))
+            },
+        )
+        .unwrap();
+        let sparse_blocks = fs::metadata(&sparse_path).unwrap().blocks() * 512;
+        assert!(
+            sparse_blocks < sparse_size,
+            "sparse allocation {sparse_blocks} must be less than {sparse_size}"
+        );
+        let sparse_bytes = fs::read(&sparse_path).unwrap();
+        assert_eq!(&sparse_bytes[..4096], &vec![0; 4096]);
+        assert_eq!(&sparse_bytes[sparse_size as usize - 4096..], &vec![0; 4096]);
         let parts = split_ranges(&[(10, 3), (100, 2)], 8);
         assert_eq!(
             parts,
@@ -892,5 +968,962 @@ mod tests {
             .is_err()
         );
         assert!(!second.exists());
+    }
+
+    #[test]
+    fn installs_selected_deployment_payloads_into_model_cache() {
+        use flare_helios::package::{
+            PayloadId, cache as model_cache, export, protection, reader, schema::wire,
+        };
+        use flare_helios::runtime_package::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let scratch = std::env::temp_dir().join(format!("flare-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let source = scratch.join("source");
+        let root = scratch.join("cache");
+        fs::create_dir_all(&source).unwrap();
+
+        let bytes = b"layer zero weights".repeat(10);
+        let id = PayloadId::of(&bytes);
+        let raw = scratch.join("layer-000.bin");
+        fs::write(&raw, &bytes).unwrap();
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Test".into(),
+            namespace: "test".into(),
+            public_key,
+            development: false,
+        };
+        let package_id = [7u8; 32];
+
+        let rank = wire::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-0".into(),
+                nbytes: bytes.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                edge_count: 0,
+                ..Default::default()
+            }],
+            initializers: vec![wire::Initializer {
+                allocation: "device-0".into(),
+                destination_offset: 0,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: id.as_bytes().to_vec(),
+                        offset: 0,
+                        nbytes: bytes.len() as u64,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            }],
+            ..Default::default()
+        };
+        let graph_bytes = scratch.join("graph.bin");
+        fs::write(&graph_bytes, b"graph-bytes").unwrap();
+        let graph_nbytes = 11u64;
+        let runtime = flare_helios::runtime_package::wire::ServingContract {
+            model_id: "test-model".into(),
+            identity: "test-model-sm120".into(),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let deployment = wire::DeploymentBody {
+            deployment_id: "sm120-tp1".into(),
+            architecture: vec![12, 0],
+            tensor_parallel: 1,
+            contract: Some(runtime),
+            ..Default::default()
+        };
+        let request = export::PublishRequest {
+            package: wire::PackageBody {
+                model_identity: "test-model".into(),
+                hardware_identity: "sm120".into(),
+                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "test".into(),
+                    official_source: "https://huggingface.co/test/test-model".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![export::PublishDeployment {
+                payloads: vec![],
+                body: deployment,
+                ranks: vec![export::PublishRank {
+                    body: rank,
+                    payloads: vec![export::PublishPayload {
+                        role: wire::PayloadRole::Weights,
+                        relative: "weights/layer-000.safetensors".into(),
+                        tensor: Some("flare.payload".into()),
+                        source: flare_helios::package::container::Slice::new(
+                            std::sync::Arc::new(std::fs::File::open(&raw).unwrap()),
+                            0,
+                            (bytes.len() as u64) as u64,
+                        )
+                        .unwrap(),
+                        id,
+                    }],
+                    resources: vec![export::PublishResource {
+                        kind: wire::ExecutableKind::Graph,
+                        path: graph_bytes,
+                        nbytes: (graph_nbytes) as u64,
+                    }],
+                }],
+            }],
+            package_id,
+            public_key,
+            accepted: "test".into(),
+            no_weights: false,
+        };
+        let published =
+            export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+        let verified = protection::verify(
+            &published.manifest,
+            &[publisher],
+            protection::Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        let metadata = reader::Metadata::open(&source).unwrap();
+        let entry = install_selected(verified, metadata, &root, "test-model", "tp1").unwrap();
+        assert!(entry.directory().join("model.safetensors").is_file());
+        assert!(
+            entry
+                .directory()
+                .join("weights/layer-000.safetensors")
+                .is_file()
+        );
+        assert!(entry.payload("weights/layer-000.safetensors").is_ok());
+
+        let store = model_cache::Root::open(&root).unwrap();
+        let resolved = store.resolve("test-model").unwrap().unwrap();
+        assert_eq!(resolved.id(), "tp1");
+        assert_eq!(
+            resolved
+                .payload("weights/layer-000.safetensors")
+                .unwrap()
+                .len(),
+            bytes.len() as u64
+        );
+        let object = store.payload(id).unwrap().unwrap();
+        assert_eq!(
+            object.path(),
+            store.path().join("blobs").join(id.file_name())
+        );
+        drop(resolved);
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn packed_import_installs_semantic_companions_and_ignores_stray_frontend_tensors() {
+        use flare_helios::package::{
+            PayloadId, cache as model_cache, container, conversion, export, protection, reader,
+            schema::wire,
+        };
+        use flare_helios::runtime_package::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let scratch = std::env::temp_dir().join(format!("flare-packed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let source = scratch.join("source");
+        let root = scratch.join("cache");
+        fs::create_dir_all(&source).unwrap();
+        let bytes = b"packed layer weights".repeat(9);
+        let id = PayloadId::of(&bytes);
+        let raw = scratch.join("layer.bin");
+        fs::write(&raw, &bytes).unwrap();
+        let graph = scratch.join("graph.bin");
+        fs::write(&graph, b"graph-bytes").unwrap();
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Test".into(),
+            namespace: "test".into(),
+            public_key,
+            development: false,
+        };
+        let runtime = flare_helios::runtime_package::wire::ServingContract {
+            model_id: "packed".into(),
+            identity: "packed-sm120".into(),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rank = wire::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(Default::default()),
+            allocations: vec![wire::Allocation {
+                name: "device-0".into(),
+                nbytes: bytes.len() as u64,
+                alignment: 4096,
+                ..Default::default()
+            }],
+            initializers: vec![wire::Initializer {
+                allocation: "device-0".into(),
+                destination_offset: 0,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: id.as_bytes().to_vec(),
+                        offset: 0,
+                        nbytes: bytes.len() as u64,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            }],
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let deployment = wire::DeploymentBody {
+            deployment_id: "sm120-tp1".into(),
+            architecture: vec![12, 0],
+            tensor_parallel: 1,
+            contract: Some(runtime),
+            ..Default::default()
+        };
+        let request = export::PublishRequest {
+            package: wire::PackageBody {
+                model_identity: "packed".into(),
+                hardware_identity: "sm120".into(),
+                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "test".into(),
+                    official_source: "https://huggingface.co/test/packed".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![export::PublishDeployment {
+                payloads: vec![],
+                body: deployment,
+                ranks: vec![export::PublishRank {
+                    body: rank,
+                    payloads: vec![export::PublishPayload {
+                        role: wire::PayloadRole::Weights,
+                        relative: "weights/layer-000.safetensors".into(),
+                        tensor: Some(container::COMPANION_TENSOR.into()),
+                        source: flare_helios::package::container::Slice::new(
+                            std::sync::Arc::new(std::fs::File::open(&raw).unwrap()),
+                            0,
+                            (bytes.len() as u64) as u64,
+                        )
+                        .unwrap(),
+                        id,
+                    }],
+                    resources: vec![export::PublishResource {
+                        kind: wire::ExecutableKind::Graph,
+                        path: graph,
+                        nbytes: (11) as u64,
+                    }],
+                }],
+            }],
+            package_id: [9u8; 32],
+            public_key,
+            accepted: "test".into(),
+            no_weights: false,
+        };
+        let published =
+            export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+
+        // An unrelated tensor in the untrusted primary header grants nothing.
+        let primary_path = source.join("model.safetensors");
+        let primary = container::Container::open(&primary_path).unwrap();
+        let mut output = Vec::new();
+        let mut writer = container::Writer::new(&mut output, container::PAYLOAD_FORMAT).unwrap();
+        for name in primary.tensor_names() {
+            if name.starts_with("align.") {
+                continue;
+            }
+            let slice = primary.tensor(name).unwrap();
+            writer
+                .add(name, slice.len(), container::Source::Slice(slice))
+                .unwrap();
+        }
+        writer
+            .add(
+                "frontend.fake",
+                8,
+                container::Source::Bytes(b"not-real".to_vec()),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        drop(primary);
+        fs::write(&primary_path, &output).unwrap();
+
+        let packed = scratch.join("packed.safetensors");
+        conversion::pack(&source, &packed).unwrap();
+        let metadata = reader::Metadata::open(&packed).unwrap();
+        let verified = protection::verify(
+            &metadata.envelope,
+            &[publisher],
+            protection::Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        assert!(verified.matches_envelope(&metadata.envelope));
+        assert_eq!(published.payloads.len(), 2);
+
+        let entry = install_selected(verified, metadata, &root, "packed", "tp1").unwrap();
+        assert!(
+            entry
+                .directory()
+                .join("weights/layer-000.safetensors")
+                .is_file()
+        );
+        let installed =
+            container::Container::open(&entry.directory().join("model.safetensors")).unwrap();
+        assert!(installed.tensor_names().all(|name| name != "frontend.fake"));
+        assert!(
+            entry
+                .payload("weights/layer-000.safetensors")
+                .unwrap()
+                .len()
+                == bytes.len() as u64
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn source_complete_packages_materialize_selected_targets_before_ready() {
+        use flare_helios::package::{
+            PayloadId, cache as model_cache, container, conversion, derivation, export, protection,
+            reader, schema::wire,
+        };
+        use flare_helios::runtime_package::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let scratch = std::env::temp_dir().join(format!("flare-derived-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let source = scratch.join("source");
+        fs::create_dir_all(&source).unwrap();
+
+        let weights = b"derivable weight payload bytes".to_vec();
+        let target = weights[..weights.len() - 6].to_vec();
+        let weight_id = PayloadId::of(&weights);
+        let target_id = PayloadId::of(&target);
+        let weight_path = scratch.join("weights.bin");
+        fs::write(&weight_path, &weights).unwrap();
+        let target_path = scratch.join("target.bin");
+        fs::write(&target_path, &target).unwrap();
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Test".into(),
+            namespace: "test".into(),
+            public_key,
+            development: false,
+        };
+        let runtime = flare_helios::runtime_package::wire::ServingContract {
+            model_id: "derived".into(),
+            identity: "derived-sm120".into(),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let initializers = [(weight_id, weights.len()), (target_id, target.len())]
+            .iter()
+            .enumerate()
+            .map(|(index, (id, nbytes))| wire::Initializer {
+                allocation: format!("device-{index}"),
+                destination_offset: 0,
+                source: Some(wire::PayloadUse {
+                    slice: Some(wire::PayloadSlice {
+                        payload_id: id.as_bytes().to_vec(),
+                        offset: 0,
+                        nbytes: *nbytes as u64,
+                    }),
+                    role: wire::PayloadRole::Weights as i32,
+                }),
+            })
+            .collect();
+        let rank = wire::RankBody {
+            rank: 0,
+            deployment_id: "sm120-tp1".into(),
+            context: Some(Default::default()),
+            allocations: vec![
+                wire::Allocation {
+                    name: "device-0".into(),
+                    nbytes: weights.len() as u64,
+                    alignment: 4096,
+                    ..Default::default()
+                },
+                wire::Allocation {
+                    name: "device-1".into(),
+                    nbytes: target.len() as u64,
+                    alignment: 4096,
+                    ..Default::default()
+                },
+            ],
+            initializers,
+            graphs: vec![wire::Graph {
+                name: "decode".into(),
+                resource: 0,
+                node_count: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let graph = scratch.join("graph.bin");
+        fs::write(&graph, b"graph-bytes").unwrap();
+        let request = export::PublishRequest {
+            package: wire::PackageBody {
+                model_identity: "derived".into(),
+                hardware_identity: "sm120".into(),
+                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "test".into(),
+                    official_source: "https://huggingface.co/test/derived".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![export::PublishDeployment {
+                payloads: vec![],
+                body: wire::DeploymentBody {
+                    deployment_id: "sm120-tp1".into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 1,
+                    contract: Some(runtime),
+                    ..Default::default()
+                },
+                ranks: vec![export::PublishRank {
+                    body: rank,
+                    payloads: vec![
+                        export::PublishPayload {
+                            role: wire::PayloadRole::Weights,
+                            relative: "weights/layer-000.safetensors".into(),
+                            tensor: Some(container::COMPANION_TENSOR.into()),
+                            source: flare_helios::package::container::Slice::new(
+                                std::sync::Arc::new(std::fs::File::open(&weight_path).unwrap()),
+                                0,
+                                (weights.len() as u64) as u64,
+                            )
+                            .unwrap(),
+                            id: weight_id,
+                        },
+                        export::PublishPayload {
+                            role: wire::PayloadRole::Weights,
+                            relative: "weights/state.safetensors".into(),
+                            tensor: Some(container::COMPANION_TENSOR.into()),
+                            source: flare_helios::package::container::Slice::new(
+                                std::sync::Arc::new(std::fs::File::open(&target_path).unwrap()),
+                                0,
+                                (target.len() as u64) as u64,
+                            )
+                            .unwrap(),
+                            id: target_id,
+                        },
+                    ],
+                    resources: vec![export::PublishResource {
+                        kind: wire::ExecutableKind::Graph,
+                        path: graph,
+                        nbytes: (11) as u64,
+                    }],
+                }],
+            }],
+            package_id: [11u8; 32],
+            public_key,
+            accepted: "test".into(),
+            no_weights: false,
+        };
+        export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+
+        // The production combiner path proves the recipe against captured bytes and
+        // then removes the target's location and companion.
+        let recipe = derivation::Derivation {
+            target: target_id,
+            length: target.len() as u64,
+            operations: vec![derivation::Operation::Copy(derivation::Copy {
+                source: weight_id,
+                source_offset: 0,
+                destination_offset: 0,
+                contiguous: target.len() as u64,
+                outer: vec![],
+            })],
+        };
+        let limits = derivation::Limits::default();
+        let wrong = derivation::Derivation {
+            operations: vec![derivation::Operation::Copy(derivation::Copy {
+                source: weight_id,
+                source_offset: 1,
+                destination_offset: 0,
+                contiguous: target.len() as u64,
+                outer: vec![],
+            })],
+            ..recipe.clone()
+        };
+        assert!(
+            conversion::emit_derivations(&source, std::slice::from_ref(&wrong), &limits).is_err()
+        );
+        assert_eq!(
+            conversion::emit_derivations(&source, std::slice::from_ref(&recipe), &limits).unwrap(),
+            1
+        );
+        assert!(!source.join("weights/state.safetensors").exists());
+
+        let root = scratch.join("cache");
+        let metadata = reader::Metadata::open(&source).unwrap();
+        let verified = protection::verify(
+            &metadata.envelope,
+            &[publisher],
+            protection::Selection::Deployment {
+                deployment: 0,
+                rank: None,
+            },
+        )
+        .unwrap();
+        let entry = install_selected(verified, metadata, &root, "derived", "tp1").unwrap();
+        assert!(
+            entry
+                .directory()
+                .join("weights/tuned/sm120-tp1/derived-000.safetensors")
+                .is_file()
+        );
+        assert_eq!(
+            entry
+                .payload("weights/tuned/sm120-tp1/derived-000.safetensors")
+                .unwrap()
+                .len(),
+            target.len() as u64
+        );
+        let store = model_cache::Root::open(&root).unwrap();
+        assert!(store.payload(target_id).unwrap().is_some());
+        drop(entry);
+        assert_eq!(store.entry("derived", "tp1").unwrap().id(), "tp1");
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn union_acquisition_uses_recipes_from_both_selected_deployments() {
+        use flare_helios::package::{
+            PayloadId, cache as model_cache, container, conversion, derivation, export, protection,
+            reader, schema::wire,
+        };
+        use flare_helios::runtime_package::Publisher;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let scratch = std::env::temp_dir().join(format!("flare-union-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let source = scratch.join("source");
+        fs::create_dir_all(&source).unwrap();
+
+        let w1 = b"first deployment source bytes".to_vec();
+        let w2 = b"second deployment source bytes".to_vec();
+        let t1 = w2[..w2.len() - 4].to_vec();
+        let t2 = w2[1..w2.len() - 3].to_vec();
+        let (w1_id, w2_id) = (PayloadId::of(&w1), PayloadId::of(&w2));
+        let (t1_id, t2_id) = (PayloadId::of(&t1), PayloadId::of(&t2));
+        assert_ne!(t1_id, t2_id);
+        let files = [
+            ("w1", &w1, w1_id),
+            ("w2", &w2, w2_id),
+            ("t1", &t1, t1_id),
+            ("t2", &t2, t2_id),
+        ];
+        let mut paths = Vec::new();
+        for (name, bytes, _) in &files {
+            let path = scratch.join(format!("{name}.bin"));
+            fs::write(&path, bytes).unwrap();
+            paths.push(path);
+        }
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Test".into(),
+            namespace: "test".into(),
+            public_key,
+            development: false,
+        };
+        let runtime = |id: &str| flare_helios::runtime_package::wire::ServingContract {
+            model_id: "union".into(),
+            identity: format!("union-{id}"),
+            max_sequence_tokens: 8,
+            prefill_chunk_size: 1,
+            pages: 1,
+            state_rows: 1,
+            page_tokens: 1,
+            model_contract: Some(flare_helios::runtime_package::wire::ModelContract {
+                vocabulary: 8,
+                graphs: vec![flare_helios::runtime_package::wire::GraphContract {
+                    graph: "decode".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rank_body =
+            |deployment: &str, rank: u32, pair: (PayloadId, u64), extra: (PayloadId, u64)| {
+                let mut initializers = Vec::new();
+                for (index, (id, nbytes)) in [pair, extra].iter().enumerate() {
+                    initializers.push(wire::Initializer {
+                        allocation: format!("device-{index}"),
+                        destination_offset: 0,
+                        source: Some(wire::PayloadUse {
+                            slice: Some(wire::PayloadSlice {
+                                payload_id: id.as_bytes().to_vec(),
+                                offset: 0,
+                                nbytes: *nbytes,
+                            }),
+                            role: wire::PayloadRole::Weights as i32,
+                        }),
+                    });
+                }
+                wire::RankBody {
+                    rank,
+                    deployment_id: deployment.into(),
+                    context: Some(Default::default()),
+                    allocations: (0..2)
+                        .map(|index| wire::Allocation {
+                            name: format!("device-{index}"),
+                            nbytes: if index == 0 { pair.1 } else { extra.1 },
+                            alignment: 4096,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    initializers,
+                    graphs: vec![wire::Graph {
+                        name: "decode".into(),
+                        resource: 0,
+                        node_count: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+            };
+        let graph1 = scratch.join("graph1.bin");
+        fs::write(&graph1, b"graph-one!!").unwrap();
+        let graph2 = scratch.join("graph2.bin");
+        fs::write(&graph2, b"graph-two!!").unwrap();
+        let payload =
+            |relative: &str, path: &Path, nbytes: usize, id: PayloadId| export::PublishPayload {
+                role: wire::PayloadRole::Weights,
+                relative: relative.into(),
+                tensor: Some(container::COMPANION_TENSOR.into()),
+                source: flare_helios::package::container::Slice::new(
+                    std::sync::Arc::new(std::fs::File::open(path).unwrap()),
+                    0,
+                    nbytes as u64,
+                )
+                .unwrap(),
+                id,
+            };
+        let request = export::PublishRequest {
+            package: wire::PackageBody {
+                model_identity: "union".into(),
+                hardware_identity: "sm120".into(),
+                frontend: Some(flare_helios::runtime_package::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    flare_helios::runtime_package::wire::DefaultSamplingParameters::default(),
+                ),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "test".into(),
+                    official_source: "https://huggingface.co/test/union".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            payloads: vec![],
+            deployments: vec![
+                export::PublishDeployment {
+                    payloads: vec![],
+                    body: wire::DeploymentBody {
+                        deployment_id: "sm120-tp1".into(),
+                        architecture: vec![12, 0],
+                        tensor_parallel: 1,
+                        contract: Some(runtime("tp1")),
+                        ..Default::default()
+                    },
+                    ranks: vec![export::PublishRank {
+                        body: rank_body(
+                            "sm120-tp1",
+                            0,
+                            (w1_id, w1.len() as u64),
+                            (t1_id, t1.len() as u64),
+                        ),
+                        payloads: vec![
+                            payload("weights/tp1/w1.safetensors", &paths[0], w1.len(), w1_id),
+                            payload("weights/tp1/t1.safetensors", &paths[2], t1.len(), t1_id),
+                        ],
+                        resources: vec![export::PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph1,
+                            nbytes: (11) as u64,
+                        }],
+                    }],
+                },
+                export::PublishDeployment {
+                    payloads: vec![],
+                    body: wire::DeploymentBody {
+                        deployment_id: "sm120-tp2".into(),
+                        architecture: vec![12, 0],
+                        tensor_parallel: 2,
+                        contract: Some(runtime("tp2")),
+                        ..Default::default()
+                    },
+                    ranks: vec![
+                        export::PublishRank {
+                            body: rank_body(
+                                "sm120-tp2",
+                                0,
+                                (w2_id, w2.len() as u64),
+                                (t2_id, t2.len() as u64),
+                            ),
+                            payloads: vec![
+                                payload("weights/tp2/w2.safetensors", &paths[1], w2.len(), w2_id),
+                                payload("weights/tp2/t2.safetensors", &paths[3], t2.len(), t2_id),
+                            ],
+                            resources: vec![export::PublishResource {
+                                kind: wire::ExecutableKind::Graph,
+                                path: graph2.clone(),
+                                nbytes: 11,
+                            }],
+                        },
+                        export::PublishRank {
+                            body: rank_body(
+                                "sm120-tp2",
+                                1,
+                                (w2_id, w2.len() as u64),
+                                (t2_id, t2.len() as u64),
+                            ),
+                            payloads: vec![],
+                            resources: vec![export::PublishResource {
+                                kind: wire::ExecutableKind::Graph,
+                                path: graph2,
+                                nbytes: (11) as u64,
+                            }],
+                        },
+                    ],
+                },
+            ],
+            package_id: [13u8; 32],
+            public_key,
+            accepted: "test".into(),
+            no_weights: false,
+        };
+        export::publish(&request, &key, export::Destination::Directory(&source)).unwrap();
+
+        let limits = derivation::Limits::default();
+        let recipe = |target: PayloadId, source: PayloadId, length: u64| derivation::Derivation {
+            target,
+            length,
+            operations: vec![derivation::Operation::Copy(derivation::Copy {
+                source,
+                source_offset: 0,
+                destination_offset: 0,
+                contiguous: length,
+                outer: vec![],
+            })],
+        };
+        // The TP1 target is derived from the TP2 source, so its recipe needs
+        // authority from both selected deployments.
+        let mut second = recipe(t2_id, w2_id, t2.len() as u64);
+        if let derivation::Operation::Copy(copy) = &mut second.operations[0] {
+            copy.source_offset = 1;
+        }
+        let recipes = vec![recipe(t1_id, w2_id, t1.len() as u64), second];
+        assert_eq!(
+            conversion::emit_derivations(&source, &recipes, &limits).unwrap(),
+            2
+        );
+
+        let root = scratch.join("cache");
+        let metadata = reader::Metadata::open(&source).unwrap();
+        let sizes = crate::package_cache::requested_tensor_parallel(&[1], 1).unwrap();
+        assert!(
+            crate::package_cache::select_deployments(&metadata, &[publisher.clone()], &sizes)
+                .is_err()
+        );
+        let selections = crate::package_cache::select_deployments(
+            &metadata,
+            &[publisher.clone()],
+            &[1, 2].iter().copied().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let store = model_cache::Root::open(&root).unwrap();
+        // The real union installs both selected deployments and both targets.
+        let metadata = reader::Metadata::open(&source).unwrap();
+        let all = crate::package_cache::requested_tensor_parallel(&[1, 2], 2).unwrap();
+        let selections =
+            crate::package_cache::select_deployments(&metadata, &[publisher.clone()], &all)
+                .unwrap();
+        let verified =
+            protection::verify(&metadata.envelope, &[publisher.clone()], selections[0]).unwrap();
+        let union = model_cache::PackageSource::new(metadata, verified)
+            .unwrap()
+            .union(&[publisher], &selections)
+            .unwrap();
+        let entry = store.install_package(union, "union", "tp1+tp2").unwrap();
+        let directory = entry.directory();
+        assert!(directory.join("weights/tp1/w1.safetensors").is_file());
+        assert!(directory.join("weights/tp2/w2.safetensors").is_file());
+        assert!(
+            std::fs::read_dir(directory.join("weights/tuned/sm120-tp1"))
+                .map(|mut dir| dir.next().is_some())
+                .unwrap_or(false)
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn model_keys_are_injective_and_keep_distinct_repositories_apart() {
+        use flare_helios::package::cache::model_key;
+        assert_eq!(model_key("org/model").unwrap(), "org_2Fmodel");
+        assert_ne!(model_key("a/b").unwrap(), model_key("a--b").unwrap());
+        assert_ne!(model_key("a%2Fb").unwrap(), model_key("a/b").unwrap());
+        assert!(model_key("").is_err());
+    }
+
+    #[test]
+    fn tensor_parallel_requests_default_deduplicate_and_reject_zero() {
+        assert_eq!(requested_tensor_parallel(&[], 2).unwrap(), vec![2]);
+        assert_eq!(requested_tensor_parallel(&[], 0).unwrap(), vec![1]);
+        assert_eq!(
+            requested_tensor_parallel(&[2, 1, 2], 8).unwrap(),
+            vec![1, 2]
+        );
+        assert!(requested_tensor_parallel(&[0], 1).is_err());
+    }
+
+    #[test]
+    fn model_root_prefers_explicit_then_configured_then_default() {
+        let home = std::env::temp_dir().join(format!("flare-model-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".config/flare")).unwrap();
+        let config = home.join(".config/flare/config.toml");
+        fs::write(
+            &config,
+            "[server]\n# package_cache = \"/commented\"\n[paths] # paths section\nhub_cache = '~/.cache/hf'\npackage_cache = \"/data/flare-blobs #1\"   # trailing comment\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            model_root_from(&home, Some(&config), None).unwrap(),
+            PathBuf::from("/data/flare-blobs #1")
+        );
+        assert_eq!(
+            model_root_from(&home, Some(&config), Some(Path::new("~/custom cache"))).unwrap(),
+            home.join("custom cache")
+        );
+        assert_eq!(
+            model_root_from(&home, None, None).unwrap(),
+            home.join(".cache/flare/packages")
+        );
+
+        fs::write(&config, "[paths]\npackage_cache = \"\"\n").unwrap();
+        assert_eq!(
+            model_root_from(&home, Some(&config), None).unwrap(),
+            home.join(".cache/flare/packages")
+        );
+        fs::write(&config, "[server]\nmodel = \"x\"\n").unwrap();
+        fs::write(&config, "[paths]\npackage_cache = \"~/cached\"\n").unwrap();
+        assert_eq!(
+            model_root_from(&home, Some(&config), None).unwrap(),
+            home.join("cached")
+        );
+        fs::write(&config, "[paths]\npackage_cache = 5\n").unwrap();
+        assert!(model_root_from(&home, Some(&config), None).is_err());
+        assert!(model_root_from(&home, Some(&config), Some(Path::new("/override"))).is_ok());
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod entry_path_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn nested_packages_validate_and_evict_at_the_package_directory() {
+        let cache = Path::new("/cache");
+        let nested = entry(
+            cache,
+            "packages",
+            "export-1/deployments/sm120-tp1/rank-0/graphs.safetensors",
+        )
+        .unwrap();
+        assert_eq!(
+            unit(cache, &nested),
+            Path::new("/cache/packages/export-1").to_path_buf()
+        );
+        assert!(entry(cache, "packages", "export-1/model.safetensors").is_ok());
+        assert!(entry(cache, "packages", "underlying-payload/..").is_err());
+        assert!(entry(cache, "packages", "../escape/file").is_err());
+        assert!(entry(cache, "bin", "nested/tool").is_err());
+        assert!(entry(cache, "bin", "tool").is_ok());
     }
 }

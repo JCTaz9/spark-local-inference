@@ -42,7 +42,7 @@ def _staging():
         row_generations=torch.zeros(4, dtype=torch.int64, device="cuda"),
         live_rows=torch.zeros(1, dtype=torch.int32, device="cuda"),
         page_tables=torch.tensor([[0, 1, 2, 3]] * 4, dtype=torch.int32, device="cuda"))
-    records = torch.full((2, 4, 8), -22, dtype=torch.int64, device="cuda")
+    records = torch.full((2, 4, 24), -22, dtype=torch.int64, device="cuda")
     frame = torch.zeros(1, dtype=torch.int32, device="cuda")
     sequence = torch.ones(1, dtype=torch.int64, device="cuda")
     return metadata, admissions, inputs, records, frame, sequence
@@ -104,7 +104,7 @@ def test_native_initialize_publish_restore_preserves_exact_hybrid_bytes(backing)
         _command(metadata, source=3, destination=3, operation=1, expected=0, qsa_slot=3)
         metadata.num_ops.fill_(1)
         _replay(worker, 0)
-        assert records[0, 2].cpu().tolist() == [10, 1, 0, 0, -1, 1, 0, 0]
+        assert records[0, 2].cpu()[..., :8].tolist() == [10, 1, 0, 0, -1, 1, 0, 0]
         assert requests.ple_history[2].cpu().tolist() == [248044, 248044]
         assert requests.seed[2].item() == 2**64 - 1
         assert requests.histogram[2].sum() == 65
@@ -131,7 +131,7 @@ def test_native_initialize_publish_restore_preserves_exact_hybrid_bytes(backing)
         _replay(worker, 2)
         prefix_bytes = pool.layout.region("qsa.3.raw_keys").offset
         assert torch.equal(pool.backing[3, :prefix_bytes], pool.backing[5, :prefix_bytes])
-        assert records[0, 2].cpu().tolist() == [10, 2, 65, 0, -1, 1, 0, 0]
+        assert records[0, 2].cpu()[..., :8].tolist() == [10, 2, 65, 0, -1, 1, 0, 0]
         pool.backing[3, 0] = 19
         assert pool.backing[5, 0] == 5
 
@@ -141,7 +141,7 @@ def test_native_initialize_publish_restore_preserves_exact_hybrid_bytes(backing)
         sequence.fill_(3)
         _replay(worker, 1)
         assert torch.equal(pool.backing[2], pool.backing[5])
-        assert records[1, 1].cpu().tolist() == [20, 3, 65, 0, -1, 1, 0, 0]
+        assert records[1, 1].cpu()[..., :8].tolist() == [20, 3, 65, 0, -1, 1, 0, 0]
         assert requests.histogram[1].sum() == 65 and requests.generated_tokens[1] == 0
         assert requests.pending_token[1] == -1
         for state in qsa:

@@ -28,6 +28,9 @@ def layout(**overrides):
     values.update(overrides)
     from ignition.preparation import contract as c, runtime_package_pb2 as p
     bindings = {name: list(c.text_inputs(key[0]).values()) for key, name in values["graphs"].items()}
+    for name in values.get("confidence_widths", {}):
+        bindings[name] = [b for b in bindings[name] if b["buffer"] != "query_lengths"]
+        bindings[name].append(c.binding("speculative_prefix_limits", p.SPECULATIVE_PREFIX_LIMIT))
     specs = {}
     for fields in bindings.values():
         for b in fields:
@@ -136,7 +139,7 @@ def test_a_cold_request_initializes_prefills_in_chunks_snapshots_and_decodes():
     step = scheduler.plan()
     assert (step.kind, step.graph, step.lanes[0].tokens) == ("speculative", "speculative1x3", 3)
     packed = uploads(scheduler, step)
-    assert packed["token_ids"] == {0: [42, 0, 0, 0]} and packed["query_lengths"] == {0: [3, 0, 0, 0]}
+    assert "token_ids" not in packed and packed["query_lengths"] == {0: [3, 0, 0, 0]}
     assert packed["sample_enabled"] == {0: [1, 0, 0, 0]}
     scheduler.complete(step, records(scheduler, step, {first: (1, 702, [43, 44], 0, 2, 1)}))
     assert first.generated == [42, 43, 44] and first.consumed == 702 and first.pending_token == 44
@@ -190,7 +193,7 @@ def test_an_identical_prompt_restores_its_checkpoint_and_shares_its_complete_pag
 
     step = scheduler.plan()
     assert step.graph == "speculative4x3"
-    assert uploads(scheduler, step)["token_ids"] == {0: [50, 51, 52, 0]}
+    assert "token_ids" not in uploads(scheduler, step)
     assert scheduler.stats["prefix_hits"] == 3
 
 
@@ -393,18 +396,10 @@ def test_layout_selects_the_serving_variant_of_each_graph():
         Model.buffers[name] = tensor
     result = Layout.of(Model())
     assert result.graphs == {("prefill", 1, 128): "prefill128", ("init", 4, 1): "init4",
-                             ("speculative", 4, 2): "speculative4x2"}
+                             ("speculative", 4, 2, 8, 1): "speculative4x2"}
     assert (result.capacity, result.max_active, result.table_width, result.draft_pages) == (4, 3, 32, 1)
     assert (result.execution_width, result.state_row(2), result.snapshot_row(1)) == (2, 3, 5)
 
-    Model.signatures["proposal4x3"] = Signature("proposal", 4, 3, True)
-    Model.signatures["verification4x2"] = Signature("verification", 4, 2, True)
-    Model.signatures["speculative4x1"] = Signature("speculative", 4, 1, True)
-    result = Layout.of(Model())
-    assert result.graphs["speculative", 4, 2] == "verification4x2"
-    assert result.graphs["speculative", 4, 1] == "speculative4x1"
-    assert result.paired_graphs == frozenset({"verification4x2"})
-    assert not any(kind == "proposal" for kind, _, _ in result.graphs)
 
 
 def test_native_confidence_uses_conditional_survival_without_observed_acceptance_updates():
@@ -415,18 +410,18 @@ def test_native_confidence_uses_conditional_survival_without_observed_acceptance
     assert acceptance.expected(4) == pytest.approx(2.1)
 
 
-def packed_layout(*, combined=True):
-    kind = "packed_speculative" if combined else "speculative"
+def packed_layout(*, gpu_prefix=True):
+    kind = "speculative"
     graphs = {("speculative", batch, 1): f"width-one-{batch}" for batch in (1, 2, 4)}
-    graphs.update({(kind, 4, 6, capacity, 5 if combined else 0): f"packed-{capacity}"
+    graphs.update({(kind, 4, 6, capacity, 5): f"packed-{capacity}"
                    for capacity in (4, 8, 16, 24)})
     return layout(graphs=graphs, widths=(1, 6),
-                  paired_graphs=frozenset() if combined else frozenset(f"packed-{p}" for p in (4, 8, 16, 24)),
+                  confidence_widths={f"packed-{p}": 5 for p in (4, 8, 16, 24)} if gpu_prefix else {},
                   completion_cursors={f"packed-{p}": 1 for p in (4, 8, 16, 24)})
 
 
-def ready_packed(*, combined=True, capacity=4, remaining=(20, 20, 20)):
-    scheduler = Scheduler(packed_layout(combined=combined), prefix_cache=False)
+def ready_packed(*, gpu_prefix=True, capacity=4, remaining=(20, 20, 20)):
+    scheduler = Scheduler(packed_layout(gpu_prefix=gpu_prefix), prefix_cache=False)
     requests = [request(i, [10, 11], limit=n + 1) for i, n in enumerate(remaining)]
     for current in requests:
         scheduler.submit(current)
@@ -451,7 +446,7 @@ def test_packed_round_selects_each_physical_capacity_and_uploads_immutable_ceili
         scheduler, requests = ready_packed(capacity=capacity)
         step = scheduler.plan()
         assert (step.kind, step.graph, step.batch, step.width, step.packed_tokens, step.draft_tokens) == (
-            "packed_speculative", f"packed-{capacity}", 4, 6, capacity, 5)
+            "speculative", f"packed-{capacity}", 4, 6, capacity, 5)
         assert step.sequence == 1 and tuple(lane.tokens for lane in step.lanes) == (6, 6, 6)
         packed = uploads(scheduler, step)
         assert packed["speculative_prefix_limits"] == {0: [6, 6, 6, 0]}
@@ -519,7 +514,7 @@ def test_packed_ceilings_bound_output_context_and_device_errors_remain_visible()
     scheduler, requests = ready_packed(remaining=(1, 2, 20))
     requests[2].consumed = scheduler.layout.context - 2
     step = scheduler.plan()
-    assert step.kind == 'packed_speculative'
+    assert step.kind == 'speculative'
     assert [lane.tokens for lane in step.lanes] == [1, 2, 2]
     rows = packed_records(scheduler, step, (0, 0, 0))
     rows[requests[0].slot, 5] = 2
@@ -535,31 +530,50 @@ def test_packed_ceilings_bound_output_context_and_device_errors_remain_visible()
     assert scheduler.device_errors[256] == 1
 
 
-def test_separate_packed_verification_keeps_capacity_and_allocates_host_lengths():
-    scheduler, _ = ready_packed(combined=False)
+def test_cpu_packed_round_keeps_capacity_and_allocates_exact_host_lengths():
+    scheduler, _ = ready_packed(gpu_prefix=False)
     step = scheduler.plan()
-    assert (step.kind, step.graph, step.sequence, step.packed_tokens) == ('speculative', 'packed-4', 2, 4)
+    assert (step.kind, step.graph, step.sequence, step.packed_tokens) == ('speculative', 'packed-4', 1, 4)
     assert sum(lane.tokens for lane in step.lanes) == 4
     packed = uploads(scheduler, step)
     assert packed['query_lengths'] == {0: [2, 1, 1, 0]}
     assert 'speculative_prefix_limits' not in packed
 
 
-def test_layout_reads_real_combined_catalog_and_retains_all_c32_p128_shapes():
+def test_fixed_host_round_preserves_full_prefixes_and_selects_sufficient_rows():
+    from dataclasses import replace
+
+    scheduler = Scheduler(replace(packed_layout(gpu_prefix=False), fixed_width=6), prefix_cache=False)
+    members = [request(i, [10, 11], limit=20) for i in range(3)]
+    for member in members:
+        scheduler.submit(member)
+    scheduler._admit()
+    for member in members:
+        member.phase, member.consumed, member.generated = "decode", 2, [42]
+    for shape in scheduler.layout.graphs:
+        scheduler.policy.costs.observe(shape, 1_000_000 if len(shape) == 5 and shape[3] == 4 else 100_000_000)
+    step = scheduler.plan()
+    assert step.packed_tokens == 24 and [lane.tokens for lane in step.lanes] == [6, 6, 6]
+    assert uploads(scheduler, step)["query_lengths"] == {0: [6, 6, 6, 0]}
+
+
+def test_layout_reads_complete_catalog_and_retains_all_c32_p128_shapes():
     from types import SimpleNamespace
     import torch
     from ignition.components.capacity import speculative_shapes
     from ignition.preparation.execution import GraphSignature
 
     shapes = speculative_shapes(32, (1, 2, 3, 4, 5, 6), 128)
-    graphs = {('speculative', batch, 1): f'width-one-{batch}' for batch, width in shapes if width == 1}
-    graphs.update({('packed_speculative', batch, 6, batch * width, 5): f'packed-{batch}-{batch * width}'
+    graphs = {('speculative', batch, 1, batch, 0): f'width-one-{batch}' for batch, width in shapes if width == 1}
+    graphs.update({('speculative', batch, 6, batch * width, 5): f'packed-{batch}-{batch * width}'
                    for batch, width in shapes if width > 1})
-    fixture = layout(capacity=32, max_active=32, widths=(1, 2, 3, 4, 5, 6), graphs=graphs)
+    fixture = layout(capacity=32, max_active=32, widths=(1, 2, 3, 4, 5, 6), graphs=graphs,
+                     confidence_widths={name: key[4] for key, name in graphs.items() if key[4]})
     signatures = {name: GraphSignature(*key[:3], tuple(fixture.bindings[name][i]['buffer']
                   for i in range(len(fixture.bindings[name]))), speculation_enabled=True,
                   packed_token_capacity=key[3] if len(key) == 5 else 0,
-                  draft_tokens=key[4] if len(key) == 5 else None)
+                  draft_tokens=key[4] if len(key) == 5 else None,
+                  confidence_width=key[4] if len(key) == 5 else 0)
                   for key, name in graphs.items()}
     buffers = {name: torch.from_numpy(np.zeros(shape, dtype=dtype))
                for name, (dtype, shape) in fixture.buffer_specs.items()}
@@ -573,9 +587,9 @@ def test_layout_reads_real_combined_catalog_and_retains_all_c32_p128_shapes():
                             for name, bindings in fixture.bindings.items()]))
     actual = Layout.of(SimpleNamespace(server_config=config, buffers=buffers,
                                        signatures=signatures, max_active=32))
-    assert actual.graphs == graphs and len(actual.packed_shapes) == 28
+    assert actual.graphs == graphs and len(actual.packed_shapes) == 34
     assert all(lag == 1 for lag in actual.completion_cursors.values())
-    assert len(actual.paired_graphs) == 0
+    assert len(actual.confidence_widths) == 28
     scheduler = Scheduler(actual, prefix_cache=False)
     requests = [request(i, [10, 11], limit=20) for i in range(32)]
     for current in requests:
@@ -585,7 +599,7 @@ def test_layout_reads_real_combined_catalog_and_retains_all_c32_p128_shapes():
         current.phase, current.consumed, current.generated = 'decode', 2, [42]
     step = scheduler.plan()
     assert (step.kind, step.batch, step.width, step.packed_tokens, step.draft_tokens) == (
-        'packed_speculative', 32, 6, 128, 5)
+        'speculative', 32, 6, 128, 5)
     assert len(step.lanes) == 32 and sum(lane.tokens for lane in step.lanes) == 192
     assert uploads(scheduler, step)['speculative_prefix_limits'] == {0: [6] * 32}
 

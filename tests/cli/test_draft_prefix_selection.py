@@ -95,7 +95,7 @@ def test_capacity_configuration_and_explicit_flags_override_recipe_defaults(tmp_
 def test_plan_and_rebuild_metadata_record_prefix_selection():
     from types import SimpleNamespace
     from tests.cli.test_planning import derive
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as p
+    from ignition.preparation import rebuild_manifest
 
     plan = derive(speculation=settings())
     assert plan.speculative_token_capacity == 128
@@ -103,6 +103,3 @@ def test_plan_and_rebuild_metadata_record_prefix_selection():
     encoded = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
     assert encoded["speculation"]["draft_prefix_selection"] == "gpu"
     assert encoded["speculation"]["token_capacity"] == 128
-    legacy = p.RebuildSpeculation.FromString(b"\x08\x05\x10\x01\x1a\x03mtp\x30\x01")
-    assert legacy.draft_prefix_selection == ""
-    assert legacy.draft_tokens == 5 and legacy.packed_verification

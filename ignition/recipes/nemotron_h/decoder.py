@@ -53,7 +53,7 @@ class PreparedDecoder:
         self.target_layers = () if weights.draft is None else config.draft.target_layers
         self.auxiliary = None if not self.target_layers else buffers.zeros(
             (source.shape[0], len(self.target_layers) * config.hidden), torch.bfloat16)
-        self.width = source.shape[0] // metadata.lengths.numel() if mode == "verify" else 1
+        self.width = metadata.max_query_tokens if mode == "verify" else 1
         self.replay = None
         if weights.draft is not None:
             indices = tuple(i for i, kind in enumerate(config.layers) if kind == "mamba")
@@ -76,7 +76,8 @@ class PreparedDecoder:
             kwargs = dict(session=session, name=prefix, workspace=workspace, buffers=buffers)
             if kind == "mamba":
                 block = PreparedMamba(w, source, pool.recurrent(index), self.delta, config, mode=mode,
-                    replay=self.replay, records=pool.replay_records(index) if mode == "verify" else None, **kwargs)
+                    replay=self.replay, records=pool.replay_records(index) if mode == "verify" else None,
+                    verification_width=self.width, **kwargs)
             elif kind == "attention":
                 key, value = pool.attention(index, config)
                 block = PreparedAttention(w, source, metadata, key, value, config, mode=mode,

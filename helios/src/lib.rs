@@ -10,6 +10,8 @@ pub mod offload;
 mod os;
 #[cfg(feature = "server")]
 pub mod output;
+#[cfg(feature = "runtime-package")]
+pub mod package;
 mod replay;
 #[cfg(feature = "runtime-package")]
 pub mod runtime_package;

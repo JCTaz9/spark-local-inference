@@ -5,7 +5,6 @@
 use serde_json::{Value, json};
 
 use super::{
-    VerifiedPackage,
     format::invalid,
     protobuf::wire::{self, Memory},
 };
@@ -20,7 +19,7 @@ pub struct InspectionOptions {
     pub all: bool,
 }
 
-impl VerifiedPackage {
+impl super::protection::LegacyVerified {
     /// Describe the package from its verified index. Enumerations appear by name; byte counts
     /// are exact; every rank bundle the copy holds is listed in index order. The document does
     /// not name the file, which the caller knows by the path it opened.
@@ -209,7 +208,7 @@ pub(super) fn describe_index(
     Ok(value)
 }
 
-fn frontend_json(
+pub(super) fn frontend_json(
     settings: &wire::FrontendSettings,
     contract: Option<&wire::FrontendContract>,
 ) -> Value {
@@ -256,7 +255,7 @@ fn frontend_json(
     })
 }
 
-fn vision_json(
+pub(super) fn vision_json(
     vision: Option<&wire::VisionCapacity>,
     settings: &wire::FrontendSettings,
     context_tokens: Option<u64>,
@@ -617,6 +616,7 @@ mod tests {
                 input_frame_bytes: 0,
                 buffers: vec![],
                 graphs: vec![wire::ExecutionGraph {
+                    confidence_width: 0,
                     name: "decode_b32".into(),
                     kind: "decode".into(),
                     sampling_mode: "sample".into(),
@@ -678,7 +678,10 @@ mod tests {
             patches_per_feature: 0,
             patch_capacities: vec![],
         };
-        assert_eq!(vision_json(Some(&disabled), &settings, Some(131072)), Value::Null);
+        assert_eq!(
+            vision_json(Some(&disabled), &settings, Some(131072)),
+            Value::Null
+        );
         let enabled = wire::VisionCapacity {
             feature_slots: 4,
             features_per_request: 4096,
@@ -696,14 +699,26 @@ mod tests {
         assert_eq!(absent_context["image_feature_window_tokens"], 4096);
         let index = wire::ModelIndex {
             contract: Some(wire::ServingContract {
-                model_contract: Some(wire::ModelContract { vision: Some(enabled), ..Default::default() }),
-                max_sequence_tokens: 131072, ..Default::default()
+                model_contract: Some(wire::ModelContract {
+                    vision: Some(enabled),
+                    ..Default::default()
+                }),
+                max_sequence_tokens: 131072,
+                ..Default::default()
             }),
-            frontend: Some(settings.clone()), sampling_defaults: Some(Default::default()),
+            frontend: Some(settings.clone()),
+            sampling_defaults: Some(Default::default()),
             ..Default::default()
         };
-        let inspected = describe_index(&index, InspectionOptions { frontend: true,
-            ..Default::default() }, None).unwrap();
+        let inspected = describe_index(
+            &index,
+            InspectionOptions {
+                frontend: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(inspected["vision"]["max_image_tokens_per_prompt"], 131072);
         assert_eq!(inspected["vision"]["image_feature_window_tokens"], 4096);
         assert_eq!(value["image"]["profile"], "deepseek4");

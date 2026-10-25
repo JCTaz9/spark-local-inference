@@ -39,9 +39,8 @@ class BatchInputs:
 class PreparedBatch:
     """Map request slots to packed KDA and sparse-MLA metadata inside a graph.
 
-    Rust uploads prefill spans or one decode token per packed request to every
-    rank. Rank zero checks decode tokens against its pending GPU samples; peers
-    consume the same uploads without sampling. Validation precedes persistent
+    Rust uploads prefill spans and request identities to every rank. Decode
+    gathers pending tokens and positions from replicated GPU state. Validation precedes persistent
     model-state writes. Invalid or stale rows contribute no tokens or cache
     addresses. Recipes compile these tensor operations together with forward.
     """
@@ -64,7 +63,6 @@ class PreparedBatch:
 
         self.shards = ContextShards() if shards is None else shards
         self.validate_prefill = validate_prefill
-        self.accept_unsampled = shard.rank != 0
         device = metadata.token_ids.device
         self.row_ids = torch.arange(rows, device=device)
         self.slot_ids = torch.arange(self.capacity, device=device)
@@ -101,8 +99,7 @@ class PreparedBatch:
             if self.validate_prefill is not None:
                 valid &= self.validate_prefill(uploaded, lengths)
         else:
-            valid &= (uploaded >= 0) & (uploaded < r.vocab_size)
-            valid &= (pending == uploaded) | (self.accept_unsampled & (pending < 0))
+            valid &= (pending >= 0) & (pending < r.vocab_size)
         present = resident & (r.status[safe_slots] == RUNNING)
         bad = present & ~valid
         bad_slots = ((self.slot_ids[:, None] == slots[None, :]) & bad[None, :]).any(1)
@@ -150,7 +147,7 @@ class PreparedBatch:
         index.positions.copy_(torch.where(live_token, position, -1))
         index.token_slots.copy_(torch.where(live_token,
             self.shards.token_slots(position, index.block_table[request]), -1))
-        tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else b.token_ids[request]
+        tokens = b.token_ids[:self.tokens] if self.mode == "prefill" else t.pending_tokens[request]
         m.token_ids.copy_(torch.where(live_token, tokens, 0))
 
     def finish(self):

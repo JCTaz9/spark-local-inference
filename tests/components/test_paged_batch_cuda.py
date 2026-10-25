@@ -1,4 +1,4 @@
-"""Queued single-rank decode consumes GPU-owned pending tokens."""
+"""Queued decode consumes GPU-owned pending tokens on every rank."""
 
 import os
 from types import SimpleNamespace
@@ -62,18 +62,19 @@ def test_packed_prefixes_keep_individual_lengths_and_total_rows_independent(rows
         graph.reset()
 
 
+@pytest.mark.parametrize("rank,world", [(0, 1), (0, 4), (3, 4)])
 @torch.no_grad()
-def test_queued_decode_uses_pending_device_token_and_rejects_invalid_state():
+def test_queued_decode_uses_pending_device_token_and_rejects_invalid_state(rank, world):
     device = torch.device("cuda", 0)
     requests = DeviceRequestState.allocate(device, vocab_size=256, capacity=2)
     inputs = BatchInputs.allocate(2, 2, device, capacity=2)
     metadata = Metadata.allocate(2, 2, 2, device)
     pool = SimpleNamespace(memory_capacity=torch.tensor([3, 4], device=device))
     batch = PreparedBatch(inputs, requests, metadata, mode="decode",
-                          shard=TensorParallelShard(0, 1), pool=pool)
+                          shard=TensorParallelShard(rank, world), pool=pool)
 
     def step():
-        batch.begin(batch.validate())
+        batch.begin(batch.validate() * world)
         batch.finish()
         # A deterministic device sampler supplies the next token without a host round trip.
         requests.pending_token.copy_(torch.where(requests.status == RUNNING,
@@ -91,7 +92,7 @@ def test_queued_decode_uses_pending_device_token_and_rejects_invalid_state():
     inputs.row_generations[0] = 1
     inputs.live_rows.fill_(1)
     inputs.page_tables[0].copy_(torch.tensor([0, 1], device=device))
-    inputs.token_ids.fill_(11)
+    inputs.token_ids.fill_(-999)
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
     for _ in range(4):
         graph.replay()

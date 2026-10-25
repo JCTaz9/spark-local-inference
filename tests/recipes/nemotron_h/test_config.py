@@ -94,3 +94,21 @@ def test_image_frontend_matches_checkpoint(checkpoint):
     raw["ps_version"] = "v1"
     with pytest.raises(ValueError, match="ps_version"):
         VisionConfig.from_dict(raw)
+
+
+def test_host_ragged_rounds_separate_target_rows_from_sample_rows():
+    from ignition.recipes.nemotron_h.bootstrap import PreparationConfig
+    from ignition.recipes.nemotron_h.recipe import RECIPE
+
+    config = PreparationConfig(max_active=4, draft_checkpoint=Path("lilicorr"),
+        speculative_widths=tuple(range(1, 9)), speculative_token_capacity=8)
+    assert (4, 8, 5) in config.speculative_round_shapes
+    assert config.decode_tokens == 8
+    assert config.decode_samples == 32
+    assert RECIPE.speculation.packed_verification
+    fixed = replace(config, speculative_fixed_width=4)
+    assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 4}
+    assert fixed.decode_tokens == 8 and fixed.decode_samples == 16
+    plain = replace(config, draft_checkpoint=None)
+    assert plain.speculative_round_shapes == ()
+    assert plain.decode_tokens == plain.decode_samples == 4

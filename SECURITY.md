@@ -17,3 +17,10 @@ steps or proof-of-concept code.
 
 See [NVIDIA's PSIRT policies](https://www.nvidia.com/en-us/security/psirt-policies/)
 for information about vulnerability handling and disclosure.
+
+## Model package integrity
+
+Flare package signatures authenticate metadata and stored executable bytes. Executable
+resources use one zstd level-3 frame per resource; compression is not encryption and
+provides no confidentiality. The accepted publisher namespace must exactly match the
+signed namespace. Treat signed packages as executable input, not sandboxed code.

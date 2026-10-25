@@ -47,7 +47,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None,
-           image_concurrency: int | None = None, mla_compute_mode: str | None = None) -> planning.Plan:
+           image_concurrency: int | None = None, mla_compute_mode: str | None = None,
+           native_dense_activations: bool = False) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     workers = compiler_workers(configuration, compile_workers)
     result = planning.plan(
@@ -58,7 +59,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
-                     autotune_effort=tuning_effort(configuration, autotune_effort))
+                     autotune_effort=tuning_effort(configuration, autotune_effort),
+                     native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
 
 
@@ -179,13 +181,14 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         raise UsageError("--speculative-token-capacity must cover the maximum verification width")
     packed = default.packed_verification and drafts > 0
     prefix_selection = default.draft_prefix_selection if drafts else "cpu"
-    if packed and not adaptive:
+    if prefix_selection == "gpu" and not adaptive:
         raise UsageError(f"{alias} requires adaptive verification; --no-mtp-adaptive-verification does not apply")
     if verification_budget is not None and not (packed and adaptive and prefix_selection == "gpu"):
         raise UsageError("--mtp-verification-token-budget requires positive adaptive packed GPU speculation")
-    if explicit_graph_budget and not (packed and adaptive):
-        raise UsageError("--speculative-graph-budget requires packed adaptive learned speculation with positive draft depth")
-    budget = graph_budget.value if packed else None
+    physical_catalog = packed
+    if explicit_graph_budget and not (physical_catalog and drafts > 0):
+        raise UsageError("--speculative-graph-budget requires a packed target catalog with positive draft depth")
+    budget = graph_budget.value if physical_catalog and drafts > 0 else None
     if budget is not None and (type(budget) is not int or budget < 1):
         raise UsageError("--speculative-graph-budget must be a positive integer")
     draft_head = getattr(args, "draft_head_quantization", None)

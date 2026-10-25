@@ -69,7 +69,7 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
     requests = DeviceRequestState.allocate(device)
     requests.admit(2, RequestAdmission(17, 93), [1, 2, 3, 4, 5], consumed_tokens=2)
     output = torch.arange(64 * 2560, device=device).reshape(64, 2560).bfloat16()
-    records = torch.zeros((2, 4, 8), dtype=torch.int64, device=device)
+    records = torch.zeros((2, 4, 24), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.ones(1, dtype=torch.int64, device=device)
     pool = GraphBufferPool(device, chunk_bytes=2 << 20)
@@ -118,8 +118,8 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
         assert torch.equal(features.arena[1, :4], output[:4])
         assert torch.all(features.arena[1, 4:] == 7)
         assert torch.all(features.arena[0] == 7)
-        assert records[0, 2].tolist() == [17, 1, 2, 0, -1, 1, 0, 0]
-        assert records[0, 0].tolist() == [0, 0, 0, 0, -1, 0, 0, 0]
+        assert records[0, 2][..., :8].tolist() == [17, 1, 2, 0, -1, 1, 0, 0]
+        assert records[0, 0][..., :8].tolist() == [0, 0, 0, 0, -1, 0, 0, 0]
         for name, before in requests_before.items():
             assert torch.equal(getattr(requests, name), before), name
         torch.testing.assert_close(operation.pixels[:16], inputs.vision_pixel_values[:16].bfloat16(), rtol=0, atol=0)
@@ -132,7 +132,7 @@ def test_native_vision_handoff_append_epoch_validation_and_completion(compiled):
         _replay(worker)
         assert features.count[2].item() == 6
         assert torch.equal(features.arena[1, 4:6], output[:2])
-        assert records[1, 2].tolist() == [17, 2, 2, 0, -1, 1, 0, 0]
+        assert records[1, 2][..., :8].tolist() == [17, 2, 2, 0, -1, 1, 0, 0]
         saved = features.arena[1].clone()
         for kind, error in (
             ("offset", 8),

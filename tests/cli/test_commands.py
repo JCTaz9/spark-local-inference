@@ -92,7 +92,7 @@ def test_multi_host_ranks_parse_for_rank_zero_and_its_peers():
 
 
 def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(capsys):
-    for command in (["export", "--output", "model.safetensors"], ["serve"]):
+    for command in (["export"], ["serve"]):
         for flags in (["--kv-cache-limit", "context"], ["--memory-limit", "30G"]):
             with pytest.raises(SystemExit) as error:
                 main([*command, "qwen3.8-flash", *flags])
@@ -101,7 +101,7 @@ def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(c
 
 
 def test_served_model_name_is_a_runtime_override(capsys):
-    for command in (["export", "--output", "model.safetensors"], ["serve"]):
+    for command in (["export"], ["serve"]):
         with pytest.raises(SystemExit) as error:
             main([*command, "qwen3.8-flash", "--served-model-name", "local-model"])
         assert error.value.code == 2
@@ -109,7 +109,7 @@ def test_served_model_name_is_a_runtime_override(capsys):
 
 
 def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_accept(host, tmp_path, capsys):
-    for command in (["export", "--output", str(tmp_path / "package")], ["serve"]):
+    for command in (["export"], ["serve"]):
         assert _parser().parse_args([*command, "glm-5.3-flash", "--no-stream-overlap"]).no_stream_overlap
         assert not _parser().parse_args([*command, "glm-5.3-flash"]).no_stream_overlap
     for model in ("qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash"):
@@ -134,7 +134,7 @@ def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
     assert "--graph-times applies only to --direct" in failure(capsys)[0]
     assert main(["serve", "glm-5.3-flash", "--direct", "--eager", "--graph-times", "/nonexistent/times.json"]) == 2
     assert "graph replay with --graph-times saves it" in failure(capsys)[0]
-    for arguments in (["export", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--output", "x", "--eager"],
+    for arguments in (["export", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--eager"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2", "--direct"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
@@ -243,10 +243,10 @@ def test_deepseek_v4_vision_uses_only_checkpoint_integrated_dspark():
 
 
 def test_roce_ring_requires_multiple_hosts_before_model_or_gpu_work(tmp_path, capsys):
-    for arguments in (["export", "--output", str(tmp_path / "model")], ["serve"]):
+    for arguments in (["export"], ["serve"]):
         assert main([*arguments, "qwen3.8-flash", "--roce-ring"]) == 2
         assert "--roce-ring requires at least two hosts" in failure(capsys)[0]
-    args = _parser().parse_args(["export", "qwen3.8-flash", "--output", str(tmp_path / "model"),
+    args = _parser().parse_args(["export", "qwen3.8-flash",
                                "--roce-ring", "--ranks", "4"])
     assert args.roce_ring
     from ignition.cli.serve import _checkpoint_fabric
@@ -278,3 +278,10 @@ def test_fabric_transfers_follow_the_chain_shape():
 
     args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--roce-chain"])
     assert _checkpoint_fabric(args) == dict(ring=False, chain=True, streams=8)
+
+
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_native_dense_activations_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).native_dense_activations
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--native-dense-activations"]).native_dense_activations

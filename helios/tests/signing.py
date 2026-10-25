@@ -3,7 +3,6 @@
 from pathlib import Path
 from ignition.preparation.runtime_package import export_model
 from ignition.preparation.memory_inventory import print_inventory
-from ignition.preparation.package_file import DEFAULT_SHARD_SIZE
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ignition.preparation.protection import Publisher
@@ -12,10 +11,26 @@ if __package__:
 else:
     import legacy_package
 
+DEFAULT_SHARD_SIZE = legacy_package.DEFAULT_SHARD_SIZE
 publish_legacy = legacy_package.publish_legacy
 extend_cluster_legacy = legacy_package.extend_cluster
-resource_key = legacy_package.resource_key
-chunk_aad = legacy_package.chunk_aad
+zstd_compress = legacy_package.zstd_compress
+zstd_decompress = legacy_package.zstd_decompress
+
+
+def publish_captured_legacy(path, sources, *, shard_size=DEFAULT_SHARD_SIZE):
+    """Serialize captured native sources with the compatibility fixture writer."""
+    import json
+    import flare_heliopause
+    from ignition.preparation import runtime_package_pb2 as proto
+
+    record = json.loads(flare_heliopause.export_read_sources(str(sources)))
+    index = proto.ModelIndex.FromString(bytes(record['index']))
+    payload = [(offset, Path(source), start, size)
+               for offset, source, start, size in record['payload']]
+    physical = Path(sources).with_suffix('.safetensors')
+    publish_legacy(physical, index, payload, publisher=publisher(), shard_size=shard_size)
+    legacy_package.snapshot_fixture(physical, path)
 
 
 def publisher():

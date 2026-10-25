@@ -6,11 +6,9 @@ import pytest
 import torch
 
 from ignition.preparation import runtime_package_pb2 as proto
-from ignition.preparation.package_file import combine, read_index, write_sources
-from ignition.preparation.package_snapshot import convert, read_container
 from ignition.preparation.rebuild_manifest import rebuild_weights_metadata, validate_weights, weight_views
 from helios.tests.signing import publisher
-from tests.preparation.test_package_snapshot import native, profile, assert_native
+from tests.preparation.test_package_snapshot import native, assert_native
 from tests.preparation import test_package_protection as fixtures
 
 
@@ -74,63 +72,11 @@ def test_invalid_weight_catalog_cannot_be_used_for_preparation(change):
     with pytest.raises(ValueError): validate_weights(bundle)
 
 
-def test_signed_manifest_survives_rank_combination_and_conversion(native, tmp_path):
-    roots = []
-    for rank in range(2):
-        source = tmp_path / f'weights-{rank}'
-        source.write_bytes(bytes([rank + 1]) * 64)
-        bundle = proto.BundleIndex(allocations=[proto.Allocation(name='weights', nbytes=64, file='weight-bytes')])
-        bundle.resources['weight-bytes'].CopyFrom(proto.Span(nbytes=64))
-        bundle.rebuild_weights.version = 1
-        bundle.rebuild_weights.tensors.add(name='layers[0].weight', dtype='uint8', element_bytes=1,
-            shape=[8, 8], stride=[8, 1], layout_type='packed', storage={'allocation': 'weights'})
-        index = proto.ModelIndex(version=4, ranks=[bundle])
-        if rank == 0:
-            index.rebuild.CopyFrom(proto.RebuildManifest(version=1, recipe='test', source_identity='a'*64,
-                checkpoint_repository='test/weights', checkpoint_revision='b'*40, tensor_parallel=2))
-        path = tmp_path / f'rank-{rank}.json'
-        write_sources(path, index, [(0, source, 0, 64)])
-        roots.append(path)
-    package = tmp_path / 'package.safetensors'
-    combine(package, roots, [], publisher=publisher(), cluster=(2, 'test-export'))
-    index, _ = read_index(package)
-    assert index.rebuild.recipe == 'test' and index.rebuild.tensor_parallel == 2
-    assert len(index.ranks) == 2
-    for rank in index.ranks:
-        validate_weights(rank)
-        assert rank.rebuild_weights.tensors[0].name == 'layers[0].weight'
-    with package.open('rb') as f:
-        header, _, envelope, layout = read_container(f)
-    assert header['flare.payload']['shape'] == [0]
-    assert all((package.parent / name).stat().st_size <= 64_000_000_000
-               for parts in layout['files'].values() for _, name in parts if name)
-    assert_native(native, package)
-    converted = tmp_path / 'converted' / 'package.safetensors'
-    convert(package, converted, profiles=[profile()], cache=tmp_path / 'cache')
-    with converted.open('rb') as f:
-        assert read_container(f)[2] == envelope
-    assert read_index(converted)[0] == index
-    assert_native(native, converted)
-
-    from ignition.preparation.resign import resign
-    development = fixtures.development_publisher()
-    development_path = tmp_path / 'development.safetensors'
-    combine(development_path, roots, [], publisher=development, cluster=(2, 'test-export'))
-    signed_path = tmp_path / 'production.safetensors'
-    resign(development_path, signed_path, publisher=publisher(),
-           development_profile=fixtures.development_profile(development))
-    signed_index, _ = read_index(signed_path)
-    assert signed_index.rebuild == index.rebuild
-    for actual, expected in zip(signed_index.ranks, index.ranks, strict=True):
-        assert actual.rebuild_weights == expected.rebuild_weights
-    assert_native(native, signed_path)
-
-
 def test_manifest_is_authenticated_with_shared_and_rank_metadata(native, tmp_path):
     index = proto.ModelIndex(version=4, ranks=[proto.BundleIndex()])
     index.rebuild.version = 1
     index.rebuild.recipe = 'signed-recipe'
-    from ignition.preparation.package_file import publish
+    from helios.tests.signing import publish_legacy as publish
     path = tmp_path / 'model.safetensors'
     publish(path, index, [], publisher=publisher())
     assert_native(native, path)

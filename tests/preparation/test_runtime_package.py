@@ -101,6 +101,130 @@ def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
             FileSource(checkpoint, offset, size)
 
 
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
+@pytest.mark.parametrize("fixture,binary,expected", [
+    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches"),
+    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed"),
+])
+def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected):
+    import shutil
+
+    import flare_heliopause
+    from safetensors import safe_open
+
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run([
+        "cargo", "build", "--manifest-path", str(root / "helios/Cargo.toml"),
+        "--no-default-features", "--features", "runtime-package,test-tools",
+        "--bin", binary,
+    ], check=True, cwd=root, timeout=180)
+    original = tmp_path / "original"
+    result = subprocess.run([
+        sys.executable, str(root / "helios/tests" / fixture), str(original),
+    ], cwd=root, text=True, capture_output=True, timeout=180)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if fixture == "runtime_package_fixture.py":
+        assert (original / "package/weights/misc.safetensors").is_file()
+
+    packed = tmp_path / "packed"
+    restored = tmp_path / "restored"
+    packed.mkdir()
+    restored.mkdir()
+    flare_heliopause.export_payload_convert(str(original / "package"), str(packed / "package"), "packed")
+    flare_heliopause.export_payload_convert(str(packed / "package"), str(restored / "package"), "directory")
+
+    primaries = [original / "package/model.safetensors", packed / "package", restored / "package/model.safetensors"]
+    manifests = []
+    for primary in primaries:
+        with safe_open(primary, framework="numpy") as tensors:
+            assert tensors.metadata()["format"] == "flare-payload"
+            manifests.append(tensors.get_tensor("flare.manifest").tobytes())
+    assert manifests[0] == manifests[1] == manifests[2]
+    if fixture == "fixed_package_fixture.py":
+        from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+        descriptor = tmp_path / 'package-schema.pb'
+        subprocess.run(['protoc', '-I', str(root / 'helios/proto'), '--include_imports',
+                        f'--descriptor_set_out={descriptor}', 'package.proto'], check=True)
+        pool = descriptor_pool.DescriptorPool()
+        for file in descriptor_pb2.FileDescriptorSet.FromString(descriptor.read_bytes()).file:
+            pool.Add(file)
+        envelope_type = message_factory.GetMessageClass(pool.FindMessageTypeByName('flare.package.ProtectedPackage'))
+        rank_type = message_factory.GetMessageClass(pool.FindMessageTypeByName('flare.package.RankBody'))
+        envelope = envelope_type.FromString(manifests[0])
+        rank = rank_type.FromString(envelope.ranks[0].body)
+        assert 'transform_' + 'template_parameter_' * 32 in {function.symbol for function in rank.functions}
+        assert 'bias_' + 'template_parameter_' * 32 in {symbol.symbol for module in rank.modules for symbol in module.globals}
+        assert 'assertFile_0' in {symbol.symbol for module in rank.modules for symbol in module.globals}
+    companions = sorted(path for path in (original / "package").rglob("*.safetensors")
+                        if path.name != "model.safetensors")
+    assert companions
+    for companion in companions:
+        relative = companion.relative_to(original / "package")
+        with safe_open(companion, framework="numpy") as left, safe_open(restored / "package" / relative, framework="numpy") as right:
+            assert left.keys() == right.keys() == ["flare.payload"]
+            assert left.get_tensor("flare.payload").tobytes() == right.get_tensor("flare.payload").tobytes()
+
+    for directory in (original, packed, restored):
+        if directory != original:
+            for fixture_file in original.iterdir():
+                if fixture_file.is_file():
+                    shutil.copyfile(fixture_file, directory / fixture_file.name)
+        result = subprocess.run([
+            str(root / "helios/target/debug" / binary), str(directory),
+        ], cwd=root, text=True, capture_output=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert expected in result.stdout
+
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
+def test_captured_weight_payloads_survive_relocation_and_capacity_changes(tmp_path):
+    from safetensors import safe_open
+
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run([
+        "cargo", "build", "--manifest-path", str(root / "helios/Cargo.toml"),
+        "--no-default-features", "--features", "runtime-package,test-tools",
+        "--bin", "test_runtime_package",
+    ], check=True, cwd=root, timeout=180)
+    payloads, addresses = [], []
+    variants = [
+        ("baseline", {}),
+        ("relocated", dict(capacity=129, allocation_padding=64 << 20)),
+        ("changed", dict(capacity=129, allocation_padding=64 << 20, weight_delta=4.)),
+    ]
+    for name, options in variants:
+        directory = tmp_path / name
+        directory.mkdir()
+        result = subprocess.run([
+            sys.executable, "-c",
+            "import json, sys; from pathlib import Path; "
+            "sys.path.insert(0, 'helios/tests'); "
+            "from runtime_package_fixture import prepare; "
+            "prepare(Path(sys.argv[1]), layer_groups=True, **json.loads(sys.argv[2]))",
+            str(directory), json.dumps(options),
+        ], cwd=root, text=True, capture_output=True, timeout=180)
+        assert result.returncode == 0, result.stdout + result.stderr
+        groups = {}
+        for path in (directory / "package/weights").glob("*.safetensors"):
+            with safe_open(path, framework="numpy") as tensors:
+                groups[path.stem] = tensors.get_tensor("flare.payload").tobytes()
+        assert set(groups) == {"layer-000", "layer-001"}
+        payloads.append(groups)
+        addresses.append(json.loads((directory / "expected.json").read_text())["addresses"])
+        result = subprocess.run([
+            str(root / "helios/target/debug/test_runtime_package"), str(directory),
+        ], cwd=root, text=True, capture_output=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "192 graph launches" in result.stdout
+
+    assert addresses[0]["weight"] != addresses[1]["weight"]
+    assert payloads[0] == payloads[1]
+    assert payloads[1]["layer-000"] != payloads[2]["layer-000"]
+    assert payloads[1]["layer-001"] == payloads[2]["layer-001"]
+
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
 @pytest.mark.parametrize("fixture,binary,expected,exec_handover", [
@@ -120,7 +244,7 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
     arguments = [sys.executable, str(root / "helios/tests" / fixture), str(tmp_path)]
     if exec_handover:
         arguments.append(executable)
-    arguments += ["--shard-size", str(shard_size)]
+    arguments += ["--shard-size", str(shard_size), "--legacy"]
     result = subprocess.run(arguments, cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     package_path = tmp_path / "package"
@@ -161,30 +285,20 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
         resource = next((item for item in signed.executables.resources if item.offset == span.offset), None)
         if resource is None:
             return stored
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        from helios.tests.signing import publisher, chunk_aad, resource_key
-        from ignition.preparation.protection import CHUNK
-        signer = publisher()
-        cipher = AESGCM(resource_key(signer.public_key, protected.package_id, span.offset, signer.namespace))
-        result, cursor = bytearray(), 0
-        for chunk in range(len(resource.sha256)):
-            size = min(CHUNK, resource.plain_bytes - len(result)) + 16
-            result.extend(cipher.decrypt(chunk.to_bytes(12, 'big'), stored[cursor:cursor + size],
-                chunk_aad(protected.package_id, span.offset, resource.plain_bytes, chunk)))
-            cursor += size
-        return bytes(result)
+        from helios.tests.signing import zstd_decompress
+        assert resource.stored_bytes == len(stored)
+        return zstd_decompress(stored)
     for module in document.modules:
         assert b".py\0" not in contents(module.file)
         for symbol in module.globals:
             assert b"/preparation/internal/kernel.py" not in contents(symbol.file)
-    assert all(function.symbol.startswith("_f") for function in document.functions)
     if fixture == "fixed_package_fixture.py":
         assert any(contents(symbol.file).rstrip(b"\0") == b"kernel"
                    for module in document.modules for symbol in module.globals)
         for name in (b"numeric_argument", b"integer_pointer_argument", b"pointer_table_argument",
-                     b"transform", b"no_arguments", b"assertFile_0"):
-            assert name not in document.SerializeToString()
-            assert all(name + b"\0" not in contents(module.file) for module in document.modules)
+                     b"transform_" + b"template_parameter_" * 32, b"no_arguments", b"assertFile_0"):
+            assert name in document.SerializeToString()
+            assert any(name + b"\0" in contents(module.file) for module in document.modules)
     if not exec_handover:
         result = subprocess.run([executable, str(tmp_path)],
                                 cwd=root, text=True, capture_output=True, timeout=60)

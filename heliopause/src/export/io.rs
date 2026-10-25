@@ -1264,7 +1264,7 @@ mod tests {
     fn capture_buffers_count_rank_processes_sharing_host_memory() {
         let mut request: super::super::CaptureRequest = serde_json::from_value(serde_json::json!({
             "path": "capture.json", "context": 0, "world_size": 3,
-            "graphs": [], "allocations": [], "shard_size": 1 << 30
+            "graphs": [], "allocations": []
         })).unwrap();
         let available = 1u64 << 30;
         assert_eq!(request.local_rank_count().unwrap(), 3);

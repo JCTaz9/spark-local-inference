@@ -71,10 +71,9 @@ def _rank(rank, world, rendezvous):
                 inputs.live_rows.fill_(3)
                 inputs.token_ids.copy_(torch.tensor([7, 8, 9, 0]))
                 inputs.page_tables.copy_(torch.arange(32, dtype=torch.int32)[None, :].expand(4, -1))
-                if rank == 0:
-                    requests.pending_token.copy_(torch.tensor([9, 8, -1, 7]))
-                    if fault == "pending":
-                        requests.pending_token[3] = 99
+                requests.pending_token.copy_(torch.tensor([9, 8, -1, 7]))
+                if fault == "pending" and rank == 0:
+                    requests.pending_token[3] = -1
                 if fault == "epoch" and rank == world - 1:
                     requests.generation[1] = 8
                 torch.cuda.synchronize(device)

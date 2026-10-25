@@ -12,7 +12,7 @@ from ignition.components.recurrent import prepare_sequence_binding
 
 class PreparedMamba:
     def __init__(self, weights, source, state, metadata, config, *, mode, session, name, workspace, buffers,
-                 replay=None, records=None):
+                 replay=None, records=None, verification_width=1):
         c, tokens = config.text, source.shape[0]
         heads, dim, n, groups = c["mamba_num_heads"], c["mamba_head_dim"], c["ssm_state_size"], c["n_groups"]
         width, channels = config.mamba_width, config.convolution_width
@@ -50,7 +50,7 @@ class PreparedMamba:
             num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens, out=recurrence.view(tokens, heads, dim))
         if mode == "verify":
             self.recurrence = PreparedMambaVerification(args, records, replay.ring_start, replay.pending_count,
-                metadata.final_state_indices, width=tokens // sequences, session=session,
+                metadata.final_state_indices, width=verification_width, session=session,
                 workspace=workspace, name=name + ".verification")
         elif mode == "decode":
             self.recurrence = PreparedMambaUpdate(args, session=session, name=name + ".state_update")

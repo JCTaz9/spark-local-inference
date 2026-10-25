@@ -94,11 +94,11 @@ def test_native_glm_metadata_and_consumption(rank, world, mode, capacity):
             if fault == "token":
                 token_ids[0] = 154880
             active = [True] * rows
-            if mode == "decode" and rank == 0:
+            if mode == "decode":
                 for row, slot in enumerate(slots):
                     requests.pending_token[slot] = token_ids[row]
             if fault == "pending":
-                requests.pending_token[3] = 99
+                requests.pending_token[3] = -1 if mode == "decode" else 99
             if fault == "duplicate":
                 slots[1] = 3
                 active[1] = False

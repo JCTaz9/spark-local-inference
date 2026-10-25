@@ -147,12 +147,15 @@ def test_typed_settings_survive_publication_and_tensor_parallel_assembly(tmp_pat
         assert index.contract.frontend_workers == 4
         assert index.HasField("sampling_defaults") and index.sampling_defaults.HasField("seed")
         assert index.frontend.image.WhichOneof("profile") == "mimo"
-        path = tmp_path / f"rank-{rank}.json"
-        write_sources(path, index, [])
-        paths.append(path)
+        from tests.preparation.payload_fixture import rank_source
+        paths.append(rank_source(tmp_path / f"rank-{rank}", index=index))
     result = tmp_path / "model.safetensors"
-    combine(result, paths, [])
-    index, _ = read_index(result)
+    from helios.tests.signing import publisher
+    from tests.preparation.payload_fixture import manifest, schema
+    combine(result, paths, [], publisher=publisher())
+    envelope = manifest(result)
+    package = schema()('PackageBody').FromString(envelope.package_body)
+    index = package
     assert MessageToDict(index.sampling_defaults, preserving_proto_field_name=True) == {
         **source["sampling_defaults"], "seed": "0"}
     assert index.sampling_defaults.HasField("ranges") == bool(ranges)

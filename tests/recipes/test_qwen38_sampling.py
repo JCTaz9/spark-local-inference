@@ -289,13 +289,13 @@ def test_terminal_grammar_errors_stale_epochs_and_inactive_lanes():
     worker = _worker({"sampling": graph, "record": record_graph}, {"records": records}, (sampler, state))
     try:
         _replay(worker, 1)
-        assert records[0, 0].cpu().tolist() == [1, 1, 2, 0, -1, 1, 0, 0]
+        assert records[0, 0].cpu()[..., :8].tolist() == [1, 1, 2, 0, -1, 1, 0, 0]
         assert state.rng_counter.cpu().tolist() == [0] * 4
         _replay(worker)
-        assert records[0, 0].cpu().tolist() == [1, 1, 2, 1, 7, FINISHED, 0, 0]
-        assert records[0, 1].cpu().tolist() == [1, 1, 2, 1, 8, FINISHED, 0, 0]
-        assert records[0, 2].cpu().tolist() == [1, 1, 2, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
-        assert records[0, 3].cpu().tolist() == [0, 0, 0, 0, -1, 0, 0, 0]
+        assert records[0, 0].cpu()[..., :8].tolist() == [1, 1, 2, 1, 7, FINISHED, 0, 0]
+        assert records[0, 1].cpu()[..., :8].tolist() == [1, 1, 2, 1, 8, FINISHED, 0, 0]
+        assert records[0, 2].cpu()[..., :8].tolist() == [1, 1, 2, 0, -1, ERROR, INVALID_DISTRIBUTION, 0]
+        assert records[0, 3].cpu()[..., :8].tolist() == [0, 0, 0, 0, -1, 0, 0, 0]
         assert state.pending_token.cpu().tolist() == [7, 8, -1, -1]
         before = state.histogram.clone()
         _replay(worker)
@@ -391,7 +391,7 @@ def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampl
         assert torch.equal(state.ple_history, old_history)
         assert state.consumed_tokens.cpu().tolist() == [3] * 4
         for slot in order[:capacity]:
-            assert records[0, slot].cpu().tolist() == [17 + slot, 1, 3, 0, -1, 1, 0, 0]
+            assert records[0, slot].cpu()[..., :8].tolist() == [17 + slot, 1, 3, 0, -1, 1, 0, 0]
             assert state.seed[slot].item() == 2**64 - 1 - slot
             assert state.pending_token[slot] == -1
             assert state.histogram[slot, 4] == 2 and state.histogram[slot].sum() == 4
@@ -406,7 +406,7 @@ def test_native_admission_scatter_preserves_restored_state_and_gates_final_sampl
         frame.fill_(1)
         sequence.fill_(2)
         _replay(worker, 1)
-        assert records[1, 3].cpu().tolist() == [20, 2, 3, 1, 8, 1, 0, 0]
+        assert records[1, 3].cpu()[..., :8].tolist() == [20, 2, 3, 1, 8, 1, 0, 0]
         assert state.histogram[3, 8] == 1 and state.generated_tokens.sum() == 1
         enabled.zero_()
         _replay(worker, 1)

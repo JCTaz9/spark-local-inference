@@ -28,19 +28,11 @@ def test_encrypted_key_and_public_profile(tmp_path, monkeypatch):
     assert bytes(profile['public_key']) == publisher.public_key
     assert not profile['development']
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    from helios.tests.legacy_package import signature_message
-    from ignition.preparation import runtime_package_pb2 as proto
-    from ignition.preparation.package_file import publish
-    from ignition.preparation.package_snapshot import read_container
+    from tests.preparation.payload_fixture import publish, verify_signatures
 
-    package = tmp_path / 'model.safetensors'
-    publish(package, proto.ModelIndex(version=4, ranks=[proto.BundleIndex()]), [], publisher=publisher)
-    with package.open('rb') as source:
-        envelope = proto.ProtectedIndex.FromString(read_container(source)[2])
+    package = publish(tmp_path, publisher)
     public_key = Ed25519PublicKey.from_public_bytes(bytes(profile['public_key']))
-    for group in [*envelope.groups, *envelope.ranks]:
-        public_key.verify(group.signature,
-                          signature_message(envelope.package_id, envelope.signer, group.kind, group.body))
+    verify_signatures(package, public_key)
     with pytest.raises(FileExistsError):
         signing.generate(directory, 'Example publisher', 'example', password)
     assert path.read_bytes() == encoded

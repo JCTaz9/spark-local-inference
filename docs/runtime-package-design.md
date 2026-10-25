@@ -1,9 +1,12 @@
 # Runtime packages: the preparation boundary and native serving
 
-Flare serves a prepared model from a runtime package: a metadata-only primary
-`.safetensors` file and immutable sibling payload files holding everything a Rust
-process needs to rebuild the model's CUDA graphs and storage without a Python interpreter. Preparation still happens in Python
-with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
+Flare serves a prepared model from a runtime package containing everything a Rust
+process needs to rebuild the model's CUDA graphs and storage without a Python
+interpreter. The [package format](package-format-design.md) defines a packed
+`.safetensors` file and a directory form with `model.safetensors` plus immutable
+payload companions. The Flare model cache stores the directory form. Serving
+requires execution ABI 4 and prepared model contract 2; other versions require
+re-export. Preparation happens in Python with PyTorch, Transformers, and b12x. Serving requires the NVIDIA driver,
 the package, the Rust `flare` executable, and its system library dependencies
 (including libturbojpeg). Python and preparation tools are not required.
 The [core design](core-design.md) defines the model contracts, scheduling,
@@ -21,7 +24,7 @@ how the prepared state leaves the Python process and how it is reconstructed.
 | Helios | Rust runtime library. It rebuilds a package into a live CUDA context and serves it | The `helios/` crate, including `src/runtime_package/` and the server |
 | flare | Public serving command. It links Helios to load a package and run the server | The `flare/` Rust crate; section 5 |
 
-Preparation knowledge, recipes, planning, hub access, the kernel cache,
+Preparation knowledge, recipes, planning, checkpoint acquisition, the kernel cache,
 compilation, tuning, and capture stay on the preparation host. Ignition imports
 `flare_heliopause` and passes graph handles, allocation declarations, tensor-view
 metadata, and resource owners through `ignition/preparation/runtime_package.py`.
@@ -63,7 +66,7 @@ frontend metadata, and resource owners. File-backed embedding tables supply
 checkpoint ranges; generated tokenizer and template assets supply text.
 Heliopause owns CUPTI callbacks, graph introspection, pointer reachability,
 device-to-host transfers, graph and package serialization, asset materialization,
-cubin redaction, hashing, encryption, signing, conversion, rank payload channels,
+cubin debug stripping, hashing, compression, signing, conversion, rank payload channels,
 and publication. Export retains graph templates, storage, contexts, and their
 Python owners until native CUDA work has drained. A failed drain retains those
 owners. Final assembly consumes rank indexes and open source file ranges
@@ -143,28 +146,19 @@ pool holds only graph-local intermediates and is also cleared, as are unused
 bytes in the preparation allocator. Weight tensors, MTP weights, rotary
 tables, pointer tables, and required initialized metadata retain their contents.
 
-The primary file is a valid safetensors container with three one-dimensional
-`U8` tensors and `__metadata__: {"format": "flare-snapshot"}`. Its little-endian
-u64 header length precedes a JSON header padded to a 4 KiB data boundary; the
-header is limited to 64 KiB. `flare.payload` has zero length. `flare.metadata`
-contains the signed `ProtectedIndex`; `flare.layout` follows it and maps signed
-logical byte ranges to immutable payload files. Each metadata tensor is bounded
-at 128 MiB. No model payload bytes reside in the primary.
-
-The envelope uses version 4. Its authenticated `ModelIndex` uses version 4 for
-logical monolithic addressing or version 5 for logical companion addressing.
-The snapshot storage mapping does not change signed offsets or encryption
-associated data. Helios also loads `format: flare` packages with physical payloads
-in the primary or numbered companions. Absent filename and stored-part fields
-retain their original meaning. Conversion preserves the signed envelope exactly.
-Unsigned rank staging uses `format: flare-staging` and cannot load in Helios.
+Serving accepts payload format 2 and signed format-6 logical-resource containers,
+with execution ABI 4 and prepared model contract 2 required in both carriers.
+Packages with another execution ABI or prepared contract require re-export with
+Ignition and fail loading before graph replay. Unsigned rank staging cannot load.
+The canonical format uses signed content IDs, payload-relative initializers,
+and unsigned physical locations; see [payload packages](package-format-design.md).
 
 `ModelIndex.contract` is a typed `ServingContract`. It declares serving defaults
 and a versioned `ModelContract` containing vocabulary bounds, vision capacities,
 attention-history storage, page-table views, graph value sources and dependencies,
 completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
-`Struct` configuration is not accepted. Execution ABI 2/3 and protected envelope
-version 4 are versioned separately from model-index versions 4 and 5.
+`Struct` configuration is not accepted. Execution ABI 4, model contract 2, and
+payload format 2 are independent version domains.
 
 Two prepared-contract fields fail validation when absent or out of
 range. `vision` must decode to a well-formed `VisionCapabilities`: a
@@ -196,8 +190,7 @@ and layouts. Marker strings, feature tokens, and atomic
 image spans are data. Enum zero and unknown identifiers are rejected; enum
 numbers are stable and removed values must be reserved. Frontend identifiers
 cannot select scheduler, cache, text-graph packing, or completion policy.
-The serialized `prefix_boundary` field remains readable for package compatibility;
-message checkpoints derive from exact rendered prefixes without role filters.
+Message checkpoints derive from exact rendered prefixes without role filters.
 
 The index stores complete recipe-declared sampling parameters in
 `DefaultSamplingParameters` and structural frontend settings in
@@ -209,8 +202,8 @@ inclusive `min` and `max` bounds for temperature, top-p, top-k, min-p, and the
 repetition, presence, and frequency penalties. Each supplied range must contain
 its existing default, and both endpoints must be valid sampler values. Numeric
 request values are clamped to these bounds; omitted ranges fix parameters at
-their defaults. Packages without range fields remain loadable without re-export
-and use this fixed-default policy. Seed remains request-controlled.
+their defaults. Packages without range fields use this fixed-default policy. Seed
+remains request-controlled.
 
 `FrontendSettings` contains EOS token IDs, the special-token strings used by the
 chat template, and optional image settings. Qwen image settings contain resize
@@ -221,29 +214,14 @@ checkpoint config files, then exports only these consumed fields. The only front
 payload assets are `tokenizer.json` and the Jinja chat template; raw generation,
 tokenizer, processor, and model configuration files are not included.
 
-Payload blobs contain whole resources: stored allocations, embedding planes,
-graph bodies, cubins, module globals, or frontend assets. Blob names are SHA-256
-hashes of the complete safetensors file. Adjacent stored resources are packed up
-to the selected shard limit without crossing rank or logical-file boundaries.
-Executable and supporting resources use separate shards. Whole resources remain
-contiguous; a graph change can reuse unchanged weight shards. Changing any bytes
-in a weight shard gives that entire shard a different identity. Blobs remain
-uncompressed. New exports
-reuse identical stored bytes through hardlinks, and upload clients can deduplicate
-the same named content across revisions. Upload clients may still scan local files.
-
-Every resource span stores a logical sibling `filename`, a byte `offset` relative
-to that file's logical `flare.payload`, and its byte length. An empty filename
-selects the logical primary. Snapshot layout segments resolve that span to one
-contiguous physical blob range. In a `format: flare` package the logical filename
-is the physical filename.
-Spans cannot extend into `flare.metadata`. The index is
-limited to 128 MiB and contains ordered rank bundles, peer-memory ownership,
-serving configuration, frontend asset spans, allocation descriptions, kernel
-metadata, and graph declarations. Each tensor-parallel size requires a distinct export.
+Payload descriptors bind destination ranges to signed content objects. Unsigned
+locations supply physical placement. Payload aggregation and initializers are
+defined in [payload packages](package-format-design.md). The metadata declares
+rank bundles, peer-memory ownership, serving configuration, frontend assets,
+allocations, kernels, and graph programs for each prepared deployment.
 
 Graph bodies, cubins, module globals, packed tensor data, tokenizer data, and
-other frontend assets live in separate indexed payload spans. A decrypted graph body contains its declared number of nodes followed by its
+other frontend assets live in separate indexed payload spans. A decoded graph body contains its declared number of nodes followed by its
 edges. Each record is a little-endian u32 length followed by one Protobuf
 `Node` or `Edge`, with a 1 MiB record limit. Kernel arguments, node attributes,
 and edge data are Protobuf byte strings. Graph bodies are independent; the
@@ -298,225 +276,39 @@ cache. Unaligned source ranges use aligned scratch reads, and small headers,
 leading bytes, and trailing bytes use positioned I/O where needed. Output files
 retain their exact declared lengths. Direct-I/O errors fail the operation.
 
-A blob's complete safetensors bytes are hashed before opening a temporary output
-for it. An existing cache entry is pinned and verified before reuse. A cache miss
-streams the bytes to a temporary file and hashes them again; changed content
-fails publication. Synchronized immutable blobs are installed without replacing
-existing entries, then hardlinked beside the primary. `--no-weights` requires
-both captured allocation blobs and final stored-data shards to exist with their
-exact contents. It still scans and hashes source bytes, creates no missing
-stored-data blob, and publishes no primary if any required blob is absent.
-Executable resources may produce additional blobs.
+Payload publication verifies source bytes and existing cache objects before reuse.
+A cache miss installs an immutable object without replacing existing entries.
+`--no-weights` requires exact cached weight payloads, including tuned weights;
+missing or corrupt required payloads fail publication. Executable and initial-state
+payloads may be installed during this export.
 
-Native stderr rows omit the Flare banner and report disposable-storage
-clearing, graph inspection and serialization, module and global capture,
-reachable-storage scanning, frontend assets, executable hashing and encryption,
-blob publication, and metadata signing. Capture and frontend rows render only on
-rank zero; coordinators report aggregate rank-transfer receive progress. Ignition
-pauses its enclosing export activity while native rows animate and retains the
-elapsed result. Byte counters distinguish source reads, hashes, copies, installed
-bytes, and cache reuse. Rank transfers report send and receive bytes; conversion reports
-source verification, relocation, and publication separately.
+Native stderr rows omit the Flare banner. Rank-zero capture reports storage
+clearing, graph inspection and serialization, module/global capture, storage scans,
+weight materialization, and frontend assets. Coordinators report export peer waits,
+rank transfers, and preparation-resource release before publication.
+Publication reports payload assembly, validation, frontend verification, each rank's
+executable compression and installation, each rank's data verification and
+installation, shared data, metadata signing, and final package commit.
+
+Native phases animate and update elapsed time independently of Python. Byte totals
+count plaintext executable inputs or data source occurrences, including duplicate
+payloads verified before reuse; they do not claim physical disk throughput or
+cache bytes written. Ignition prints one final export success or failure result
+with the total elapsed time.
 
 ### File placement and addressing
 
-`ignition export`, `ignition sign`, and `ignition convert` pack
-published payloads to at most 64 GB (64,000,000,000 bytes), including the
-4096-byte header. The reader retains its 64 GiB limit for existing packages. The
-`[publishing] shard_size` setting or `--shard-size SIZE` can select a smaller limit.
-Zero is invalid. An
-indivisible resource exceeding the limit fails publication; no oversized file is
-published. All model payloads reside outside the primary.
+Payload packages use signed content IDs and unsigned locations. Signed format-6
+logical-resource containers use the archive reader and must declare execution
+ABI 4 and prepared model contract 2. Payload conversion accepts only payload
+packages; converting logical-resource containers requires re-export with Ignition.
 
-The layout JSON has `version: 1` and a `files` mapping. Each logical filename maps
-to ordered `[length, blob_filename]` segments. An empty blob filename represents
-zero padding. The empty logical filename is required. At most 100 logical files
-and 65,536 segments are allowed. Blob names are 64 lowercase hexadecimal SHA-256
-digits followed by `.safetensors`. Each blob contains only a one-dimensional
-`U8` `flare.payload` tensor and `__metadata__: {"format": "flare-data"}`. Its header
-is exactly 4096 bytes including the length prefix; its payload must exactly match
-the segment length. A repeated blob name must have the same length.
-
-The layout supplies physical addressing, not publisher authority. Signed resource
-bounds, executable ciphertext hashes, and optional stored-data verification apply
-to the reconstructed logical bytes. The native loader pins all selected blobs and
-rejects resources spanning multiple blobs or padding. Hosts need sufficient open
-file descriptors for their selected blobs and runtime resources.
-
-Ignition stores blobs under `paths.package_cache/blobs` and hardlinks them into
-snapshot directories. Existing blobs are checked before reuse; missing blobs
-are hashed before writing and again while written, synchronized, installed
-without overwriting, and made read-only. Snapshot and cache must share a filesystem. Publication installs all
-payload links before atomically publishing the metadata primary. A failed export
-can leave reusable blobs and links, but never a primary naming incomplete payloads.
-
-The converter validates the source publisher's public profile and signatures,
-reads all stored data and authenticated resources, and checks the relocated blob
-bytes before publishing the original envelope with a new layout. It needs no
-private key, checkpoint, or GPU. The source remains intact. `--no-weights` export
-requires all stored-data blobs to exist; preparation, capture, and content reads
-still run. Captured allocations are scanned into sparse 64 KiB nonzero spans;
-cache hits do not write staging weight files.
-
-Companion references are portable ASCII basenames ending in `.safetensors`, with
-an alphanumeric first character and only letters, digits, dots, underscores, and
-hyphens thereafter. Paths, `..`, and device names in signed references are
-rejected. A companion directory entry may be a symbolic link to a regular file,
-including a file on another filesystem. The loader follows the link when opening
-the companion, validates the opened file's type, header, length, and payload
-ranges, and retains that file handle. Broken links, link loops, and nonregular
-targets are rejected. Retargeting a link does not replace an already opened
-companion. The operator controls these filesystem links; signed basenames do not
-confine their targets to the package directory. Package files must remain
-immutable while they are being transferred or served.
-
-The loader retains the package directory and opened files and caches each
-payload base and direct-I/O handle. Allocation uploads add the resource offset
-to that base. Embedding readers retain their file handles before serving; block
-coalescing compares both file identity and offset.
-
-Logical file placement precedes encryption, so executable keys and authenticated
-chunk data use logical offsets. Physical blob placement can change without
-re-signing or decrypting a resource.
-
-`StoredData.parts` describes the ordered file-qualified ranges of one owner's
-stored data. Its SHA-256 covers their concatenation, including declared alignment
-padding. With parts present, `offset` is zero and `nbytes` is the sum of their
-lengths. With parts absent, `offset` and `nbytes` select the legacy primary range.
-Each allocation or plane must fit within one signed part. Bounds, resource roles,
-and overlaps are checked per file even when the optional content scan is disabled.
-
-**Offloaded n-gram tables.** The model index declares token normalization or
-EOS-bounded history, per-head n-gram orders, XOR multipliers, modulus sizes,
-row offsets, quantization, and separate weight and scale payload spans.
-DeepSeek V4.1 uses FP8/E8M0 rows; Qwen PLE uses group-16 NVFP4 rows with FP8 block
-scales and a global FP32 scale. Each table is stored once for all TP ranks.
-Indirect delivery is the sole n-gram execution mechanism. Graphs bind compact
-GPU row buffers and named external event waits at their lookup consumers.
-Table storage is selected when loading and does not change graph bindings.
-
-DeepSeek V4.1 and Qwen hash tokens in their graphs, including GPU-produced proposals.
-DeepSeek V4.1 retains the three preceding tokens in continuation state across prefill
-chunks and reused prefixes; Qwen preserves its EOS-bounded history.
-The graph copies row IDs to a mapped host mailbox and publishes its submission
-sequence with a system-scope release operation. The reader observes that
-sequence with an acquire operation before accessing the IDs. Both models publish
-after input-state preparation, before target layer 0. Qwen consumes rows at
-layer 1; DeepSeek V4.1 consumes its two tables at layers 1 and 14.
-
-Mapped mailbox addresses and synchronization are independent of the host operating
-system. Linux backs them with registered host pages; Windows uses host-backed CUDA
-VMM with CPU and GPU access at the recorded address. Windows rounds and merges
-adjacent host allocations to its CUDA allocation granularity while preserving
-each buffer's address and extent in the package. No OS-specific mailbox graph or
-package encoding is required.
-
-Ranks with identical table planes share a reader that gathers each step's rows once.
-`EngramTable.shards` declares disjoint, contiguous row ranges in rank order, with
-separate weight and scale spans for each owner. These partitions cover the full
-table and publish partition-local row IDs; excluded lookup lanes publish `-1`.
-Each distinct partition has its own reader, staging, and submission state. An
-absent partition list retains the shared planes and delivery semantics of
-previously exported packages. The default, `--embedding-table-storage disk`, uses
-direct I/O, deduplicated 4 KiB blocks, and a 128-entry queue with 64 KiB
-registered buffers per table. `--embedding-table-storage ram` holds tables in ordinary
-resident memory and gathers the same rows; on GB300, Qwen's disk reads lengthened
-32-request rounds by a quarter. RAM startup loads each plane with four readers
-issuing contiguous 4 MiB direct reads into aligned resident storage. It does not
-construct row lookups, zero-fill the table, or copy through row staging while
-loading. Both modes write bounded pinned
-staging buffers. At 4,096 tokens, Qwen needs 5.625 MiB of row staging and a
-512 KiB request mailbox per rank. The two DeepSeek V4.1 tables need 49.5 MiB of
-pinned row staging per reader group. Partitioned DeepSeek tables retain the
-24-lane compact buffer layout, with unowned lanes zero-filled. Direct-I/O buffers
-add 8 MiB per table in disk mode.
-
-`--embedding-table-cache-size SIZE` adds a bounded cache on each host above the
-disk reader. Each entry holds one immutable packed-weight row and its scale row.
-Four-way sets protect rows by approximate usage frequency, with recency breaking
-ties. A bounded four-counter estimate records each distinct requested ID per
-gather, including misses. Counters saturate at 255 and halve after ten times the
-counter-array length in observations, allowing workload changes to retire prior
-popularity. An incoming row with a lower score than every resident in its set
-is served without admission. Misses use the same coalesced direct-I/O reader and
-enter the cache only after a successful gather. The budget includes payload,
-index, usage counters and preallocated miss workspace. The host budget is divided
-equally among distinct table catalogs, then across each catalog's tables in
-proportion to their stored bytes. A table reader owns its cache for the loaded
-package's lifetime; ranks with identical catalogs share that reader.
-Each server start creates an empty row cache, populated by successful request
-gathers.
-
-The loader commits this storage before the existing KV/continuation capacity
-planner reads available memory. On GB10, the fixed host cache therefore reduces
-the physical memory available to those pools. Prefix-checkpoint pinning,
-publication, and retirement remain owned by the KV cache and scheduler. The
-Engram cache copies hits into the existing pinned staging buffers before GPU
-upload, so its entries require no GPU retirement fence. Staging reuse continues
-to wait for every rank's consumer completion.
-
-Before launching a graph, each rank queues a readiness-generation wait, row
-copies, and an event record on a copy stream per table. Reader threads publish
-the generation only after filling the host buffers. Each table requires two
-H2D copies per rank per step: one contiguous weight plane and one contiguous
-scale plane. In RAM mode the CPU gathers each row into those planes before
-either upload. The captured graph waits
-on the recorded event at the table consumer, allowing preceding layers to run
-while reads and copies are pending. Storage mode does not change the model
-graph catalog. All rank completions must finish before staging storage is
-reused. Read failures release pending waits with zeroed rows, poison the
-executor, and suppress completion delivery. Shutdown cancels pending mailbox
-waits and drains the streams before releasing storage.
-
-**Kernels.** The same subscriber copies the image of every module and library
-the driver loads, from the driver-API load calls and from the resource
-callback that also covers modules loaded internally by CUDA libraries. Each
-kernel node's function maps to its image through `cuFuncGetModule`. Resource
-callbacks during lazy loading are associated with the driver call that
-materializes the module, including attribute and occupancy queries and launches
-using context-independent `CUkernel` handles. Occupancy queries retain their
-input-function association even when they reject the launch configuration.
-A unique symbol-name match is a fallback. The exporter records
-each function's parameter layout from `cuFuncGetParamInfo` and its dynamic
-shared-memory, carveout, and cluster attributes. ELF symbol enumeration and
-`cuModuleGetGlobal` capture initialized module globals and constants; native
-loading restores their contents after loading each cubin.
-Source-bearing debug sections, embedded PTX, compiler comments, and ELF source-file
-names are erased without changing CUDA section or symbol indices. Assertion
-filename globals are replaced with `kernel`; assertion conditions and messages
-remain intact. Defined function and global symbols receive module-local opaque
-names. Section names and package lookup names use the same aliases; undefined
-imports and CUDA-reserved symbols retain their driver-facing names. String tables
-are rebuilt and their original bytes cleared. Instructions, relocation indices,
-CUDA metadata, and initialized model data retain their executable layout.
-
-These transformations remove descriptive metadata, not executable semantics.
-Cubins remain disassemblable, and instruction patterns, required CUDA metadata,
-and remaining runtime diagnostics can identify compiler and kernel families.
-Package signatures authenticate the publisher. Executable-resource encryption
-does not provide confidentiality against an operator controlling the runtime.
-
-**Graphs.** Capture keeps the graph templates alive, and the walker records
-each template node by node: kernel nodes with grid, block, shared memory,
-every nonzero launch attribute, and the parameter bytes copied verbatim;
-memset and contiguous device-to-device copy nodes with their driver
-parameters; empty nodes; named external event-wait nodes; and every edge
-with its edge data. CUPTI node ids preserve construction order, including
-independent branches. Kernel parameters may use argument arrays or a packed
-`extra` buffer; the exporter reads individual parameters using the driver's
-offsets and sizes. Parameterless kernels retain an empty argument list. External
-waits refer to declared readiness events that the loader recreates. Host
-nodes, child graphs, undeclared event waits, event-record nodes, conditional
-nodes, and device-updatable nodes fail export.
-
-**Contract.** The package carries the Helios execution manifest with buffer
-addresses rewritten as allocation references, the server configuration, the
-frontend assets, the device architecture, and the context flags, cache
-configuration, and limits. Parameter bytes are stored exactly as captured.
-Pointer and tensor-map fields may additionally be declared as relocations,
-which lets a loader place storage elsewhere and rewrite the fields, tensor
-maps through `cuTensorMapReplaceAddress`; the model export does not declare
-them and relies on identical addresses instead.
+Canonical payload packages do not use logical filenames, layout segments, or
+key-free conversion of signed logical ranges: they use signed content ids,
+payload-relative initializer slices, and unsigned `LocationSet` entries, with
+`flare sign` required only when payload partitioning or signed semantics change.
+See [payload packages](package-format-design.md) for the present-state rules on
+canonical forms, packing, publication, locations, and conversion.
 
 ### Preparation rebuild metadata
 
@@ -546,10 +338,15 @@ Ignition does not yet provide that importer or a package rebuild command.
 `--no-weights` continues to prepare from the source checkpoint and reuse cached
 payloads. Offloaded embedding planes retain their existing typed table metadata.
 
+Speculative rebuild metadata records the resolved physical graph-count budget
+as `RebuildSpeculation.graph_budget`. Packed speculative preparation requires
+an explicit positive budget; rebuilding a catalog must use that recorded value
+rather than selecting a recipe default.
+
 Flare exposes the manifest and per-rank tensor counts through `flare inspect`;
 `--all` includes the tensor catalogs. Absent manifests are reported as null.
 Helios ignores rebuild metadata during loading and replay, including unfamiliar
-catalog versions. Previously exported packages need no conversion to serve.
+catalog versions. Serving still requires execution ABI 4 and model contract 2.
 Changing signed rebuild metadata requires signing the package again.
 
 ### Publisher authentication and executable access
@@ -563,7 +360,7 @@ resources:
 | 1 | Model index without rank bundles, publisher namespace, source URL, development marker, model license name and link when recorded, rank count, and SHA-256 commitments to groups 2–3 | Before publisher acceptance or CUDA initialization |
 | 2 | Frontend asset spans and hashes | Before those contents are consumed |
 | 3 | Ranges and SHA-256 of shared embedding tables, including padding | With `flare run --verify-weights` |
-| Rank *r* | Rank *r*'s bundle; its cubin and graph spans, plaintext and ciphertext sizes, and ciphertext chunk hashes; its module global spans and hashes; and the ranges and SHA-256 of its stored allocations and embedding partitions, including padding | Bundle before loading; resources as for groups 2–3 |
+| Rank *r* | Rank *r*'s bundle; its cubin and graph spans, decoded and stored sizes, and compressed chunk hashes; its module global spans and hashes; and the ranges and SHA-256 of its stored allocations and embedding partitions, including padding | Bundle before loading; resources as for groups 2–3 |
 
 Stored data is ordered by owner: shared tables, then each rank's allocations and table partitions.
 Each owner's signed parts describe its contiguous ranges across files. Every signature
@@ -584,36 +381,38 @@ overlapping, unclassified, or incorrectly classified spans fail loading. The
 contains the signing-key fingerprint, not the verification key. Keys come from
 Helios's embedded publisher profiles or explicitly supplied profile files.
 
-Cubins and graph records use AES-256-GCM in independent 4 MiB plaintext chunks,
-each followed by a 16-byte tag. Each package has a random 32-byte identifier.
-HKDF-SHA256 derives a resource key from the publisher verification key, with
-the package identifier as salt and a domain-separated encoding of the resource
-offset and the acceptance string as context. The exporter encrypts under the
-publisher namespace; Helios derives from the string the user applied to accept
-the package, which the trust store remembers, so acceptance is the key material
-and any other string decrypts nothing. Chunk nonces encode the chunk index;
-authenticated data binds the package identifier, offset, plaintext length, and
-chunk index. Field encodings use little-endian u64 byte lengths followed by the
-field bytes; the exporter and native reader define the matching domain strings
-in `ignition/preparation/protection.py` and
-`helios/src/runtime_package/protection.rs`. Re-signing ciphertext with another
-key or namespace does not produce a loadable package. Weights and tables stay
-plaintext and retain direct-I/O compatibility and storage deduplication.
+The exporter writes each cubin or graph as one zstd frame at level 3.
+`ExecutableResource.stored` addresses the frame and `decoded_nbytes` is its
+signed decoded length. `chunk_nbytes` is 4 MiB and `chunk_sha256` holds the
+SHA-256 of each compressed chunk, with count
+`ceil(stored.nbytes / 4 MiB)`. The stored and decoded lengths are each bounded
+by 4 TiB. The decoder accepts one bounded zstd frame, caps its window at 8 MiB,
+and rejects truncated or extra frames, trailing bytes, and decoded length
+mismatch.
+
+Signatures authenticate the stored frame and its signed decoded length. Helios
+authenticates each compressed chunk against its signed commitment before feeding
+it to the decoder; it does not require hashing the entire combined executable
+payload first. Acceptance is a trust and license decision: the value passed to
+`authorize` equals the signed publisher namespace exactly. It is not key
+material. Weights and tables stay uncompressed and retain direct-I/O compatibility
+and storage deduplication.
 
 `PackageClaim::read` returns what a package claims before verification: signer
 fingerprint, namespace, official source, and development marker, syntax-checked
 so a caller can resolve the signer's identity from them. `VerifiedPackage::open`
 authenticates the index and publisher binding against the supplied profiles,
 for every rank or for one rank of a multi-host package, and exposes the recorded
-license. `VerifiedPackage::authorize` records the acceptance string and
-optionally checks the stored-data contents. Only its `AuthorizedPackage` result can enter
+license. `VerifiedPackage::authorize` requires the acceptance string to equal the
+signed publisher namespace exactly, records it, and optionally checks the
+stored-data contents. Only its `AuthorizedPackage` result can enter
 `NativeModel::load` or `NativeResources::load`. Executable resources are
-hash-checked and decrypted before CUDA receives them. Frontend assets retain
+hash-checked, decompressed, and length-checked before CUDA receives them. Frontend assets retain
 signed digest checks. Open package descriptors remain alive through native
 use, including deferred frontend and embedding-table reads; replacing the
 pathname cannot redirect those reads. Package files must remain immutable while
 loaded. Signatures authenticate bytes and do not sandbox executable code.
-Encryption does not prevent a user controlling the runtime from recovering code.
+Compression does not prevent a user controlling the runtime from recovering code.
 
 Source builds contain no embedded publisher profiles:
 `helios/src/runtime_package/publishers.json` is an empty array. Helios reserves an
@@ -704,50 +503,36 @@ starting at zero, while loading progress retains the CLI's GPU labels. Flare
 sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requires
 compiled cubins; missing native GPU code fails instead of compiling PTX.
 
-`LoadOptions` selects runtime concurrency, MTP draft-token count, and adaptive
-or fixed verification before any CUDA context is initialized. Ignition captures
-every power-of-two request bucket through the padded concurrency maximum.
-Width one covers every bucket; wider speculative and verification graphs require
-`batch_capacity * token_capacity <= speculative_token_capacity`. The capacity
-defaults to the larger of padded concurrency and maximum verification width.
-Proposal graphs independently cover every bucket at the configured draft depth. Mixed graph coverage is sparse over prompt capacity
-and verification width; see [mixed execution](scheduling-runtime-design.md).
-Execution metadata
-identifies graph kind, sampling mode, batch capacity, token capacity, draft
-source, draft count, and verification count; the
-loader uses these fields rather than graph names to select variants. It checks
-required batch coverage and identical selected catalogs across TP ranks.
-The scheduler compares declared prefill capacities by useful service and
-estimated graph duration. A package must include its configured maximum prefill chunk;
-intermediate capacities are optional and need not follow a generated sequence.
-Draft count and verification count are independent declaration fields.
-Verification count includes the pending input token. Proposal graphs declare
-only draft count and source; verification graphs declare only verification count.
-A split catalog retains one configured proposal depth in both adaptive and fixed
-verification modes. Packages containing several producer depths load only the
-selected depth; shorter producers never enter scheduling or probe selection.
-Verification prefixes and packed target capacities remain adaptive. Packages
-containing only the maximum proposal depth remain supported. Combined graphs declare both
-counts. For a selected combined batch and width, the loader chooses one permitted draft count;
-it never loads duplicate MTP alternatives for that shape. The index lists
-each graph's function dependencies, so kernel selection also precedes graph
-body reads. Selection does not infer semantics from graph names.
+`LoadOptions` selects runtime concurrency, maximum actual MTP draft count, and
+adaptive or fixed prefix selection before CUDA initialization. Every required
+power-of-two request bucket has width-one execution. Wider programs fit the
+prepared aggregate target envelope. A package must include its configured
+maximum prefill chunk; intermediate prefill capacities are optional.
 
-`flare run` accepts `--max-concurrency N`, `--mtp-draft-tokens N`, and either
-`--mtp-adaptive-verification` or `--no-mtp-adaptive-verification`. Unspecified
-settings retain package defaults. Reductions must be supported by captured
-graphs; a concurrency limit of three still requires the batch-four bucket.
-Zero drafts selects ordinary prefill, decode, mixed, resume, and prefix-cache operations.
-The graph catalog's optional `speculation_enabled` field declares which serving
-mode an operation supports; absent means shared by both modes. Preparation includes
-ordinary operations alongside speculative operations, including width-one rounds
-that maintain draft state for subsequent wider rounds. Selection removes all
-unneeded variants before reading graph bodies. Captured weights and storage layouts
-remain shared; pinned zero does not execute draft generation or state maintenance.
-Missing variants required by the declared envelope and increases beyond package
-capacities fail before allocation. Split catalogs also require proposal-free
-width-one speculative graphs. Fixed loading retains those graphs and width-one
-verification alongside the full loaded width where the envelope permits it.
+Execution metadata identifies complete speculative programs by B/D/W/P: request
+capacity, captured proposal depth, per-request target capacity including the pending
+token, and physical aggregate target rows. P is explicit for rectangular programs
+as well as ragged programs. D is independent of W and must describe the captured
+computation. The loader selects supported reductions from actual programs, rejects
+uncaptured capacities, and verifies identical selected catalogs across ranks.
+Each program's function dependencies allow kernel selection before graph-body
+reads. Graph names do not select semantics.
+
+`QueryLength` inputs bind exact host-selected lengths. `SpeculativePrefixLimit`
+inputs bind immutable ceilings and leave actual lengths to a captured GPU causal
+allocator. Fixed prefix selection supports host-allocated ragged programs; GPU
+allocation requires adaptive selection. A confidence output declares
+`confidence_width` and uses FP32 `[2, request_slots, draft_capacity]` frames.
+
+`flare run` accepts `--max-concurrency`, `--mtp-draft-tokens`, and adaptive/fixed
+selection flags. Unspecified values retain package defaults. A concurrency limit
+of three requires the batch-four bucket. Zero drafts selects ordinary prefill,
+decode, mixed, resume, and prefix-cache operations. The optional
+`speculation_enabled` field selects complete serving modes for shared operations.
+Preparation includes ordinary programs and width-one speculative programs that
+preserve draft context. Selection removes unused variants before reading graph
+bodies; captured weights and storage remain shared. There are no standalone
+proposal or verification operations or separate packed-speculative operation.
 
 Unselected graph templates and executables are never reconstructed. Functions
 used only by omitted graphs are dropped, as are unused modules without globals.
@@ -893,8 +678,9 @@ understands. It does not pin a driver version or a Helios build, because sm_120
 SASS loads on any driver that supports the architecture and a package stays
 valid across Helios builds that keep the contract.
 
-Flare has no recipe catalog, no planner, no hub access, and no kernel cache.
-Those belong to ignition.
+Flare acquires prepared packages from the Hub and resolves offline packages
+through the shared model cache. Model recipes, preparation planning, and kernel
+preparation belong to Ignition.
 
 ## 6. Tensor-parallel ranks as threads
 
@@ -957,12 +743,15 @@ restored image. The probes, orchestration, and measurements live under
 - The sm_120 TMA tile path links against driver-provided code and reserves
   about 3.6 GiB of device memory per context when loaded; the memory plan
   should account for it once b12x kernels that use the path are identified.
-- Weight payloads are packed by allocator segment in address order, so any
-  change in allocation order or size renames every later blob of a rank.
-  [Stable weight payloads](weight-payload-stability.md) specifies owner-ordered
-  packing whose blob names depend only on checkpoint bytes, recipe packing,
-  and rank.
-- Each tensor-parallel size stores a complete copy of the weights.
-  [Package resharding](package-resharding.md) specifies a fat package in which
-  derived sizes reference or derive the canonical size's blobs and Flare
-  materializes the selected size locally.
+- Legacy allocator-segment packages pack weights in address order, so changes
+  in allocation order or size rename later blobs of a rank. Each independently
+  exported tensor-parallel size stores a complete copy of its weights.
+  [Payload-based model packages and the Flare model cache](package-format-design.md)
+  specifies stable layer payloads, payload-based authentication, packed and
+  directory canonical forms, and one package containing multiple prepared TP
+  deployments. Download materializes selected layouts into a shared Rust-owned
+  cache whose entries use the directory form. Aligned W4A16, QMMA, and IQ2
+  producer mappings have focused GPU byte-comparison coverage. Unsupported
+  mappings retain independently exported bytes, including shard-dependent
+  quantization data. Derived TP materialization has byte-exact fixture coverage
+  but no full-model TP2 reshard qualification.

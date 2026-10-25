@@ -130,6 +130,7 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
             },
             draft_pages_per_request: 1,
             completion_inputs: vec![],
+            speculative_allocations: vec![],
             state_rows_per_request: None,
         },
     )
@@ -154,7 +155,9 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
             GraphKind::Speculative,
         ] {
             for tokens in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
+                graphs.push(crate::execution::GraphDescriptor { confidence_width: 0,
+                    draft_tokens: if kind == GraphKind::Speculative { tokens - 1 } else { 0 },
+                    packed_token_capacity: if kind == GraphKind::Speculative { batch * tokens } else { 0 },
                     name: format!("{kind:?}-{batch}-{tokens}"),
                     kind,
                     sampling_mode: crate::execution::SamplingMode::General,
@@ -173,7 +176,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
         (GraphKind::Vision, vec![8, 16, 256, 1024, 4096, 16384]),
     ] {
         for tokens in capacities {
-            graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
+            graphs.push(crate::execution::GraphDescriptor { confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
                 name: format!("{kind:?}-{tokens}"),
                 kind,
                 sampling_mode: crate::execution::SamplingMode::General,
@@ -499,6 +502,7 @@ fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents(
                 },
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
+            speculative_allocations: vec![],
                 state_rows_per_request: None,
             },
         )
@@ -577,6 +581,7 @@ fn invalid_prefill_limits_reject_before_request_resources_are_created() {
                 },
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
+            speculative_allocations: vec![],
                 state_rows_per_request: None,
             },
         );
@@ -942,7 +947,7 @@ fn branching_requests_own_distinct_tail_pages_and_terminal_snapshots() {
 #[test]
 fn host_uploaded_decode_waits_for_its_previous_sample() {
     let mut scheduler = scheduler(1, 8, 2);
-    scheduler.capabilities.completion_inputs = vec!["token_ids".into()];
+    scheduler.capabilities.completion_inputs = vec![((GraphKind::Decode, 1, 0, 1, 0, 0), vec!["token_ids".into()])];
     let handle = scheduler.admit(spec(63, 3)).unwrap();
     init(&mut scheduler, 1);
     let prefill = scheduler.plan().unwrap();
@@ -1302,12 +1307,12 @@ fn speculative_every_committed_prefix_updates_counts_and_tokens_once() {
     }
 }
 #[test]
-fn speculative_rounds_wait_for_feedback_and_use_actual_counts() {
+fn speculative_rounds_allow_lookahead_and_use_actual_counts() {
     let (mut s, h) = speculative_scheduler(65, 32);
     let first = s.plan().unwrap();
-    assert!(first.requires_feedback);
+    assert!(!first.requires_feedback);
     s.commit(&first, Fence(4)).unwrap();
-    assert!(s.plan().is_none());
+    assert!(s.plan().is_some());
     assert!(s.commit(&first, Fence(5)).is_err());
     s.complete(
         Fence(4),
@@ -1349,7 +1354,7 @@ fn speculative_output_limit_masks_rows_without_queueing_terminal_work() {
     let out = s
         .complete(
             Fence(4),
-            &vector_records(h, 4, 61, 2, &[7], 8, 2),
+            &bounded_vector_records(h, 4, 61, 2, &[7], 8, 2, first.lanes[0].tokens),
             Default::default(),
         )
         .unwrap();
@@ -1405,7 +1410,7 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
         assert!(s.plan().is_none());
         s.complete(
             Fence(4),
-            &vector_records(h, 4, 66, 2, &[10], 8, 1),
+            &bounded_vector_records(h, 4, 66, 2, &[10], 8, 1, step.lanes[0].tokens),
             Default::default(),
         )
         .unwrap();
@@ -1534,7 +1539,7 @@ fn fixed_width_respects_output_limit_at_context_boundary() {
     scheduler
         .complete(
             Fence(4),
-            &vector_records(h, 4, 127, 3, &[10, 11], 8, 2),
+            &bounded_vector_records(h, 4, 127, 3, &[10, 11], 8, 2, first.lanes[0].tokens),
             Default::default(),
         )
         .unwrap();
@@ -1644,7 +1649,7 @@ fn acceptance_keeps_request_program_and_censored_prefixes_separate() {
 }
 
 #[test]
-fn physically_offered_padding_is_not_an_acceptance_observation() {
+fn offered_prefix_cannot_exceed_the_reserved_logical_lane() {
     use speculation::ProposalSource::Mtp;
     for remaining in [1, 2] {
         let (mut s, h) = speculative_scheduler(65, remaining + 1);
@@ -1666,6 +1671,11 @@ fn physically_offered_padding_is_not_an_acceptance_observation() {
             2,
         );
         completion[0].vector.as_mut().unwrap().accepted_drafts = remaining as i64;
+        assert!(s.complete(Fence(4), &completion, Default::default()).is_err());
+        assert_eq!(s.request(h).unwrap().acceptance().rounds(), 0);
+        let vector = completion[0].vector.as_mut().unwrap();
+        vector.offered_drafts = remaining as i64 - 1;
+        vector.accepted_drafts = remaining as i64 - 1;
         s.complete(Fence(4), &completion, Default::default())
             .unwrap();
         let profile = s.request(h).unwrap().acceptance();
@@ -1686,7 +1696,7 @@ fn completion_learns_only_proven_acceptance_and_is_transactional() {
         let (mut s, h) = speculative_scheduler(65, 8);
         let plan = s.plan().unwrap();
         s.commit(&plan, Fence(4)).unwrap();
-        let mut completion = vector_records(h, 4, 66, 2, &[10], 8, status);
+        let mut completion = bounded_vector_records(h, 4, 66, 2, &[10], 8, status, plan.lanes[0].tokens);
         completion[0].vector.as_mut().unwrap().accepted_drafts = accepted;
         let mut invalid = completion;
         invalid[0].generation += 1;
@@ -1844,7 +1854,7 @@ fn fixed_and_adaptive_widths_are_independent_of_batch_capacity() {
         let batch = active.next_power_of_two();
         let width = 7;
         assert_eq!((step.batch_capacity, step.token_capacity), (batch, width));
-        assert!(step.requires_feedback);
+        assert!(!step.requires_feedback);
         s.speculative_fixed_width = None;
         s.refresh_speculative_catalog();
         for width in 1..=8 {
@@ -1912,7 +1922,7 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
         assert!(step.requires_feedback);
         s.commit(&step, Fence(6)).unwrap();
         assert!(s.plan().is_none());
-        let mut complete = vector_records(a, 6, 66, 2, &[40], 8, 1);
+        let mut complete = bounded_vector_records(a, 6, 66, 2, &[40], 8, 1, step.lanes[0].tokens);
         let other = vector_records(b, 6, 66, 2, &[41], 8, 1);
         complete[b.slot as usize] = other[b.slot as usize];
         for h in [a, b] {
@@ -1979,6 +1989,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
         },
         draft_pages_per_request: 1,
         completion_inputs: vec![],
+            speculative_allocations: vec![],
         state_rows_per_request: None,
     };
     let limits = SchedulerLimits {
@@ -2044,6 +2055,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
         SchedulerCapabilities {
             draft_pages_per_request: 9,
             completion_inputs: vec![],
+            speculative_allocations: vec![],
             state_rows_per_request: None,
             ..capabilities
         },
@@ -3281,4 +3293,13 @@ fn scored_requests_bypass_prefix_lookup_and_keep_their_own_prefill_catalog() {
     again.prompt_logprobs = false;
     let ordinary = scheduler.plan_admission(&again).unwrap();
     assert!(ordinary.lookup.checkpoint.is_some());
+}
+
+fn bounded_vector_records(h: RequestHandle, fence: u64, consumed: i64, generated: i64,
+    tokens: &[i64], width: i64, status: i64, limit: usize) -> [CompletionRecord; 4] {
+    let mut rows = vector_records(h, fence, consumed, generated, tokens, width, status);
+    let vector = rows[h.slot as usize].vector.as_mut().unwrap();
+    vector.offered_drafts = vector.offered_drafts.min(limit.saturating_sub(1) as i64);
+    vector.accepted_drafts = vector.accepted_drafts.min(vector.offered_drafts);
+    rows
 }

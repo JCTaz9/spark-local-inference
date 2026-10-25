@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
-pub const ABI_VERSION: u32 = 2;
-pub const SPECULATIVE_ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const VECTOR_RECORD_FIELDS: usize = 24;
 pub const MAX_OUTPUT_TOKENS: usize = 8;
 pub const REQUEST_LANES: usize = 64;
@@ -13,7 +12,6 @@ pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 pub const LOGPROB_PAIR_FIELDS: usize = 2;
 pub const LOGPROB_FIELDS: usize = LOGPROB_PAIR_FIELDS * (1 + MAX_LOGPROB_TOKEN_IDS);
 pub const PROMPT_FIELDS: usize = 3 + 2 * MAX_TOP_LOGPROBS;
-pub const RECORD_FIELDS: usize = 8;
 pub const BATCH_CAPACITIES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,12 +66,6 @@ pub enum GraphKind {
     ScoredPrefill,
     Decode,
     Speculative,
-    /// Retained draft preparation; consumes no target history.
-    Proposal,
-    /// Target verification of a retained proposal prefix.
-    Verification,
-    /// One proposal and GPU-allocated packed target pass with terminal feedback.
-    PackedSpeculative,
     Mixed,
     Resume,
     Vision,
@@ -91,8 +83,6 @@ impl GraphKind {
                 | Self::ScoredPrefill
                 | Self::Decode
                 | Self::Speculative
-                | Self::Verification
-                | Self::PackedSpeculative
                 | Self::Mixed
                 | Self::Resume
         )
@@ -129,9 +119,6 @@ impl TryFrom<&str> for GraphKind {
             "scored_prefill" => Ok(Self::ScoredPrefill),
             "decode" => Ok(Self::Decode),
             "speculative" => Ok(Self::Speculative),
-            "proposal" => Ok(Self::Proposal),
-            "verification" => Ok(Self::Verification),
-            "packed_speculative" => Ok(Self::PackedSpeculative),
             "mixed" => Ok(Self::Mixed),
             "resume" => Ok(Self::Resume),
             "vision" => Ok(Self::Vision),
@@ -141,6 +128,12 @@ impl TryFrom<&str> for GraphKind {
             )),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefixAllocation {
+    Host,
+    Gpu,
 }
 
 #[derive(Clone, Debug)]
@@ -162,7 +155,9 @@ pub struct InputBinding {
 
 #[derive(Clone, Debug)]
 pub struct GraphDescriptor {
-    /// Proposal depth of a packed combined round; zero for legacy operations.
+    /// Confidence prefixes produced per request in the completion frame.
+    pub confidence_width: usize,
+    /// Proposal depth of a complete speculative round.
     pub draft_tokens: usize,
     pub name: String,
     pub kind: GraphKind,
@@ -170,7 +165,7 @@ pub struct GraphDescriptor {
     pub handle: usize,
     pub batch_capacity: usize,
     pub token_capacity: usize,
-    /// Total target-token rows for packed verification; zero keeps rectangular capacity.
+    /// Physical target-token rows; explicit for every speculative operation.
     pub packed_token_capacity: usize,
     /// Prompt capacity for a mixed graph; zero for every other operation.
     pub prefill_capacity: usize,
@@ -227,12 +222,9 @@ pub struct ExecutionManifest {
 
 impl ExecutionManifest {
     pub fn completion_fields(&self) -> usize {
-        if self.abi_version == SPECULATIVE_ABI_VERSION {
-            VECTOR_RECORD_FIELDS
-        } else {
-            RECORD_FIELDS
-        }
+        VECTOR_RECORD_FIELDS
     }
+
     pub fn request_capacity(&self) -> usize {
         self.max_active.next_power_of_two()
     }
@@ -357,10 +349,10 @@ impl ExecutionManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if ![ABI_VERSION, SPECULATIVE_ABI_VERSION].contains(&self.abi_version) {
+        if self.abi_version != ABI_VERSION {
             return Err(Error::execution(
                 ExecutionError::Manifest,
-                "unsupported execution ABI version",
+                "unsupported execution ABI version; re-export the model package",
             ));
         }
         if !(1..=REQUEST_LANES).contains(&self.max_active) {
@@ -465,9 +457,16 @@ impl ExecutionManifest {
         let logprobs = self.max_top_logprobs()? != 0;
         self.prompt_logprob_capacity()?;
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
-            if self.abi_version != SPECULATIVE_ABI_VERSION || buffer.dtype != Dtype::Float32
+            if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI3 and two float32 frames of seven prefixes per request slot".into());
+                return Err("completion_speculative_survival requires ABI4 and two float32 frames of seven prefixes per request slot".into());
+            }
+        }
+        if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
+            if buffer.dtype != Dtype::Float32 || buffer.shape.len() != 3
+                || buffer.shape[0] != 2 || buffer.shape[1] != self.request_capacity()
+                || !(1..MAX_OUTPUT_TOKENS).contains(&buffer.shape[2]) {
+                return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps") {
@@ -481,30 +480,27 @@ impl ExecutionManifest {
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
         for graph in &self.graphs {
-            if graph.packed_token_capacity != 0 && (!matches!(graph.kind, GraphKind::Verification | GraphKind::PackedSpeculative)
-                || graph.packed_token_capacity < graph.batch_capacity
-                || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)) {
-                return Err("packed verification rows exceed declared request-prefix bounds".into());
+            if graph.kind == GraphKind::Speculative {
+                if graph.packed_token_capacity < graph.batch_capacity
+                    || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)
+                    || graph.draft_tokens > 7
+                    || (graph.token_capacity == 1 && graph.draft_tokens != 0) {
+                    return Err("speculative B/D/W/P geometry is invalid".into());
+                }
+            } else if graph.packed_token_capacity != 0 || graph.draft_tokens != 0 {
+                return Err("draft depth and target rows require a speculative operation".into());
             }
-            if (graph.kind != GraphKind::PackedSpeculative && graph.draft_tokens != 0)
-                || (graph.kind == GraphKind::PackedSpeculative
-                    && (!(1..=7).contains(&graph.draft_tokens)
-                        || graph.draft_tokens + 1 > graph.token_capacity
-                        || graph.packed_token_capacity == 0)) {
-                return Err("packed combined proposal depth is outside its declared target bounds".into());
-            }
-            if matches!(graph.kind, GraphKind::Proposal | GraphKind::PackedSpeculative) {
+            if graph.confidence_width > 0 {
                 let confidence = self.buffer("proposal_confidence")?;
-                if graph.token_capacity < 2
+                if graph.kind != GraphKind::Speculative
+                    || graph.confidence_width != graph.draft_tokens
                     || confidence.dtype != Dtype::Float32
-                    || confidence.shape.len() != 2
-                    || confidence.shape[0] != self.request_capacity()
-                    || !(if graph.kind == GraphKind::PackedSpeculative { graph.draft_tokens } else { graph.token_capacity - 1 }..=7).contains(&confidence.shape[1])
-                    || confidence.strides != [confidence.shape[1], 1]
-                {
-                    return Err(
-                        "proposal confidence requires one FP32 value per request row and draft".into(),
-                    );
+                    || confidence.shape.len() != 3
+                    || confidence.shape[0] != 2
+                    || confidence.shape[1] != self.request_capacity()
+                    || confidence.shape[2] < graph.confidence_width
+                    || confidence.shape[2] > MAX_OUTPUT_TOKENS - 1 {
+                    return Err("confidence output requires [2, request_slots, draft_capacity] float32 frames".into());
                 }
             }
             if graph.name.is_empty() || !names.insert(&graph.name) {
@@ -515,7 +511,7 @@ impl ExecutionManifest {
             }
             let valid = match graph.kind {
                 GraphKind::Mixed => {
-                    self.abi_version == SPECULATIVE_ABI_VERSION
+                    self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && (2..=self.request_capacity()).contains(&graph.batch_capacity)
                         && (1..=8).contains(&graph.token_capacity)
@@ -527,8 +523,8 @@ impl ExecutionManifest {
                             .checked_add((graph.batch_capacity - 1) * graph.token_capacity)
                             .is_some()
                 }
-                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative => {
-                    self.abi_version == SPECULATIVE_ABI_VERSION
+                GraphKind::Speculative => {
+                    self.abi_version == ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
                         && (1..=8).contains(&graph.token_capacity)

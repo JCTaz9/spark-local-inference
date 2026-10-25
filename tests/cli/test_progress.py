@@ -43,16 +43,16 @@ def signature(kind="decode", *, batch=1, width=1, packed=0, drafts=None, prefill
 def test_catalog_plain_callback_retains_every_shape_without_inventing_cross_products():
     messages = []
     graph_catalog(messages.append, [signature(batch=1), signature(batch=2), signature(batch=1, width=2),
-        signature("packed_speculative", batch=2, width=6, packed=4, drafts=5, enabled=True),
-        signature("packed_speculative", batch=2, width=6, packed=12, drafts=5, enabled=True),
+        signature("speculative", batch=2, width=6, packed=4, drafts=5, enabled=True),
+        signature("speculative", batch=2, width=6, packed=12, drafts=5, enabled=True),
         signature("vision", width=576, enabled=None), signature("mixed", batch=2, prefill=128)])
     output = "\n".join(messages)
     assert "Graph catalog: 7 graphs (before compilation/capture)" in output
     rows = [line.split() for line in messages if line.strip().startswith("decode")]
     assert rows == [["decode", "off", "1,2", "1", "-", "-", "-", "2"],
                     ["decode", "off", "1", "2", "-", "-", "-", "1"]]
-    packed = next(line.split() for line in messages if line.strip().startswith("packed_speculative"))
-    assert packed == ["packed_speculative", "on", "2", "6", "4,12", "5", "-", "2"]
+    packed = next(line.split() for line in messages if line.strip().startswith("speculative"))
+    assert packed == ["speculative", "on", "2", "6", "4,12", "5", "-", "2"]
     assert any(line.split() == ["vision", "-", "1", "576", "-", "-", "-", "1"] for line in messages)
     assert any(line.split() == ["mixed", "off", "2", "1", "-", "-", "128", "1"] for line in messages)
     assert "\x1b" not in output
@@ -98,7 +98,7 @@ from types import SimpleNamespace
 from ignition.progress import StartupProgress, graph_catalog, phase
 progress = StartupProgress()
 with phase(progress, 'Prepare serving graphs') as stage:
-    graph_catalog(progress, [SimpleNamespace(kind='packed_speculative', batch_capacity=2,
+    graph_catalog(progress, [SimpleNamespace(kind='speculative', batch_capacity=2,
         token_capacity=6, packed_token_capacity=12, draft_tokens=5,
         prefill_capacity=0, speculation_enabled=True)])
     stage.update('later work')
@@ -125,5 +125,23 @@ with phase(progress, 'Prepare serving graphs') as stage:
     assert "\x1b[" in output
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
     assert plain.count("Graph catalog: 1 graphs") == 1
-    assert "packed_speculative" in plain and "later work" in plain and "OK" in plain
+    assert "speculative" in plain and "later work" in plain and "OK" in plain
     assert "…" not in plain
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_nonlive_export_only_prints_its_terminal_result(fail):
+    stream = io.StringIO()
+    progress = StartupProgress(stream=stream)
+    progress.console = Console(file=stream, width=120, color_system=None)
+    try:
+        with phase(progress, 'Export native package', live=False):
+            assert stream.getvalue() == ''
+            if fail:
+                raise RuntimeError('publication failed')
+    except RuntimeError:
+        assert fail
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith('[  FAILED  ]' if fail else '[    OK    ]')
+    assert progress.active is None

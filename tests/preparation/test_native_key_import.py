@@ -1,9 +1,7 @@
 """Native Ed25519 key import against independent PKCS#8 encoders."""
 
-import hashlib
 import json
 import shutil
-import struct
 import subprocess
 from types import SimpleNamespace
 
@@ -11,9 +9,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import pytest
 
-from ignition.preparation import runtime_package_pb2 as proto
-from ignition.preparation.package_file import publish
-from ignition.preparation.package_snapshot import read_container
+from tests.preparation.payload_fixture import publish, verify_signatures
 from ignition.preparation.protection import Publisher
 
 PASSWORD = b'native-import-fixture-passphrase'
@@ -24,25 +20,13 @@ def _write(path, value):
     path.chmod(0o600)
 
 
-def _verify_signatures(path, public):
-    with path.open('rb') as source:
-        envelope = proto.ProtectedIndex.FromString(read_container(source)[2])
-    assert envelope.signer == hashlib.sha256(public.public_bytes_raw()).digest()
-    for group in [*envelope.groups, *envelope.ranks]:
-        values = (b'flare-package-signature-v4', struct.pack('<I', 4), envelope.package_id,
-                  envelope.signer, struct.pack('<I', group.kind), group.body)
-        message = b''.join(struct.pack('<Q', len(value)) + value for value in values)
-        public.verify(group.signature, message)
-
-
 def _publish_with_key(tmp_path, monkeypatch, path, key):
     from ignition import signing
     monkeypatch.setattr(signing, 'passphrase', lambda _: PASSWORD)
     publisher = Publisher.load(path, 'flare-tests', 'https://huggingface.co/flare-tests/fixture')
     assert publisher.public_key == key.public_key().public_bytes_raw()
-    output = tmp_path / 'model.safetensors'
-    publish(output, proto.ModelIndex(version=4, ranks=[proto.BundleIndex()]), [], publisher=publisher)
-    _verify_signatures(output, key.public_key())
+    output = publish(tmp_path, publisher)
+    verify_signatures(output, key.public_key())
 
 
 @pytest.mark.parametrize('encrypted', [False, True])
@@ -135,7 +119,7 @@ def test_signing_key_rotation_during_preparation_rejects_native_publication(tmp_
     _write(path, encode(first))
     signer = Publisher.load(path, 'flare-tests', 'https://huggingface.co/flare-tests/fixture')
     _write(path, encode(second))
-    output = tmp_path / 'model.safetensors'
+    output = tmp_path / 'package'
     with pytest.raises(ValueError, match='signing key changed'):
-        publish(output, proto.ModelIndex(version=4, ranks=[proto.BundleIndex()]), [], publisher=signer)
+        publish(tmp_path, signer)
     assert not output.exists()

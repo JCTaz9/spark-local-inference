@@ -32,7 +32,8 @@ def model_fixture(monkeypatch, *, synchronize=None, server=None):
     model = PreparedModel(
         device=0,
         graphs={"decode": Resource("graph", events)},
-        buffers={name: object() for name in ("frame_index", "submission_sequence", "completion_records")},
+        buffers={"frame_index": object(), "submission_sequence": object(),
+                 "completion_records": SimpleNamespace(shape=(2, 4, 24))},
         signatures={"decode": GraphSignature("decode", 1, 1)},
         resources=(weights,),
         server_config={},

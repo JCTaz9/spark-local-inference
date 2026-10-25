@@ -100,19 +100,18 @@ impl CompletionRecord {
             self.error_code,
             self.reserved,
         ];
-        if let Some(v) = self.vector {
-            values.extend([
-                v.emitted_count,
-                v.offered_drafts,
-                v.accepted_drafts,
-                v.copy_offered_mask,
-                v.model_reserved,
-                v.draft_cache_consumed,
-                0,
-                v.verification_width,
-            ]);
-            values.extend(v.tokens);
-        }
+        let v = self.vector.expect("completion serialization requires a token vector");
+        values.extend([
+            v.emitted_count,
+            v.offered_drafts,
+            v.accepted_drafts,
+            v.copy_offered_mask,
+            v.model_reserved,
+            v.draft_cache_consumed,
+            0,
+            v.verification_width,
+        ]);
+        values.extend(v.tokens);
         values
     }
 }
@@ -194,7 +193,7 @@ pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[Comple
 }
 
 fn reads_speculative_survival(graph: &super::GraphDescriptor) -> bool {
-    graph.token_capacity > 1 && matches!(graph.kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative | GraphKind::Mixed)
+    graph.token_capacity > 1 && matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -419,10 +418,10 @@ impl GraphExecutor {
                 confidence: manifest
                     .graphs
                     .iter()
-                    .any(|g| matches!(g.kind, GraphKind::Proposal | GraphKind::PackedSpeculative))
+                    .any(|graph| graph.confidence_width > 0)
                     .then(|| {
                         let buffer = manifest.buffer("proposal_confidence")?;
-                        Readback::new(&model, buffer.address, buffer.nbytes)
+                        Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2)
                     })
                     .transpose()?,
                 survival: manifest.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival")
@@ -496,9 +495,8 @@ impl GraphExecutor {
         let Some(resources) = &self.resources else {
             return false;
         };
-        let grammar_constrained = grammar_constrained || resources.engram.is_some();
         self.poison.is_none()
-            && resources.frames.iter().any(|frame| frame.pending.is_none())
+            && resources.frames[self.next_sequence as usize % 2].pending.is_none()
             && !resources
                 .frames
                 .iter()
@@ -526,15 +524,16 @@ impl GraphExecutor {
     ) -> Result<Option<Fence>> {
         let fence = self.next_fence()?;
         validate_uploads(&self.manifest, graph, uploads, &mut self.resolved_uploads)?;
-        Ok(self
-            .can_submit(
-                grammar
-                    || matches!(
-                        self.manifest.graphs[graph].kind,
-                        GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative
-                    ),
-            )
-            .then_some(fence))
+        if !self.can_submit(grammar || !matches!(self.manifest.graphs[graph].kind,
+            GraphKind::Decode | GraphKind::Speculative)) {
+            return Ok(None);
+        }
+        if crate::engram::consumes(self.manifest.graphs[graph].kind) {
+            if let Some(engram) = self.resources.as_ref().and_then(|resources| resources.engram.as_ref()) {
+                engram.validate(fence.0, self.manifest.graphs[graph].packed_tokens(), uploads)?;
+            }
+        }
+        Ok(Some(fence))
     }
 
     /// Retain allocations after a peer failure that may strand a GPU collective.
@@ -573,11 +572,7 @@ impl GraphExecutor {
                 Error::execution(ExecutionError::State, "graph index out of range")
             })?;
         let grammar_constrained = grammar_constrained
-            || matches!(
-                graph.kind,
-                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative
-            )
-            || resources.engram.is_some();
+            || !matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative);
         let mut resolved = validate_uploads(
             &self.manifest,
             graph_index,
@@ -593,18 +588,20 @@ impl GraphExecutor {
         {
             return Ok(None);
         }
-        let Some(index) = resources
-            .frames
-            .iter()
-            .position(|frame| frame.pending.is_none())
-        else {
+        let index = self.next_sequence as usize % 2;
+        if resources.frames[index].pending.is_some() {
             return Ok(None);
-        };
+        }
         if self.next_sequence > i64::MAX as u64 {
             return Err(Error::execution(
                 ExecutionError::Capacity,
                 "submission sequence exhausted",
             ));
+        }
+        if crate::engram::consumes(graph.kind) {
+            if let Some(engram) = &resources.engram {
+                engram.validate(self.next_sequence, graph.packed_tokens(), uploads)?;
+            }
         }
         let fence = Fence(self.next_sequence);
         let queued = resources.frames.iter().any(|frame| frame.pending.is_some());
@@ -682,10 +679,10 @@ impl GraphExecutor {
                     frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(&resources.copy,
                         b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
                 }
-                if matches!(graph.kind, GraphKind::Proposal | GraphKind::PackedSpeculative) {
+                if graph.confidence_width > 0 {
                     let confidence = self.manifest.buffer("proposal_confidence")?;
                     frame.confidence.as_ref().unwrap().enqueue_copy(
-                        &resources.copy, confidence.address, confidence.nbytes,
+                        &resources.copy, confidence.address + index * confidence.nbytes / 2, confidence.nbytes / 2,
                     )?;
                 }
                 if reads_speculative_survival(graph) {
@@ -877,8 +874,7 @@ impl GraphExecutor {
             logprobs,
             prompt_logprobs,
             speculative_survival,
-            proposal_confidence: if matches!(self.manifest.graphs[pending.graph_index].kind,
-                GraphKind::Proposal | GraphKind::PackedSpeculative)
+            proposal_confidence: if self.manifest.graphs[pending.graph_index].confidence_width > 0
             {
                 let mut confidence = [[0.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
                 let graph = &self.manifest.graphs[pending.graph_index];
@@ -886,11 +882,11 @@ impl GraphExecutor {
                     .iter_mut()
                     .take(graph.batch_capacity)
                     // SAFETY: The transfer event follows the producing graph;
-                    // no subsequent proposal can reuse its feedback storage yet.
+                    // this frame remains reserved while its sidecar is decoded.
                     .zip(unsafe { frame.confidence.as_ref().unwrap().bytes() }
-                        .chunks_exact(4 * self.manifest.buffer("proposal_confidence")?.shape[1]))
+                        .chunks_exact(4 * self.manifest.buffer("proposal_confidence")?.shape[2]))
                 {
-                    for (value, bytes) in row.iter_mut().take(if graph.kind == GraphKind::PackedSpeculative { graph.draft_tokens } else { graph.token_capacity - 1 }).zip(bytes.chunks_exact(4)) {
+                    for (value, bytes) in row.iter_mut().take(graph.confidence_width).zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
                 }
@@ -995,6 +991,13 @@ pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
         .graphs
         .get(graph_index)
         .ok_or_else(|| Error::execution(ExecutionError::Upload, "graph index out of range"))?;
+    if graph.kind == GraphKind::ScoredPrefill {
+        let bytes = uploads.iter().filter(|upload| upload.buffer == "prompt_target_tokens")
+            .map(|upload| upload.offset.saturating_add(upload.bytes.len())).max().unwrap_or(0);
+        if bytes == 0 || bytes % 4 != 0 || bytes / 4 > graph.token_capacity {
+            return Err("scored prefill requires one target per live prompt row".into());
+        }
+    }
     if uploads.len() > manifest.input_frame_bytes {
         return Err(Error::execution(
             ExecutionError::Upload,
@@ -1147,9 +1150,8 @@ pub(super) fn decode_records(
     capacity: usize,
     fields: usize,
 ) -> Result<CompletionRecords> {
-    let vector = fields == VECTOR_RECORD_FIELDS;
     if !(1..=REQUEST_LANES).contains(&capacity)
-        || ![8, VECTOR_RECORD_FIELDS].contains(&fields)
+        || fields != VECTOR_RECORD_FIELDS
         || bytes.len() != capacity * fields * 8
     {
         return Err(Error::execution(
@@ -1161,11 +1163,7 @@ pub(super) fn decode_records(
         records: [CompletionRecord::default(); REQUEST_LANES],
         len: capacity,
     };
-    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(if vector {
-        VECTOR_RECORD_FIELDS * 8
-    } else {
-        64
-    })) {
+    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(VECTOR_RECORD_FIELDS * 8)) {
         let mut fields = [0i64; VECTOR_RECORD_FIELDS];
         for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(8)) {
             *field = i64::from_le_bytes(bytes.try_into().unwrap());
@@ -1179,7 +1177,7 @@ pub(super) fn decode_records(
             status: fields[5],
             error_code: fields[6],
             reserved: fields[7],
-            vector: vector.then(|| TokenVector {
+            vector: Some(TokenVector {
                 emitted_count: fields[8],
                 offered_drafts: fields[9],
                 accepted_drafts: fields[10],
@@ -1190,7 +1188,7 @@ pub(super) fn decode_records(
                 tokens: fields[16..24].try_into().unwrap(),
             }),
         };
-        if vector && record.status != 0 && fields[14] != 0 {
+        if record.status != 0 && fields[14] != 0 {
             return Err(Error::execution(
                 ExecutionError::Completion,
                 "reserved vector completion field must be zero",

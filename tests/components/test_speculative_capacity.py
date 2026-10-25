@@ -19,11 +19,17 @@ def test_recipes_share_bounded_target_coverage(concurrency, drafts, override):
     capacity = max(batch_capacities(concurrency)[-1], drafts + 1) if override is None else override
     expected = {(b, w) for b in batch_capacities(concurrency) for w in widths
                 if w == 1 or b * w <= capacity}
-    for recipe, enabled in ((Qwen, "mtp"), (Glm, "mtp"), (DeepSeek4, "dspark"),
-                            (Mimo, "dflash")):
+    for recipe, enabled in ((Qwen, "mtp"), (Glm, "mtp")):
         config = recipe(max_active=concurrency, speculative_widths=widths,
                         speculative_token_capacity=override, **{enabled: True})
         assert set(config.speculative_shapes) == expected
+    for recipe, enabled in ((DeepSeek4, "dspark"), (Mimo, "dflash")):
+        config = recipe(max_active=concurrency, speculative_widths=widths,
+                        speculative_token_capacity=override, **{enabled: True})
+        assert {(batch, width) for batch, width, packed in config.speculative_round_shapes if width == 1} == {
+            (batch, 1) for batch in batch_capacities(concurrency)}
+        assert all(width == 1 or (width == drafts + 1 and batch < packed <= min(capacity, batch * width))
+                   for batch, width, packed in config.speculative_round_shapes)
     config = DeepSeek41(max_active=concurrency, speculative_widths=widths,
                        speculative_token_capacity=override)
     assert set(config.speculative_shapes) == {(b, 1) for b in batch_capacities(concurrency)}
@@ -47,3 +53,26 @@ def test_proposals_keep_full_depth_independently_of_target_coverage():
 def test_insufficient_or_noninteger_capacity_is_rejected(capacity):
     with pytest.raises(ValueError):
         speculative_shapes(4, tuple(range(1, 9)), capacity)
+
+
+@pytest.mark.parametrize("recipe,enabled", [(DeepSeek4, "dspark"), (Mimo, "dflash")])
+def test_parallel_rounds_bound_physical_rows_independently_of_samples(recipe, enabled):
+    config = recipe(max_active=2, speculative_widths=(1, 2, 3, 4),
+                    speculative_token_capacity=4, **{enabled: True})
+    assert set(config.speculative_round_shapes) == {(1, 1, 1), (2, 1, 2),
+                                                   (1, 4, 2), (1, 4, 3), (1, 4, 4),
+                                                   (2, 4, 3), (2, 4, 4)}
+    assert config.decode_tokens == 4 and config.decode_samples == 8
+    fixed = recipe(max_active=2, speculative_widths=(1, 2, 3, 4),
+                   speculative_token_capacity=4, speculative_fixed_width=3, **{enabled: True})
+    assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 3}
+    assert fixed.decode_samples == 6
+
+
+def test_kimi_parallel_rounds_have_packed_target_capacity():
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(max_active=2, speculative_widths=(1, 2, 3, 4),
+                               speculative_token_capacity=4, draft_checkpoint="/tmp/dspark")
+    assert (2, 4, 3) in config.speculative_round_shapes
+    assert config.decode_tokens == 4 and config.decode_samples == 8

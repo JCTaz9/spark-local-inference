@@ -33,9 +33,21 @@ no Python calls, CUDA allocation, compilation, or graph capture. Missing graph
 variants and inconsistent contracts fail startup; requests outside prepared
 capacities fail admission.
 
-Model index version 4 is required. Execution ABI 2/3 and protected envelope
-version 4 have separate meanings. Packages with a different model-index version
-require re-export; Helios has no schema-name fallback or migration loader.
+Payload packages use `PackageBody.format_version` 2 with a signed payload
+envelope and unsigned `LocationSet`. Each executable resource is one zstd
+level-3 frame with a signed decoded length and compressed-chunk commitments.
+Execution ABI 4, prepared model contract 2, and payload format 2 are independent
+version domains. A package with another execution ABI or prepared contract
+requires re-export with Ignition and fails loading before replay.
+
+Executable resources are one mandatory zstd level-3 frame per resource. The
+signed `ExecutableResource` binds its stored frame, signed decoded length,
+resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
+compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
+capped at 8 MiB and rejects truncated or extra frames, trailing bytes, and
+decoded length mismatch. `authorize` requires the supplied acceptance string to
+exactly equal the signed publisher namespace; signatures authenticate the stored
+frame and its decoded length, while acceptance records trust and license terms.
 
 ## Serving metadata
 
@@ -46,8 +58,7 @@ reduce captured concurrency and speculative width. Physical cache capacities
 are chosen after graph loading and replace preparation's working-set counts.
 History drafting is a startup option that requires enabled learned speculation
 and concrete copied-token inputs in each selected wider graph. Export records
-no history preference. Existing packages' recorded defaults remain usable and
-explicit startup options take precedence.
+no history preference. Package defaults fill missing settings; explicit startup options take precedence.
 
 The optional package rebuild manifest and per-rank weight catalogs describe
 preparation inputs and stored tensor views. They do not select serving behavior.
@@ -58,7 +69,7 @@ serving contract and replay path unchanged.
 
 | Field | Meaning |
 |---|---|
-| `version` | Semantic contract version, currently 1 |
+| `version` | Semantic contract version, 2 |
 | `vocabulary` | Valid sampled token range and histogram/mask geometry |
 | `input_vocabulary` | Valid input range, including declared nonsampled image sentinels |
 | `vision` | Feature-slot and per-window feature capacities, patch-to-feature ratio, and captured patch capacities |
@@ -101,55 +112,67 @@ remembered page-table lengths. Buffers remain alive through execution drain.
 
 A `StateView` describes a byte offset, row stride, and byte extent within a
 registered persistent buffer. Each graph lists read, write, or read/write
-accesses. Device-owned pending tokens name a readable state view; initialization,
-restoration, and prefill must declare producers of that view. A host-owned
-pending token instead declares a value binding. Shared scheduling derives its
-completion dependency from these concrete inputs.
+accesses. Device-owned pending tokens name a readable state view. Initialization,
+restoration, prefill, scored prefill, resume, decode, speculative generation, and
+mixed generation declare writes when they produce that state. A host-owned
+pending token instead declares a value binding. Completion dependencies are
+derived for each selected graph from its actual inputs, rather than from the
+union of another operation's inputs.
 
-### Device-allocated speculative prefixes
+### Complete speculative generation
 
-`PACKED_SPECULATIVE` declares one captured proposal, causal prefix allocation,
-target verification, and accepted-state commit. Its execution descriptor carries
-the request capacity, `draft_tokens`, logical `verify_tokens`, and
-`packed_token_capacity`. The configured proposal depth is fixed across dispatches.
-The host chooses physical target capacity before generating the round's proposals,
-using completed observations rather than current draft values. The graph generates
-the complete proposal block before allocating verification prefixes.
+`SPECULATIVE` is one complete captured generation operation: proposal generation,
+optional confidence and prefix allocation, target verification, and accepted-state
+commit. There are no standalone proposal or verification operations. `DECODE`
+remains ordinary one-token generation. Width-one speculative programs draw no
+proposals and preserve the draft context needed for wider rounds.
 
-The `SPECULATIVE_PREFIX_LIMIT` input contains each submitted lane's immutable
-upper bound, including its pending token. The graph initializes proposal
-validation from those bounds, then writes actual lengths to device-owned
-`query_lengths`; this operation cannot bind host `QUERY_LENGTH` values.
-Helios fixes the cohort, original request slots, generations, pending tokens,
-page tables and continuation rows for the entire submission. Page reservations
-cover each lane's upper bound, including the cache contract's draft-page extent;
-dividing the total target budget evenly among lanes is insufficient.
+Each speculative descriptor declares four independent physical extents:
 
-Every submitted lane starts with one pending position. Allocation repeatedly
-selects the highest immediate-frontier survival probability, multiplying FP32
-confidence values sequentially in FP64. Ties prefer the shorter prefix and then
-the original request slot; floating-point total ordering distinguishes signed
-zeros. Later confidence cannot influence admission of its predecessors. Zero
-probability does not stop allocation while a permitted frontier remains.
-The sum of admitted lengths cannot exceed the captured physical target capacity.
-Rank-zero confidence is broadcast before allocation; validation agreement
-suppresses commitment on every rank if any participating rank rejects the cohort.
+| Extent | Metadata | Meaning |
+|---|---|---|
+| B | `batch_capacity` | Captured request rows |
+| D | `draft_tokens` | Actual proposal draws performed by the captured program |
+| W | `token_capacity` / `verify_tokens` | Per-request target capacity, including the pending token |
+| P | `packed_token_capacity` | Total target rows, explicit even when P = B × W |
 
-Allocation consumes no random draws. Valid rounds preserve the proposal depth's
-draft RNG reservation and the verifier width's target RNG reservation, regardless
-of the admitted prefix. Terminal completion reports actual offered drafts,
-accepted drafts and emitted tokens. Helios validates every offer against its
-reserved lane ceiling and validates the aggregate target budget before changing
-request state. Invalid ownership cannot mutate a replacement request.
+D is not inferred from W: rectangular programs usually have D = W − 1, while a
+confidence program can generate a full block and verify a shorter useful prefix.
+Lane limits cannot exceed `min(D + 1, W)` or request output/context limits.
+The host chooses the cohort and physical program from completed observations
+before that program generates proposals.
 
-There is no intermediate proposal completion. The target completion still
-precedes host admission, stop processing and reservation of another round.
-Cancellation suppresses publication but retains slots, pages, mailboxes and
-scratch until the terminal fence drains. Embedding delivery uses one
-GPU-produced request per table and submission, followed by the existing compact
-row transfer; a round contains only one target pass. Host-stop and constrained
-requests retain their ordinary width-one barriers. Packages containing only the
-separate proposal and verification operations retain their existing semantics.
+A speculative program binds exactly one length source. `QUERY_LENGTH` supplies
+exact host-selected per-lane lengths whose total fits P. `SPECULATIVE_PREFIX_LIMIT`
+supplies immutable ceilings; the captured program writes actual query lengths
+and allocates causal prefixes within P. The ceilings may sum to more than P,
+so cache reservations must cover each lane's full ceiling. These bindings derive
+allocation ownership without a model flag or model-name branch.
+
+Device allocation consumes fresh causal confidence within the complete graph.
+Every lane starts with one pending position. Allocation selects the highest
+immediate-frontier survival probability, multiplying FP32 confidence values in
+FP64. Ties prefer shorter prefixes and then original request slots. Later
+confidence cannot admit a predecessor. Rank-zero confidence is broadcast before
+allocation, and validation agreement suppresses commit on all ranks if a rank
+rejects the cohort. Allocation consumes no random draws; the captured proposal
+and target programs retain their declared RNG reservations.
+
+A program producing confidence declares `confidence_width`, equal to its actual
+D. `proposal_confidence` is contiguous FP32 storage with shape
+`[2, request_slots, draft_capacity]`; the capacity covers every declared output
+width. Frame index selects the completion frame, and submitted rows retain their
+lane order. There is no unframed confidence layout.
+
+The single terminal completion reports actual offers, accepted drafts, and
+emitted tokens. Helios validates each offer against its reserved lane ceiling
+and the aggregate P before updating request state. Compatible decode and
+speculative programs may occupy both execution frames. Host-fed pending tokens,
+grammar, host stops, history inputs, unknown or stale costs, and operations that
+change phase require completion feedback. Cancellation suppresses publication
+while retaining slots, pages, mailboxes, scratch, and captured owners through
+the terminal fence. Engram uses two host staging frames per table; a frame cannot
+be reused until every participating rank retires its consumer.
 
 `state_rows_per_request` is a per-graph storage requirement. The runtime uses the
 maximum among selected graphs to partition execution and snapshot rows. It is
@@ -173,7 +196,7 @@ readmission, and offload consume the same storage contract.
 A completion cursor names committed state and its lag behind target consumption.
 For a successful speculative lane, the reported draft cursor must equal
 `max(consumed_tokens - lag_tokens, 0)`. A graph with no draft cursor reports -1.
-Sampled IDs must fit the vocabulary; the ABI3 reserved model field remains -1.
+Sampled IDs must fit the vocabulary; the ABI4 reserved model field remains -1.
 The scheduler independently validates generations, submission order, accepted
 counts, and request endpoints before retiring any lane.
 

@@ -1,10 +1,9 @@
-"""Cubin metadata redaction preserves executable layouts and CUDA lookup names."""
+"""Cubin debug stripping preserves executable layouts and original CUDA symbols."""
 
 import struct
 
 import pytest
 
-from ignition.preparation.cubin import redact_symbols
 from ignition.preparation.module_images import global_symbols, strip_debug
 
 
@@ -51,27 +50,19 @@ def sections(image):
     return [struct.unpack_from("<IIQQQQIIQQ", image, offset + i * size) for i in range(count)]
 
 
-def test_redaction_preserves_code_metadata_and_symbol_indices():
+def test_debug_stripping_preserves_code_metadata_and_symbol_names():
     original = cubin()
-    clean, aliases = redact_symbols(strip_debug(original))
-    assert aliases == {"descriptive_kernel": "_f0", "weight_layout": "_f1"}
-    for secret in (b"descriptive_kernel", b"weight_layout", b"/private/", b"compiler build identity"):
-        assert secret not in clean
-    assert b".text._f0\0" in clean and b".nv.info._f0\0" in clean
-    assert b"__assertfail\0" in clean
-    assert global_symbols(clean) == [".nv.reservedSmem.offset0", "_f1"]
+    clean = strip_debug(original)
+    for name in (b"descriptive_kernel", b"weight_layout", b"__assertfail"):
+        assert name + b"\0" in clean
+    assert b"compiler build identity" not in clean
+    assert global_symbols(clean) == [".nv.reservedSmem.offset0", "weight_layout"]
     before, after = sections(original), sections(clean)
     assert len(before) == len(after)
-    for index in (4, 5, 8):
-        assert before[index][1:] == after[index][1:]
+    for index in (1, 2, 3, 4, 5, 8, 9):
+        assert before[index] == after[index]
         start, size = before[index][4:6]
         assert original[start:start + size] == clean[start:start + size]
-    for index in (3, 9):
-        assert before[index][1:] == after[index][1:]
-        start, size = before[index][4:6]
-        for position in range(start, start + size, 24):
-            assert original[position + 4:position + 24] == clean[position + 4:position + 24]
-        assert struct.unpack_from("<I", clean, start + 24)[0] == 0
     for index in (6, 7):
         assert after[index][5] == 0
         start, size = before[index][4:6]
@@ -79,14 +70,14 @@ def test_redaction_preserves_code_metadata_and_symbol_indices():
 
 
 @pytest.mark.parametrize("mutation,error", [
-    (lambda b: struct.pack_into("<Q", b, 64 + 2 * 64 + 8, 2), "device-allocated"),
-    (lambda b: struct.pack_into("<Q", b, 64 + 2 * 64 + 24, 0), "overlaps .*headers"),
+    (lambda b: struct.pack_into("<Q", b, 64 + 6 * 64 + 8, 2), "device-allocated"),
+    (lambda b: struct.pack_into("<Q", b, 64 + 6 * 64 + 24, sections(bytes(b))[4][4]), "overlaps executable metadata"),
     (lambda b: struct.pack_into("<I", b, 64 + 3 * 64 + 40, 100), "symbol table"),
     (lambda b: struct.pack_into("<Q", b, 64 + 3 * 64 + 56, 0), "symbol table"),
-    (lambda b: struct.pack_into("<Q", b, 64 + 2 * 64 + 32, len(b)), "section extent"),
+    (lambda b: struct.pack_into("<Q", b, 64 + 2 * 64 + 32, len(b)), "overlaps executable metadata"),
 ])
 def test_invalid_metadata_cannot_overwrite_executable_bytes(mutation, error):
     image = bytearray(cubin())
     mutation(image)
     with pytest.raises(ValueError, match=error):
-        redact_symbols(bytes(image))
+        strip_debug(bytes(image))

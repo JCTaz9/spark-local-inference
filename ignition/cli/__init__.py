@@ -29,9 +29,7 @@ def _parser() -> argparse.ArgumentParser:
                                help="configuration file (default: ~/.config/flare/config.toml)")
         return subparser
 
-    exporting = command("export", serve.export, "prepare a native model package")
-    exporting.add_argument("--output", type=Path, metavar="FILE",
-                           help="destination .safetensors file (default: a snapshot in the package cache)")
+    exporting = command("export", serve.export, "prepare a native model package in the shared cache")
     exporting.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
@@ -55,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
                            help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)")
         hosts.add_argument("--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
                            help="tensor-parallel ranks, one per host; this process is rank zero (default: 1);"
-                                " an export assembles all ranks at --output on rank zero")
+                                " an export publishes all ranks to the shared model cache on rank zero")
         hosts.add_argument("--rendezvous", metavar="ADDR:PORT",
                            help="IPv4 address and port on which rank zero admits its peers")
     serving.add_argument("--prefix-cache-states", type=int, metavar="N",
@@ -93,22 +91,21 @@ def _parser() -> argparse.ArgumentParser:
     signing.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     signing.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     signing.add_argument("--development-publisher", type=Path, help="source public profile (default: beside config)")
-    converting = command("convert", publishing.convert, "convert a signed package to an immutable blob snapshot")
-    converting.add_argument("package", type=Path, help="existing signed .safetensors package")
-    converting.add_argument("--output", type=Path, help="destination primary (default: package cache snapshot)")
+    combining = command("combine", publishing.combine, "combine prepared TP packages into one signed package")
+    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format packages")
+    combining.add_argument("--output", required=True, type=Path, help="destination package directory; must not exist")
+    combining.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
+    combining.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
+    combining.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
+    combining.add_argument("--publisher-keys", type=Path, action="append", default=[],
+                           help="trusted public publisher profiles of the sources; repeatable")
+    converting = command("convert", publishing.convert, "convert a package to the selected canonical container form")
+    converting.add_argument("package", type=Path, help="existing signed package file or directory, including a cache entry")
+    converting.add_argument("--output", type=Path, help="standalone destination (default: shared model cache entry)")
     converting.add_argument("--publisher-keys", type=Path, action="append", default=[],
                             help="trusted public publisher profiles; repeatable")
-    def shard_size(value):
-        from .config import parse_size
-        try:
-            parse_size(value, "shard size")
-        except FlareError as error:
-            raise argparse.ArgumentTypeError(str(error)) from error
-        return value
-
-    for publishing in (exporting, signing, converting):
-        publishing.add_argument("--shard-size", type=shard_size, metavar="SIZE",
-                                help="maximum payload file size including its header; at most 64G (default: 64G)")
+    converting.add_argument("--form", choices=("directory", "packed"), default="directory",
+                            help="payload container form: a directory of companions or one packed .safetensors file (default: directory)")
     return parser
 
 
@@ -168,6 +165,9 @@ def _preparation_arguments(running):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--native-dense-activations", action="store_true",
+                          help="use quantized activations instead of auto precision for dense projections:"
+                               " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"

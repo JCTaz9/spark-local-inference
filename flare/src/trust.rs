@@ -2,9 +2,10 @@
 //!
 //! Loading a package: read its unverified claim, resolve the signer's identity from the
 //! publisher's repository whenever it can be consulted, verify the signatures, disclose
-//! publisher, identity, source, and license, and obtain the acceptance string, which Helios
-//! uses as the key material for every executable resource. Remembered acceptance suppresses
-//! the disclosure and supplies the key; it never skips the repository check.
+//! publisher, identity, source, and license, and obtain the acceptance string. Helios
+//! requires it to match the signed publisher namespace exactly; it records trust and license
+//! acceptance but is not executable key material. Remembered acceptance suppresses the
+//! disclosure; it never skips the repository check.
 
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -58,13 +59,23 @@ pub(crate) fn publishers(
             })?,
         );
     }
+    unique_profiles(publishers)
+}
+
+fn unique_profiles(publishers: Vec<Publisher>) -> Result<Vec<Publisher>> {
+    // One key may be listed under several namespaces: a publisher promoting a package keeps the
+    // key and changes the namespace. Identity is the (key, namespace) pair, so a differing display
+    // name for the same pair is the only real conflict; namespaces never merge into one another.
     let mut unique = std::collections::HashMap::new();
     let mut result = Vec::new();
     for publisher in publishers {
         publisher.validate()?;
-        if let Some(previous) = unique.insert(publisher.fingerprint(), publisher.clone()) {
+        let identity = (publisher.fingerprint(), publisher.namespace.clone());
+        if let Some(previous) = unique.insert(identity, publisher.clone()) {
             if previous != publisher {
-                return Err("conflicting identities for the same publisher key".into());
+                return Err(
+                    "conflicting identities for the same publisher key and namespace".into(),
+                );
             }
         } else {
             result.push(publisher);
@@ -112,6 +123,13 @@ impl Entry {
         })
     }
 }
+/// Public profiles remembered in an explicit trust store. Entries without a
+/// stored key cannot verify signatures themselves and are omitted.
+pub(crate) fn trusted_profiles(store: Option<&Path>) -> Result<Vec<Publisher>> {
+    let store = load_store(&store_path(store)?)?;
+    Ok(store.trusted.iter().filter_map(Entry::profile).collect())
+}
+
 /// The verification key remembered for the claim's signer and namespace when the store holds
 /// one, so a package accepted earlier verifies without a profile or a network request.
 pub(crate) fn remembered_profile(
@@ -270,15 +288,39 @@ enum Identity {
 }
 
 /// Verify, disclose, and accept a package, returning it ready to load along with its publisher.
-pub fn load(
+/// Everything a package claim establishes before acceptance: the exact claim, the profiles that
+/// can verify its signatures, the resolved publisher identity (including revocation), and the
+/// remembered trust entry. Acquisition uses this to authenticate a package and bind its metadata
+/// without accepting terms or decoding executables; acceptance stays in `load`/`authorize`.
+pub(crate) struct ResolvedIdentity {
+    pub claim: PackageClaim,
+    pub profiles: Vec<Publisher>,
+    pub identity: Identity,
+    pub remembered: Option<Entry>,
+    /// Trust store this resolution read, where acceptance is recorded.
+    pub store_path: PathBuf,
+}
+
+pub(crate) fn resolve_identity(
     root: &Path,
-    args: &crate::cli::Run,
-    progress: &mut flare_helios::startup::StartupProgress,
-    origin: Option<&str>,
-) -> Result<(AuthorizedPackage, Publisher)> {
-    let phase = progress.phase("Verify package", None);
+    publisher_keys: &[PathBuf],
+    hub: &crate::cli::HubOptions,
+    trust_store: Option<&Path>,
+) -> Result<ResolvedIdentity> {
+    resolve_identity_with(root, publisher_keys, &[], hub, trust_store)
+}
+
+/// Resolve identity with profiles carried in an authenticated request. Profiles
+/// are public keys, never private material or controller-local paths.
+pub(crate) fn resolve_identity_with(
+    root: &Path,
+    publisher_keys: &[PathBuf],
+    supplied: &[Publisher],
+    hub: &crate::cli::HubOptions,
+    trust_store: Option<&Path>,
+) -> Result<ResolvedIdentity> {
     let claim = PackageClaim::read(root)?;
-    let path = store_path(args.trust_store.as_deref())?;
+    let path = store_path(trust_store)?;
     let store = load_store(&path)?;
     let remembered = store
         .trusted
@@ -286,10 +328,12 @@ pub fn load(
         .find(|e| e.fingerprint == claim.signer && e.namespace == claim.namespace)
         .cloned();
     let mut profiles = publishers(
-        &args.publisher_keys,
+        publisher_keys,
         claim.development,
         crate::environment::home_directory,
     )?;
+    profiles.extend(supplied.iter().cloned());
+    let mut profiles = unique_profiles(profiles)?;
     // The publisher's repository is consulted on every load that is not offline, so a key the
     // publisher removed from publisher.json stops loading everywhere, remembered or not. When it
     // cannot be consulted, a previously confirmed identity stands.
@@ -299,7 +343,7 @@ pub fn load(
     let identity = if claim.development {
         Identity::Development
     } else {
-        match identity::resolve(&claim, &args.hub)? {
+        match identity::resolve(&claim, hub)? {
             Resolution::Verified(profile) => {
                 profiles.push(profile);
                 Identity::Verified
@@ -314,30 +358,97 @@ pub fn load(
             )),
         }
     };
-    // The remembered key verifies signatures only when no fresher profile names the same key, so
-    // a publisher changing its display name does not conflict with what was remembered.
-    if !profiles.iter().any(|p| p.fingerprint() == claim.signer) {
+    // The remembered key verifies signatures only when no fresher profile names the same key and
+    // namespace, so a publisher changing its display name does not conflict with what was
+    // remembered, and a key promoted to another namespace still needs a profile for that
+    // namespace.
+    if !profiles
+        .iter()
+        .any(|p| p.fingerprint() == claim.signer && p.namespace == claim.namespace)
+    {
         if let Some(profile) = remembered.as_ref().and_then(Entry::profile) {
             profiles.push(profile);
         }
     }
+    Ok(ResolvedIdentity {
+        claim,
+        profiles,
+        identity,
+        remembered,
+        store_path: path,
+    })
+}
+
+pub fn load(
+    root: &Path,
+    args: &crate::cli::Run,
+    progress: &mut flare_helios::startup::StartupProgress,
+    origin: Option<&str>,
+) -> Result<(AuthorizedPackage, Publisher)> {
+    let phase = progress.phase("Verify package", None);
+    let ResolvedIdentity {
+        claim,
+        profiles,
+        identity,
+        remembered,
+        store_path: path,
+    } = resolve_identity(
+        root,
+        &args.publisher_keys,
+        &args.hub,
+        args.trust_store.as_deref(),
+    )?;
     // A peer of a multi-host package holds only its rank's bytes, so it verifies that rank alone.
     let rank = args.rank.filter(|&rank| rank != 0);
-    let package = VerifiedPackage::open(root, &profiles, rank).map_err(
-        |error| -> Box<dyn std::error::Error> {
-            if error.to_string().contains("unknown package publisher") {
-                if let Identity::Unverified(reason) = &identity {
-                    return format!(
-                        "cannot verify signing key {}: {reason}; publish the key in publisher.json \
-                     at the root of {} or supply its profile with --publisher-keys",
-                        claim.signer, claim.official_source
-                    )
-                    .into();
-                }
+    // Signed topology selects the deployment. A single requested size is authoritative; without
+    // one, a single-host run may infer it from the selected GPU count, while a multi-host peer
+    // cannot (its local device count is not the world size) and must name it when the package
+    // holds several deployments.
+    let requested = match args.hub.tensor_parallel.as_slice() {
+        [size] => Some(*size),
+        [] => {
+            if args.rank.is_none() && !args.gpus.is_empty() {
+                u32::try_from(args.gpus.len()).ok()
+            } else {
+                None
             }
-            error.into()
-        },
-    )?;
+        }
+        _ => None,
+    };
+    if args.hub.tensor_parallel.len() > 1 {
+        return Err(
+            "select one tensor-parallel size for a run; the package holds one deployment per size"
+                .into(),
+        );
+    }
+    let selected_rank = rank
+        .map(|rank| u32::try_from(rank).map_err(|_| "rank id exceeds the package rank domain"))
+        .transpose()?;
+    // Only payload packages describe several deployments in one file; a legacy package is already
+    // a single prepared size, so topology selection must not reroute it to the payload reader.
+    let payload_format = matches!(
+        flare_helios::runtime_package::NativeResources::package_format(root),
+        Ok(flare_helios::runtime_package::PackageFormat::Payload)
+    );
+    let package = match requested {
+        Some(size) if payload_format => {
+            VerifiedPackage::open_tensor_parallel(root, &profiles, size, selected_rank)
+        }
+        _ => VerifiedPackage::open(root, &profiles, rank),
+    }
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        if error.to_string().contains("unknown package publisher") {
+            if let Identity::Unverified(reason) = &identity {
+                return format!(
+                    "cannot verify signing key {}: {reason}; publish the key in publisher.json \
+                     at the root of {} or supply its profile with --publisher-keys",
+                    claim.signer, claim.official_source
+                )
+                .into();
+            }
+        }
+        error.into()
+    })?;
     phase.finish("signatures");
     if let Some(origin) = origin {
         let downloaded = format!("https://huggingface.co/{origin}");
@@ -365,7 +476,7 @@ fn authorize(
 ) -> Result<AuthorizedPackage> {
     let fingerprint = &claim.signer;
     let namespace = &claim.namespace;
-    // Publisher disclosure and exact key/namespace acceptance protect user safety
+    // Publisher disclosure and exact namespace acceptance protect user safety
     // before executing model package code.
     let explicit = match (&args.dangerously_approve_key, &args.dangerously_accept_publisher) {
         (Some(key), Some(owner)) if key == fingerprint && owner == namespace => Some(owner.clone()),
@@ -401,14 +512,8 @@ fn authorize(
             response
         }
     };
-    let phase = args
-        .verify_weights
-        .then(|| progress.phase("Verify stored data", None));
     let publisher = package.publisher().clone();
-    let authorized = package.authorize(&accepted, args.verify_weights)?;
-    if let Some(phase) = phase {
-        phase.finish("stored-data contents");
-    }
+    let authorized = package.authorize_with_progress(&accepted, args.verify_weights, Some(progress))?;
     let entry = Entry {
         fingerprint: fingerprint.clone(),
         namespace: accepted,
@@ -604,6 +709,28 @@ mod tests {
             publishers(&[], true, || Ok(home.path().to_owned())).unwrap(),
             vec![publisher]
         );
+    }
+
+    #[test]
+    fn one_key_may_hold_several_namespaces_but_not_conflicting_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("publisher.json");
+        let mut second = development_publisher();
+        second.name = "Example".into();
+        second.namespace = "example".into();
+        second.development = false;
+        let mut promoted = second.clone();
+        promoted.namespace = "example-next".into();
+        fs::write(&path, serde_json::to_vec(&[&second, &promoted]).unwrap()).unwrap();
+        assert_eq!(
+            publishers(std::slice::from_ref(&path), false, || unreachable!()).unwrap(),
+            vec![second.clone(), promoted]
+        );
+        // The same key and namespace with different attributes is one ambiguity, not two profiles.
+        let mut renamed = second.clone();
+        renamed.name = "Someone Else".into();
+        fs::write(&path, serde_json::to_vec(&[&second, &renamed]).unwrap()).unwrap();
+        assert!(publishers(std::slice::from_ref(&path), false, || unreachable!()).is_err());
     }
 
     #[test]

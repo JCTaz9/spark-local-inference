@@ -135,12 +135,13 @@ def mxfp4_activation(x):
     return (torch.tensor(_FP4_VALUES)[code] * scale).reshape(x.shape)
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("rows", [1, 17, 128])
 @pytest.mark.parametrize("fmt", ["nvfp4", "nvfp4_a4", "mxfp4"])
-def test_ordinary_fp4_linear_graph(tmp_path, rows, fmt):
-    from b12x.preparation import PreparationSession
+def test_ordinary_fp4_linear_graph(tmp_path, rows, fmt, native):
     from ignition.components.linear import QuantizedProjection
     from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
 
     gen = torch.Generator().manual_seed(871)
     tensors, weight = packed(256, 512, fmt, gen)
@@ -155,14 +156,26 @@ def test_ordinary_fp4_linear_graph(tmp_path, rows, fmt):
         assert loader._session.torch_copy_bytes == 0
     cpu = torch.randn(rows, 288, generator=gen).to(torch.bfloat16)
     x, out = cpu.cuda(), torch.empty((rows, 128), device="cuda", dtype=torch.bfloat16)
-    with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+    with RecordedPreparationSession(device=x.device, checkpoint="fp4-linear", workload_schema="fp4-linear",
+            numerical_policy="default", autotune_effort="off", native_dense_activations=native) as session:
+        if native and fmt == "nvfp4":
+            with pytest.raises(ValueError, match="activation global scale"):
+                QuantizedProjection(x, w, out, session=session, name="linear", activation_mode="auto")
+            return
         with pytest.raises(ValueError, match="output must not overlap bias"):
             QuantizedProjection(x, w, out, bias=out[0], session=session, name="aliased",
                                 workspace=ScratchArena(x.device))
+        arena = ScratchArena(x.device)
+        session.register_scratch(arena)
         projection = QuantizedProjection(x, w, out, session=session, name="linear", activation_mode="auto",
-                                         workspace=ScratchArena(x.device))
+                                         workspace=arena)
+        session.tune(show_progress=False)
+        if native:
+            assert projection.activation_mode == "quantized"
+            assert projection.plan.selection.config.mode == "quantized"
+        session.freeze()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with session.capture(), torch.cuda.graph(graph):
             projection(x)
         for factor in (1, -.5):
             x.copy_(cpu * factor)
@@ -427,4 +440,45 @@ def test_ggml_projection_fusion_and_sharding_graph(tmp_path, codec, rows):
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
             torch.testing.assert_close(out.float().cpu(), expected, rtol=.015, atol=.015)
+        graph.reset()
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+def test_native_mxfp8_dense_graph(rows):
+    from ignition.components.linear import QuantizedProjection
+    from ignition.components.weights import quantize_bf16_linear_as_mxfp8
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.reference.qwen38_quant import decode_mxfp8, quantize_mxfp8_activation
+
+    gen = torch.Generator().manual_seed(195)
+    weight = quantize_bf16_linear_as_mxfp8(
+        (torch.randn(256, 512, generator=gen) * .03125).bfloat16().cuda())
+    decoded = decode_mxfp8(weight.weight.values.cpu(), weight.weight.scale_rows[0].view(torch.uint8).cpu())
+    cpu = torch.randn(rows, 512, generator=gen).bfloat16()
+    source = cpu.cuda()
+    output = torch.empty(rows, 256, device="cuda", dtype=torch.bfloat16)
+    with RecordedPreparationSession(device=source.device, checkpoint="native-mxfp8",
+            workload_schema="dense", numerical_policy="default", autotune_effort="off",
+            native_dense_activations=True) as session:
+        arena = ScratchArena(source.device)
+        session.register_scratch(arena)
+        projection = QuantizedProjection(source, weight, output, session=session, name="dense",
+                                         activation_mode="auto", workspace=arena)
+        session.tune(show_progress=False)
+        assert projection.activation_mode == "quantized"
+        assert projection.plan.selection.config.mode == "quantized"
+        assert session.tuning_report["native_dense_activations"] is True
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            projection(source)
+        for factor in (1, -.5):
+            source.copy_(cpu * factor)
+            expected = quantize_mxfp8_activation((cpu * factor).float()) @ decoded.T
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output.float().cpu(), expected, rtol=.025, atol=.015)
         graph.reset()

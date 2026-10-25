@@ -114,7 +114,7 @@ fn assert_blocking(channel: &Channel) {
 }
 
 #[test]
-fn handoff_receives_ready_commit_prepare_and_drain_on_both_transports() {
+fn receive_preserves_control_tags_on_both_transports() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
@@ -124,7 +124,7 @@ fn handoff_receives_ready_commit_prepare_and_drain_on_both_transports() {
         let mut receiver = Channel::new(receiver).unwrap();
         for tag in [READY, COMMIT, PREPARE, DRAIN] {
             sender.send(tag, &[tag]).unwrap();
-            assert_eq!(receiver.handoff(tag, HANDOFF_SPIN).unwrap(), vec![tag]);
+            assert_eq!(receiver.receive(tag).unwrap(), vec![tag]);
             #[cfg(unix)]
             assert_blocking(&receiver);
         }
@@ -132,13 +132,13 @@ fn handoff_receives_ready_commit_prepare_and_drain_on_both_transports() {
 }
 
 #[test]
-fn spin_timeout_preserves_fragment_for_blocking_handoff_and_idle_wait() {
+fn nonblocking_poll_preserves_fragment_for_receive_and_idle_wait() {
     let (mut sender, receiver) = crate::execution::rank_stream::test_pair().unwrap();
     let mut receiver = Channel::new(receiver).unwrap();
     sender.write_all(&[PREPARE, 3, 0]).unwrap();
-    let started = Instant::now();
-    assert!(receiver.spin(HANDOFF_SPIN).unwrap().is_none());
-    assert!(started.elapsed() >= HANDOFF_SPIN);
+    receiver.nonblocking(true).unwrap();
+    assert!(receiver.poll().unwrap().is_none());
+    receiver.nonblocking(false).unwrap();
     #[cfg(unix)]
     assert_blocking(&receiver);
     let writer = std::thread::spawn(move || {
@@ -147,7 +147,7 @@ fn spin_timeout_preserves_fragment_for_blocking_handoff_and_idle_wait() {
         let mut sender = Channel::new(sender).unwrap();
         sender.send(DRAIN, &[]).unwrap();
     });
-    assert_eq!(receiver.handoff(PREPARE, Duration::ZERO).unwrap(), vec![10, 11, 12]);
+    assert_eq!(receiver.receive(PREPARE).unwrap(), vec![10, 11, 12]);
     assert_eq!(receiver.wait(true).unwrap(), (DRAIN, vec![]));
     #[cfg(unix)]
     assert_blocking(&receiver);
@@ -155,13 +155,13 @@ fn spin_timeout_preserves_fragment_for_blocking_handoff_and_idle_wait() {
 }
 
 #[test]
-fn handoff_reports_wrong_tags_peer_errors_and_disconnects() {
+fn receive_reports_wrong_tags_peer_errors_and_disconnects() {
     for tag in [COMMIT, FAILED] {
         let (sender, receiver) = crate::execution::rank_stream::test_pair().unwrap();
         let mut sender = Channel::new(sender).unwrap();
         let mut receiver = Channel::new(receiver).unwrap();
         sender.send(tag, b"rank failed").unwrap();
-        let error = receiver.handoff(READY, HANDOFF_SPIN).unwrap_err().to_string();
+        let error = receiver.receive(READY).unwrap_err().to_string();
         assert!(error.contains(if tag == FAILED { "rank failed" } else { "received 4" }), "{error}");
         #[cfg(unix)]
         assert_blocking(&receiver);
@@ -169,7 +169,7 @@ fn handoff_reports_wrong_tags_peer_errors_and_disconnects() {
     let (sender, receiver) = crate::execution::rank_stream::test_pair().unwrap();
     let mut receiver = Channel::new(receiver).unwrap();
     drop(sender);
-    assert!(receiver.handoff(READY, HANDOFF_SPIN).unwrap_err().to_string().contains("disconnected"));
+    assert!(receiver.receive(READY).unwrap_err().to_string().contains("disconnected"));
     #[cfg(unix)]
     assert_blocking(&receiver);
 }
@@ -211,7 +211,7 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
     manifest.graphs[0].input_bindings[2].nbytes = buffer.nbytes;
     manifest.input_frame_bytes = 16 + buffer.nbytes;
     manifest.validate().unwrap();
-    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 4);
+    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 5);
     for (sender, receiver) in [crate::execution::rank_stream::test_pair().unwrap(),
                                (client.into(), server.into())] {
         let mut sender = Channel::new(sender).unwrap();
@@ -327,7 +327,7 @@ fn completed(status: i64) -> FrameCompletion {
         status,
         error_code: 0,
         reserved: 0,
-        vector: None,
+        vector: Some(super::super::TokenVector::default()),
     };
     FrameCompletion {
         logprobs: None,
@@ -378,7 +378,7 @@ fn completion_wire_preserves_the_execution_abi() {
     assert_eq!(timing(&mut reader).unwrap(), root.timing);
     assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
     assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, 8).unwrap();
+    let records = super::super::transport::decode_records(reader.0, Fence(3), 4, super::super::VECTOR_RECORD_FIELDS).unwrap();
     for (expected, actual) in root.records.iter().zip(records.iter()) {
         assert_eq!(expected.fields(), actual.fields());
     }
@@ -466,7 +466,7 @@ fn proposal_confidence_survives_rank_transport_without_numeric_consensus() {
     timing(&mut reader).unwrap();
     assert_eq!(proposal_confidence(&mut reader).unwrap(), root.proposal_confidence);
     assert_eq!(speculative_survival(&mut reader).unwrap(), root.speculative_survival);
-    assert_eq!(reader.0.len(), 4 * 8 * 8);
+    assert_eq!(reader.0.len(), 4 * super::super::VECTOR_RECORD_FIELDS * 8);
 }
 
 #[test]
@@ -509,10 +509,10 @@ fn rank_zero_confidence_is_authoritative_without_relaxing_request_agreement() {
 }
 
 #[test]
-fn packed_combined_process_schema_rejects_a_different_proposal_depth() {
+fn speculative_process_schema_rejects_a_different_proposal_depth() {
     let mut root = crate::execution::tests::manifest();
     let graph = &mut root.graphs[0];
-    graph.kind = crate::execution::GraphKind::PackedSpeculative;
+    graph.kind = crate::execution::GraphKind::Speculative;
     graph.token_capacity = 6;
     graph.packed_token_capacity = 8;
     graph.draft_tokens = 1;
@@ -564,4 +564,55 @@ fn logprob_uploads_budget_count_and_prefix_wire_bytes_separately() {
             16 + 4 * count
         );
     }
+}
+
+#[test]
+fn two_frame_window_retains_preparing_and_unconsumed_completions() {
+    let mut manifest = crate::execution::tests::manifest();
+    manifest.graphs[0].kind = crate::execution::GraphKind::Decode;
+    let frame = |sequence| Pending {
+        fence: Fence(sequence), graph: 0, grammar: false, uploads: Vec::new(),
+        dispatched: Instant::now(), committed: false, queued: sequence > 1,
+        ready: vec![false; 3], completions: (0..4).map(|_| None).collect(),
+    };
+    let mut pending = VecDeque::new();
+    assert!(window_available(&pending, false, &manifest));
+    pending.push_back(frame(1));
+    assert!(!window_available(&pending, false, &manifest));
+    for rank in 0..3 { ready_frame(&mut pending, rank, Fence(1), 0).unwrap(); }
+    assert!(pending[0].ready.iter().all(|ready| *ready));
+    pending[0].committed = true;
+    assert!(window_available(&pending, false, &manifest));
+    assert!(!window_available(&pending, true, &manifest));
+    pending.push_back(frame(2));
+    for rank in 0..3 { ready_frame(&mut pending, rank, Fence(2), 0).unwrap(); }
+    pending[1].committed = true;
+    assert!(!window_available(&pending, false, &manifest));
+    for rank in 0..3 {
+        assert!(completion_frame(&mut pending, rank, Fence(2), 0).is_err());
+        let mut value = completed(1);
+        value.graph_index = 0;
+        value.fence = Fence(1);
+        for record in value.records.iter_mut() { record.submission_sequence = 1; }
+        completion_frame(&mut pending, rank, Fence(1), 0).unwrap().completions[rank + 1] = Some(value);
+    }
+    pending[0].completions[0] = Some(completed(1));
+    assert!(!window_available(&pending, false, &manifest));
+    pending.pop_front();
+    assert!(window_available(&pending, false, &manifest));
+    assert!(ready_frame(&mut pending, 0, Fence(2), 0).is_err());
+    assert!(ready_frame(&mut pending, 0, Fence(3), 0).is_err());
+    assert!(completion_frame(&mut pending, 0, Fence(1), 0).is_err());
+    assert!(completion_frame(&mut pending, 0, Fence(2), 1).is_err());
+    completion_frame(&mut pending, 0, Fence(2), 0).unwrap();
+}
+
+#[test]
+fn rank_commit_identity_rejects_truncation_and_trailing_bytes() {
+    let bytes = identity(Fence(7), 3);
+    assert_eq!(read_identity(&bytes).unwrap(), (Fence(7), 3));
+    assert!(read_identity(&bytes[..bytes.len() - 1]).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(read_identity(&trailing).is_err());
 }

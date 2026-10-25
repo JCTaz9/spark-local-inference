@@ -120,19 +120,22 @@ def test_selected_attention_releases_private_tuning_inputs(monkeypatch):
 
 
 @pytest.mark.parametrize("metadata_layout", ["int32", "int64", "strided"])
-def test_primary_paged_verification_declares_query_width(monkeypatch, metadata_layout):
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("selected", [False, True])
+def test_primary_paged_verification_declares_query_width(monkeypatch, metadata_layout, ragged, selected):
     from b12x.attention import paged_decode
 
     monkeypatch.setattr(paged_decode, "supports", lambda **kwargs: False)
     device = torch.device("cuda", 0)
     batch, width, heads, dimension, length = 2, 7, 16, 128, 137
-    query = torch.randn((batch * width, heads, dimension), device=device, dtype=torch.bfloat16) * .1
+    counts = (2, 3) if ragged else (width, width)
+    query = torch.randn((sum(counts), heads, dimension), device=device, dtype=torch.bfloat16) * .1
     key = torch.randn((4, 128, 1, dimension), device=device, dtype=torch.bfloat16) * .1
     value = torch.randn_like(key)
     output = torch.empty_like(query)
     table = torch.arange(4, device=device, dtype=torch.int32).reshape(batch, 2)
     lengths = torch.full((batch,), length, device=device, dtype=torch.int32)
-    cu = torch.arange(batch + 1, device=device, dtype=torch.int32) * width
+    cu = torch.tensor([0, counts[0], sum(counts)], device=device, dtype=torch.int32)
     if metadata_layout == "int64":
         table, lengths, cu = (tensor.to(torch.int64) for tensor in (table, lengths, cu))
     elif metadata_layout == "strided":
@@ -140,14 +143,41 @@ def test_primary_paged_verification_declares_query_width(monkeypatch, metadata_l
         storage[:, ::2].copy_(table)
         table = storage[:, ::2]
     initial_table = table.clone()
+    blocks = None
+    if selected:
+        blocks = torch.full((1, query.shape[0], 16), -1, device=device, dtype=torch.int32)
+        blocks[:, :, :2] = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    import ignition.components.paged_attention as module
+    original = module.benchmark_resource
+
+    def checked_resource(session, key, factory):
+        def allocate():
+            arguments, seed = factory()
+            ends = arguments["cu_seqlens_q"].cpu()
+            assert ends[0] == 0 and ends[-1] == query.shape[0]
+            assert ((ends[1:] - ends[:-1]) <= width).all()
+            return arguments, seed
+        return original(session, key, allocate)
+
+    monkeypatch.setattr(module, "benchmark_resource", checked_resource)
     with RecordedPreparationSession(device=device, checkpoint="primary-paged-verify",
             workload_schema="primary-paged-verify", numerical_policy="default") as session:
         arena = ScratchArena(device)
         session.register_scratch(arena)
         attention = PreparedPagedAttention(query, key, value, table, lengths, cu, output,
-            mode="verify", width=width, session=session, workspace=arena, name="attention")
+            mode="verify", width=width, selected_blocks=blocks, session=session, workspace=arena, name="attention")
+        assert attention.arguments["q"].shape[0] == sum(counts)
+        assert attention.arguments["output"].shape[0] == sum(counts)
+        if selected:
+            assert attention.arguments["q2k_indices"].shape[1] == sum(counts)
         assert not attention.decode
         session.tune()
+        if selected:
+            from b12x.attention import paged
+
+            invalid = dict(attention.arguments, q2k_indices=blocks[:, :-1].contiguous())
+            with pytest.raises(ValueError, match="smaller than the query tensor"):
+                paged.bind(attention.plan, scratch=attention.scratch, **invalid, window_left=-1)
         compiled = compile_forward(attention)
         compiled()
         graph = torch.cuda.CUDAGraph()
@@ -156,6 +186,9 @@ def test_primary_paged_verification_declares_query_width(monkeypatch, metadata_l
         session.freeze()
         for visible, reverse_pages in ((length, False), (71, True), (length, False)):
             lengths.fill_(visible)
+            if ragged:
+                counts = (4, 1) if reverse_pages else (2, 3)
+                cu.copy_(torch.tensor([0, counts[0], sum(counts)], device=device, dtype=cu.dtype))
             table.copy_(initial_table.flip(1) if reverse_pages else initial_table)
             query.normal_(std=.1)
             output.fill_(float("nan"))
@@ -163,15 +196,18 @@ def test_primary_paged_verification_declares_query_width(monkeypatch, metadata_l
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
-            for row in range(batch):
-                for local in range(width):
-                    end = visible - width + local + 1
+            begin = 0
+            for row, count in enumerate(counts):
+                for local in range(count):
+                    end = visible - count + local + 1
                     k = key[table[row].long()].reshape(256, 1, dimension)[:end, 0].float()
                     v = value[table[row].long()].reshape(256, 1, dimension)[:end, 0].float()
-                    scores = query[row * width + local].float() @ k.T / dimension ** .5
+                    scores = query[begin + local].float() @ k.T / dimension ** .5
                     expected = scores.softmax(-1) @ v
-                    torch.testing.assert_close(output[row * width + local].float(), expected,
-                                               atol=.002, rtol=.02)
+                    torch.testing.assert_close(output[begin + local].float(), expected,
+                                               atol=.002, rtol=.02,
+                                               msg=lambda detail: f"selected={selected} ragged={ragged} visible={visible} reverse={reverse_pages} row={row} local={local}: {detail}")
+                begin += count
         graph.reset()
 
 

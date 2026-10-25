@@ -77,7 +77,7 @@ impl FromStr for MemoryLimit {
         // Bare numbers are fractions. Byte sizes require a unit to avoid ambiguity at 1.
         if number.chars().any(|c| c.is_ascii_alphabetic()) {
             let bytes = crate::offload::parse_size(number).map_err(|_| invalid())?;
-            if bytes == 0 {
+            if bytes == 0 && !reserve {
                 return Err(invalid());
             }
             Ok(if reserve {
@@ -129,6 +129,7 @@ mod tests {
         for (text, expected) in [
             ("30g", MemoryLimit::Bytes(30 << 30)),
             ("-30g", MemoryLimit::Reserve(30 << 30)),
+            ("-0KiB", MemoryLimit::Reserve(0)),
             ("1.5GiB", MemoryLimit::Bytes(3 << 29)),
             ("0.8", MemoryLimit::Fraction(0.8)),
             ("1", MemoryLimit::Fraction(1.0)),
@@ -142,7 +143,6 @@ mod tests {
             "",
             "0",
             "0G",
-            "-0G",
             "-0.8",
             "1.1",
             "30",

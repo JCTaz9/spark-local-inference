@@ -254,6 +254,26 @@ not cohort membership. Its best cohort therefore contains the largest additive
 lane values. Rust uses a bounded array to select these lanes; it does not
 enumerate joint speculative outcomes or every subset.
 
+## Terminal retirement
+
+Native terminal retirement uses an intrinsic value `v` and linear age-cost
+coefficient `c`, independently of streaming-delivery fairness and decode age.
+Its clock `A` starts when termination is observed, including preemption of a
+resident request. The snapshot family supplies the batch-feasible reference
+interval `sigma`. A terminal row contributes `v + c*sigma*(A+T)` to a snapshot
+of duration `T`, and `c` joins the common waiting-cost sum for every candidate.
+This is the same age-continuation arithmetic as output delivery, with the
+terminal event's own value and clock. It supplies no token or streaming-delivery
+credit. There is no additional terminal rate-history coordinate.
+
+If the row retires at time `t` within a lookahead horizon `H`, its contribution
+is `v + c*sigma*(A+H) + c*(H-t)*(A+(H+t)/2)`. The last term removes waiting after
+retirement. All contributions use the decision's common positive scale.
+The two-stage cohort solver therefore compares terminal retirement and enabled
+inference without separate priority rules. These terminal terms remain active
+under throughput policy; the stationary backlogged-stream analysis above does
+not establish a latency bound for finite terminal events.
+
 ## Native completion accounting
 
 Each committed submission records the resident runnable request handles,

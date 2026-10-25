@@ -74,7 +74,6 @@ def test_malformed_logprob_declarations_are_rejected(change):
         assert 'completion_logprobs' in message
         assert 'expected shape' in message and 'dtype torch.int32' in message
         assert 'got shape' in message and 'dtype torch.' in message
-    # Optional named buffers preserve the older export format.
     validate_completion_buffers({'completion_records': outputs.records}, 4)
 
 
@@ -87,4 +86,5 @@ def test_optional_survival_requires_two_float32_frames(shape, dtype):
                'completion_speculative_survival': torch.empty(shape, dtype=dtype, device='meta')}
     with pytest.raises(ValueError, match='completion_speculative_survival'):
         validate_completion_buffers(buffers, 4)
-    assert 'completion_speculative_survival' not in CompletionOutputs.allocate((2, 4, 8), device='meta').buffers()
+    with pytest.raises(ValueError, match='24-field'):
+        CompletionOutputs.allocate((2, 4, 8), device='meta')

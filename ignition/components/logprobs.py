@@ -44,11 +44,8 @@ def _position(Records, Frame, Requested, Slots, Epochs, Live, row, col,
     record = (tl.load(Frame) * SLOTS + slot) * FIELDS
     valid &= tl.load(Requested + slot, valid, other=0) != 0
     valid &= tl.load(Records + record, valid, other=0) == tl.load(Epochs + row)
-    if FIELDS == VECTOR_FIELDS:
-        valid &= col < tl.load(Records + record + COUNT_FIELD, valid, other=0)
-        token = tl.load(Records + record + TOKENS_FIELD + col, valid, other=-1)
-    else:
-        token = tl.load(Records + record + CHOSEN_FIELD, valid, other=-1)
+    valid &= col < tl.load(Records + record + COUNT_FIELD, valid, other=0)
+    token = tl.load(Records + record + TOKENS_FIELD + col, valid, other=-1)
     return slot, token, valid & (token >= 0)
 
 

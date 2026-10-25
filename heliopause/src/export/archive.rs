@@ -276,28 +276,6 @@ impl PackageSources {
             _directory: directory_handle,
         })
     }
-    pub(crate) fn from_layout(directory: &Path, layout: Layout) -> Result<Self> {
-        layout.validate()?;
-        let directory_handle = open_directory(directory)?;
-        let stable = pinned_directory(&directory_handle, directory);
-        // The directory handle is retained independently of the unpublished primary.
-        let file = Arc::new(directory_handle.try_clone()?);
-        let container = Container {
-            header_json: serde_json::Value::Null,
-            file,
-            base: 0,
-            payload_length: 0,
-            envelope: Vec::new(),
-            layout: Some(layout),
-            format: "flare-snapshot".to_owned(),
-        };
-        Ok(Self {
-            container,
-            directory: stable,
-            physical: BTreeMap::new(),
-            _directory: directory_handle,
-        })
-    }
     fn physical(&mut self, name: &str) -> Result<Source> {
         if let Some(source) = self.physical.get(name) {
             return Ok(source.clone());
@@ -446,10 +424,6 @@ pub(crate) fn temporary(directory: &Path, prefix: &str) -> Result<(File, PathBuf
     }
     Err("cannot create unique export temporary file".into())
 }
-pub(crate) fn install_file(temporary: &Path, destination: &Path) -> Result<()> {
-    std::fs::hard_link(temporary, destination)?;
-    Ok(())
-}
 pub(crate) fn install_blob(temporary: &Path, destination: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -517,53 +491,6 @@ pub(crate) fn remove_temporary(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-pub(crate) fn install_snapshot(destination: &Path, envelope: &[u8], layout: &Layout) -> Result<()> {
-    layout.validate()?;
-    let encoded = serde_json::to_vec(layout)?;
-    if envelope.is_empty()
-        || envelope.len() as u64 > MAX_INDEX
-        || encoded.is_empty()
-        || encoded.len() as u64 > MAX_INDEX
-    {
-        return Err("snapshot metadata exceeds its limit".into());
-    }
-    let raw = format!(
-        "{{\"__metadata__\":{{\"format\":\"flare-snapshot\"}},\"flare.payload\":{{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]}},\"flare.metadata\":{{\"dtype\":\"U8\",\"shape\":[{}],\"data_offsets\":[0,{}]}},\"flare.layout\":{{\"dtype\":\"U8\",\"shape\":[{}],\"data_offsets\":[{},{}]}}}}",
-        envelope.len(),
-        envelope.len(),
-        encoded.len(),
-        envelope.len(),
-        envelope.len() + encoded.len()
-    );
-    let header = encode_header(raw.into_bytes())?;
-    let directory = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(directory)?;
-    sync_directory(directory)?;
-    let (file, path) = temporary(directory, "snapshot")?;
-    let mut installed = false;
-    let result = (|| {
-        io::write_all_at(&file, &header, 0)?;
-        io::write_all_at(&file, envelope, header.len() as u64)?;
-        io::write_all_at(&file, &encoded, (header.len() + envelope.len()) as u64)?;
-        file.sync_all()?;
-        install_file(&path, destination)?;
-        installed = true;
-        sync_directory(directory)
-    })();
-    let removed = remove_temporary(&path);
-    let result = result.and(removed);
-    if result.is_err() && installed {
-        if let Ok(linked) = io::open_read(destination) {
-            if Identity::of(&file)?.same_file(&Identity::of(&linked)?) {
-                std::fs::remove_file(destination)?;
-            }
-        }
-    }
-    result
 }
 fn open_directory(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
@@ -700,8 +627,18 @@ mod tests {
             )]),
         };
         let path = directory.join("model.safetensors");
-        install_snapshot(&path, b"signed envelope", &layout).unwrap();
-        assert!(install_snapshot(&path, b"replacement", &layout).is_err());
+        let envelope = b"signed envelope";
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        let header = serde_json::json!({
+            "__metadata__": {"format": "flare-snapshot"},
+            "flare.payload": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+            "flare.metadata": {"dtype": "U8", "shape": [envelope.len()], "data_offsets": [0, envelope.len()]},
+            "flare.layout": {"dtype": "U8", "shape": [encoded.len()], "data_offsets": [envelope.len(), envelope.len() + encoded.len()]},
+        });
+        let mut bytes = encode_header(serde_json::to_vec(&header).unwrap()).unwrap();
+        bytes.extend_from_slice(envelope);
+        bytes.extend_from_slice(&encoded);
+        std::fs::write(&path, bytes).unwrap();
         let mut sources = PackageSources::open(&path).unwrap();
         let mut output = [0xff; 6];
         sources.read_at("", 0, &mut output).unwrap();

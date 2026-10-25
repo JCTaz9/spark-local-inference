@@ -124,10 +124,50 @@ def test_speculation_declaration_validates_graph_budget_type_and_range(budget):
         Speculation(5, packed_verification=True, graph_budget=budget)
 
 
-@pytest.mark.parametrize("options", [
-    {"packed_verification": False}, {"adaptive": False}, {"draft_tokens": 0},
-])
-def test_speculation_declaration_requires_packed_adaptive_learned_rounds(options):
-    values = {"draft_tokens": 5, "packed_verification": True, "graph_budget": 64, **options}
-    with pytest.raises(ValueError, match="requires packed adaptive learned speculation"):
-        Speculation(**values)
+def test_graph_budget_preserves_cpu_fixed_width_mode():
+    declaration = Speculation(5, adaptive=False, packed_verification=True, graph_budget=64)
+    assert declaration.fixed_width == 6 and declaration.draft_prefix_selection == "cpu"
+    with pytest.raises(ValueError, match="positive learned draft depth"):
+        Speculation(0, packed_verification=True, graph_budget=64)
+    with pytest.raises(ValueError, match="GPU draft prefix selection"):
+        Speculation(5, adaptive=False, packed_verification=True, draft_prefix_selection="gpu", graph_budget=64)
+
+
+@pytest.mark.parametrize("alias", ["deepseek-v4-flash", "mimo-v2.6-pro-mopd", "kimi-k3-mxfp4-csf"])
+def test_cpu_packed_recipe_accepts_fixed_width_and_explicit_graph_budget(alias):
+    value = selected("--no-mtp-adaptive-verification", "--speculative-graph-budget", "32", alias=alias)
+    assert value.packed_verification and value.draft_prefix_selection == "cpu"
+    assert not value.adaptive and value.graph_budget == 32
+
+
+@pytest.mark.parametrize("budget", [12, 32, 48])
+def test_rebuild_metadata_preserves_the_selected_physical_graph_catalog(monkeypatch, budget):
+    from types import SimpleNamespace
+    from google.protobuf.json_format import ParseDict
+    from ignition.components.capacity import packed_speculative_shapes
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from tests.cli.test_planning import derive, gpu
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    plan = derive(gpus=(gpu(0, 95), gpu(1, 95)), concurrency=32,
+                  speculation=selected("--speculative-graph-budget", str(budget)))
+    metadata = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+    decoded = proto.RebuildManifest.FromString(ParseDict(metadata, proto.RebuildManifest()).SerializeToString())
+    assert decoded.speculation.HasField("graph_budget")
+    assert decoded.speculation.graph_budget == budget
+    arguments = (plan.concurrency, plan.speculation.draft_tokens + 1, plan.speculative_token_capacity)
+    catalog = packed_speculative_shapes(*arguments, decoded.speculation.graph_budget)
+    assert catalog == packed_speculative_shapes(*arguments, budget)
+    assert catalog != packed_speculative_shapes(*arguments, 64)
+
+
+def test_packed_rebuild_metadata_rejects_an_unresolved_graph_budget(monkeypatch):
+    from types import SimpleNamespace
+    from ignition.preparation.rebuild_manifest import from_plan
+    from tests.cli.test_planning import derive
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    plan = derive(speculation=selected())
+    plan = replace(plan, speculation=replace(plan.speculation, graph_budget=None))
+    with pytest.raises(ValueError, match="explicit graph budget"):
+        from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)

@@ -42,6 +42,28 @@ pub(super) enum Memory {
     Peer,
 }
 
+/// One contiguous stored run of a payload-bound allocation: which payload resource supplies the
+/// bytes and where they start inside it. The destination offset comes from the parallel entry in
+/// `Allocation::data_spans`, so a single allocation may be assembled from several payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Source {
+    pub resource: String,
+    pub offset: u64,
+    pub nbytes: u64,
+}
+
+/// Where one authenticated payload lives in an opened container, as resolved by the package
+/// reader. `token` identifies an open file handle the archive holds; `offset` is the byte offset of
+/// the payload inside that container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Placement {
+    pub token: String,
+    pub offset: u64,
+    pub nbytes: u64,
+}
+
+pub(super) type Placements = std::collections::BTreeMap<Vec<u8>, Placement>;
+
 #[derive(Debug)]
 pub(super) struct Allocation {
     pub name: String,
@@ -49,6 +71,9 @@ pub(super) struct Allocation {
     pub alignment: usize,
     pub file: Option<String>,
     pub data_spans: Vec<[usize; 2]>,
+    /// Parallel to `data_spans` when nonempty. Empty keeps the legacy rule: the allocation's whole
+    /// payload is its resource, consumed sequentially in span order.
+    pub sources: Vec<Source>,
     pub relocations: Vec<Relocation>,
     pub address: Option<u64>,
     pub memory: Memory,
@@ -68,6 +93,10 @@ impl Allocation {
 
     pub fn stored_bytes(&self) -> usize {
         self.spans().map(|span| span[1]).sum()
+    }
+    /// True when every span names its own payload resource.
+    pub fn is_payload_bound(&self) -> bool {
+        !self.sources.is_empty()
     }
 }
 
@@ -246,9 +275,9 @@ impl Package {
         if self
             .execution
             .as_ref()
-            .is_some_and(|execution| !matches!(execution.abi_version, 2 | 3))
+            .is_some_and(|execution| execution.abi_version != crate::execution::ABI_VERSION)
         {
-            return Err(invalid("unsupported execution contract version"));
+            return Err(invalid("unsupported execution contract version; re-export the model package"));
         }
         if self.context.limits.iter().any(|limit| limit[0] > 6)
             || !(0..=3).contains(&self.context.cache)
@@ -302,11 +331,34 @@ impl Package {
                 }
                 end = offset + size;
             }
-            if a.file.is_some() != (a.stored_bytes() > 0) {
+            if a.is_payload_bound() {
+                if a.file.is_some() || a.sources.len() != a.data_spans.len() {
+                    return Err(invalid(
+                        "payload-bound allocation must name one source per data span",
+                    ));
+                }
+                for (source, span) in a.sources.iter().zip(&a.data_spans) {
+                    if source.nbytes != span[1] as u64
+                        || source.resource.is_empty()
+                        || source
+                            .offset
+                            .checked_add(source.nbytes)
+                            .is_none_or(|end| end > usize::MAX as u64)
+                    {
+                        return Err(invalid("allocation source does not match its data span"));
+                    }
+                }
+                if a.stored_bytes() == 0 {
+                    return Err(invalid("payload-bound allocation carries no stored bytes"));
+                }
+            } else if a.file.is_some() != (a.stored_bytes() > 0) {
                 return Err(invalid("allocation payload file must match its data spans"));
             }
             if matches!(a.memory, Memory::Peer)
-                && (a.address.is_none() || a.file.is_some() || !a.relocations.is_empty())
+                && (a.address.is_none()
+                    || a.file.is_some()
+                    || a.is_payload_bound()
+                    || !a.relocations.is_empty())
             {
                 return Err(invalid(
                     "peer allocations require a recorded address and carry no payload",
@@ -350,14 +402,53 @@ impl Package {
                     "mapped host allocation requires a recorded address",
                 ));
             }
-            if a.file.is_none()
-                && a.relocations
-                    .iter()
-                    .any(|r| matches!(r.kind, RelocationKind::TensorMap))
-            {
-                return Err(invalid(
-                    "tensor-map storage requires an initialized descriptor",
-                ));
+            // A tensor-map descriptor embeds a global address, so its 128 bytes must be stored
+            // bytes rather than zero fill. The carrier is irrelevant: a legacy allocation file and
+            // a payload-bound allocation both initialize through their data spans.
+            let has_descriptor = a
+                .relocations
+                .iter()
+                .any(|relocation| matches!(relocation.kind, RelocationKind::TensorMap));
+            if has_descriptor {
+                if a.file.is_none() && !a.is_payload_bound() {
+                    return Err(invalid(
+                        "tensor-map storage requires an initialized descriptor",
+                    ));
+                }
+                if a.is_payload_bound() {
+                    let mut spans: Vec<(usize, usize)> = a
+                        .spans()
+                        .map(|[offset, nbytes]| (offset, offset + nbytes))
+                        .collect();
+                    spans.sort_unstable();
+                    let mut merged: Vec<(usize, usize)> = Vec::new();
+                    for (start, end) in spans {
+                        match merged.last_mut() {
+                            Some(previous) if start <= previous.1 => {
+                                previous.1 = previous.1.max(end)
+                            }
+                            _ => merged.push((start, end)),
+                        }
+                    }
+                    for relocation in a
+                        .relocations
+                        .iter()
+                        .filter(|relocation| matches!(relocation.kind, RelocationKind::TensorMap))
+                    {
+                        let end = relocation
+                            .offset
+                            .checked_add(128)
+                            .ok_or_else(|| invalid("tensor-map relocation offset overflow"))?;
+                        if !merged
+                            .iter()
+                            .any(|(start, stop)| *start <= relocation.offset && end <= *stop)
+                        {
+                            return Err(invalid(
+                                "tensor-map descriptor bytes are not initialized by any source span",
+                            ));
+                        }
+                    }
+                }
             }
         }
         addresses.sort_unstable();
@@ -549,6 +640,7 @@ mod tests {
                 alignment: 256,
                 file: Some("state.bin".into()),
                 data_spans: vec![[0, 4096]],
+                sources: vec![],
                 relocations: vec![],
                 address: None,
                 memory: Memory::Device,
@@ -665,6 +757,67 @@ mod tests {
         assert!(value.validate().is_err());
         value.allocations[0].data_spans.clear();
         assert!(value.validate().is_ok());
+    }
+
+    #[test]
+    fn tensor_map_descriptors_must_be_initialized_by_source_spans() {
+        let mut value = package();
+        let relocation = |offset: usize| Relocation {
+            offset,
+            kind: RelocationKind::TensorMap,
+            target: Reference {
+                allocation: "state".into(),
+                offset: 0,
+            },
+        };
+        // Payload-bound storage: the descriptor must be covered by stored spans.
+        value.allocations[0].file = None;
+        value.allocations[0].data_spans = vec![[0, 128], [128, 128]];
+        value.allocations[0].sources = vec![
+            Source {
+                resource: "a".into(),
+                offset: 0,
+                nbytes: 128,
+            },
+            Source {
+                resource: "b".into(),
+                offset: 0,
+                nbytes: 128,
+            },
+        ];
+        value.allocations[0].relocations = vec![relocation(0)];
+        assert!(value.validate().is_ok());
+        value.allocations[0].relocations = vec![relocation(64)];
+        // Contiguous spans still cover the descriptor as one initialized range.
+        assert!(value.validate().is_ok());
+        value.allocations[0].data_spans = vec![[0, 128], [256, 128]];
+        value.allocations[0].sources = vec![
+            Source {
+                resource: "a".into(),
+                offset: 0,
+                nbytes: 128,
+            },
+            Source {
+                resource: "b".into(),
+                offset: 0,
+                nbytes: 128,
+            },
+        ];
+        value.allocations[0].relocations = vec![relocation(128)];
+        assert!(
+            value.validate().is_err(),
+            "a gap must not initialize a descriptor"
+        );
+        // Legacy carrier keeps its original rule.
+        let mut legacy = package();
+        legacy.allocations[0].relocations = vec![relocation(0)];
+        assert!(legacy.validate().is_ok());
+        legacy.allocations[0].file = None;
+        legacy.allocations[0].data_spans.clear();
+        assert!(
+            legacy.validate().is_err(),
+            "an uninitialized descriptor is rejected"
+        );
     }
 
     #[test]

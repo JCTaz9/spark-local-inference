@@ -65,6 +65,7 @@ def backend(monkeypatch):
     def initialize(self, *, device, namespace, **kwargs):
         assert type(kwargs["autotune"]) is bool and kwargs["compile_workers"] == 0
         self.autotune = kwargs["autotune"]
+        self.prime = kwargs.get("prime", True)
         self.device = SimpleNamespace(ordinal=0)
         self.namespace = FrozenMapping(namespace)
         self._stop = Event()
@@ -84,7 +85,7 @@ def backend(monkeypatch):
                 source=request.plan.source if autotune else "default", config={"tile": 32})
             if request.name not in controls.skip_prime:
                 call = request.prepare_call(request.plan)
-                if call is not None:
+                if call is not None and self.prime:
                     if call.produce is not None:
                         call.produce()
                     call.invoke()
@@ -176,6 +177,7 @@ def declaration(name, *, component="sequence.gdn_prefill", size=128, selected_si
 def test_declarations_do_no_work_and_prepare_in_one_tuned_batch(backend):
     events, _ = backend
     session = make_session(device=0, checkpoint="revision")
+    assert session.prime is False
     arena = ScratchArena("cpu")
     session.register_scratch(arena)
     calls = []
@@ -1159,7 +1161,7 @@ def test_published_priming_owners_can_release_candidate_storage_only_when_arena_
     assert arena.nbytes == 512 and arena.frozen
     assert "default" not in references
     assert all(owner.binding.scratch is arena.tensor for owner in owners)
-    assert output.eq(source).all()
+    assert output.eq(0).all()
     if retain_arena_owner:
         assert session._published_owners["operator"] == (arena,)
         assert references["tuned"]() is None

@@ -148,6 +148,30 @@ fn current_context() -> PyResult<(usize, i32)> {
     crate::current_context().map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
+#[cfg(feature = "qualification")]
+#[pyfunction]
+fn validate_prepared_contract(manifest: &Bound<'_, PyAny>, contract_json: &str) -> PyResult<()> {
+    let manifest = execution_manifest(manifest)?;
+    let contract: crate::model::PreparedContract = serde_json::from_str(contract_json)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    contract
+        .validate(&manifest)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+#[cfg(all(feature = "server", feature = "qualification"))]
+#[pyfunction]
+fn validate_prepared_catalog(
+    py: Python<'_>,
+    manifest: &Bound<'_, PyAny>,
+    config_json: &str,
+) -> PyResult<()> {
+    let manifest = execution_manifest(manifest)?;
+    py.detach(|| crate::server::Bootstrap::load(config_json, &manifest))
+        .map(|_| ())
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<ExecutionManifest> {
     macro_rules! field {
         ($value:expr, $name:literal, $kind:ty) => {
@@ -180,7 +204,8 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             });
         }
         graphs.push(GraphDescriptor {
-            draft_tokens: if field!(graph, "kind", String) == "packed_speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
+            confidence_width: field!(graph, "confidence_width", usize),
+            draft_tokens: if field!(graph, "kind", String) == "speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
             name: field!(graph, "name", String),
             kind: GraphKind::try_from(field!(graph, "kind", String).as_str())
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
@@ -528,7 +553,10 @@ fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
     {
         module.add_class::<GraphReplayWorker>()?;
         module.add_class::<ReplayCompletion>()?;
+        module.add_function(wrap_pyfunction!(validate_prepared_contract, module)?)?;
     }
+    #[cfg(all(feature = "server", feature = "qualification"))]
+    module.add_function(wrap_pyfunction!(validate_prepared_catalog, module)?)?;
     module.add_class::<PreparedGraphExecutor>()?;
     module.add_class::<crate::embedding_tables::NativeEmbeddingTables>()?;
     module.add_class::<crate::embedding_tables::NativeEmbeddingBinding>()?;

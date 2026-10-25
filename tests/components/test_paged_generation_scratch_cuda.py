@@ -27,7 +27,8 @@ def test_sampling_rank_preserves_subsequent_shared_graph_aliases():
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     logits = torch.zeros(16, requests.vocab_size, dtype=torch.bfloat16, device=device)
-    decoder = SimpleNamespace(weights=SimpleNamespace(draft=None), scratch=SimpleNamespace(logits=logits))
+    decoder = SimpleNamespace(weights=SimpleNamespace(draft=None), scratch=SimpleNamespace(logits=logits),
+                              head=SimpleNamespace(gather=SimpleNamespace(runtime=None)))
     pools, signatures = [], []
     for rank in (0, 1):
         pool = GraphBufferPool(device, chunk_bytes=2 << 20)
@@ -36,7 +37,7 @@ def test_sampling_rank_preserves_subsequent_shared_graph_aliases():
                                 validation_input=validation, validation_sum=torch.empty_like(validation))
         forward = PreparedGeneration(decoder, batch, completion_outputs(records), frame, sequence, runtime=None,
             coordinator=None, session=None, name="decode16", workspace=None, buffers=pool.cursor())
-        assert forward.compilation_variant == ("sample" if rank == 0 else "consume")
+        assert forward.compilation_variant == "sample"
         shared = bind_scratch(PreparedSampling.scratch_layout(4, requests.vocab_size),
                               device=device, workspace=pool.cursor())
         signatures.append(_signature(tuple(shared.values())))

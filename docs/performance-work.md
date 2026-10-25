@@ -99,9 +99,10 @@ recurrence schedules, QSA partitions, MoE reductions, and hyperconnection
 projection precision independently. Preparation metadata must agree with the
 actual submitted queries.
 
-Measure every captured speculative shape. Total target rows, `batch ×
-verification_width`, determine whether expert execution stays in the small-row
-band or selects grouped kernels. The [MTP design](mtp-design.md) specifies
+Measure every captured speculative shape. Physical target rows, `P`, determine
+whether expert execution stays in the small-row band or selects grouped kernels.
+Rectangular rounds use `P = B × W`; ragged rounds can use fewer target rows.
+The [MTP design](mtp-design.md) specifies
 round-cost and acceptance measurements. Do not infer a speedup from draft
 depth or a component benchmark alone.
 
@@ -164,9 +165,10 @@ disjoint.
 Vision working buffers and mutable validation metadata use graph-buffer cursors;
 request-owned image features and upload inputs retain independent storage.
 Speculative graphs allocate filtering and retained-probability buffers for their
-actual batch and width, sharing backing across serialized variants and proposal
-steps. Proposal-only graphs omit target and verification workspaces. Graph-buffer
-cursors reuse available space in earlier chunks without moving existing views.
+actual batch and width, sharing backing across serialized variants. Proposal and
+target stages execute within one graph; retained proposal values remain disjoint
+from target scratch until verification consumes them. Graph-buffer cursors reuse
+available space in earlier chunks without moving existing views.
 Proposal filtering, target filtering, and verification reuse sequential-stage
 intermediates. Target probabilities and validity retain separate storage through
 verification, as do retained draft probabilities.

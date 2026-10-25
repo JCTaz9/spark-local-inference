@@ -4,27 +4,78 @@
 mod tests;
 mod wire;
 
-use std::time::Instant;
+use std::{time::Instant, collections::VecDeque};
 
-use super::{ExecutionManifest, FrameCompletion, GraphExecutor, RankStream, Upload};
+use super::{ExecutionManifest, FrameCompletion, GraphExecutor, OwnedUpload, RankStream, Upload};
 use crate::{Error, Result, Shutdown, cache::Fence};
 use wire::*;
 
-// Rank exchanges within a step are brief; poll that long before blocking, as threaded ranks do.
-const HANDOFF_SPIN: std::time::Duration = std::time::Duration::from_micros(500);
-
 struct Peer {
     channel: Channel,
-    completion: Option<FrameCompletion>,
+}
+
+struct Pending {
+    fence: Fence,
+    graph: usize,
+    grammar: bool,
+    uploads: Vec<OwnedUpload>,
+    dispatched: Instant,
+    committed: bool,
+    queued: bool,
+    ready: Vec<bool>,
+    completions: Vec<Option<FrameCompletion>>,
+}
+impl Pending {
+    fn uploads(&self) -> Vec<Upload<'_>> {
+        self.uploads.iter().map(|upload| Upload {
+            buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
+        }).collect()
+    }
+}
+fn ready_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, graph: usize) -> Result<()> {
+    let frame = pending.iter_mut().find(|frame| frame.fence == fence)
+        .ok_or_else(|| invalid("unexpected rank readiness fence"))?;
+    if frame.graph != graph || frame.ready[rank] || frame.committed {
+        return Err(invalid("rank readiness identity or state differs"));
+    }
+    frame.ready[rank] = true;
+    Ok(())
+}
+fn completion_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, graph: usize) -> Result<&mut Pending> {
+    let frame = pending.iter_mut().find(|frame| frame.completions[rank + 1].is_none())
+        .ok_or_else(|| invalid("unexpected rank completion"))?;
+    if !frame.committed || frame.fence != fence || frame.graph != graph {
+        return Err(invalid("rank completion order or identity differs"));
+    }
+    Ok(frame)
+}
+fn window_available(pending: &VecDeque<Pending>, grammar: bool, manifest: &ExecutionManifest) -> bool {
+    pending.len() < 2
+        && pending.back().is_none_or(|frame| frame.committed)
+        && (!grammar || pending.is_empty())
+        && !pending.iter().any(|frame| frame.grammar || !matches!(
+            manifest.graphs[frame.graph].kind, super::GraphKind::Decode | super::GraphKind::Speculative))
+}
+
+fn identity(fence: Fence, graph: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    number(&mut bytes, fence.0 as usize);
+    number(&mut bytes, graph);
+    bytes
+}
+fn read_identity(bytes: &[u8]) -> Result<(Fence, usize)> {
+    let mut reader = Reader(bytes);
+    let value = (Fence(reader.number()? as u64), reader.number()?);
+    reader.end()?;
+    Ok(value)
 }
 
 /// Rank zero owns request scheduling; peer processes execute identical graph steps.
-/// One step can be outstanding. Its fence retires only after every rank completes.
+/// Two frame slots include preparation and unconsumed all-rank completions.
 pub struct TensorParallelExecutor {
     local: GraphExecutor,
     peers: Vec<Peer>,
-    pending: Option<(Fence, usize, Instant)>,
-    completion: Option<FrameCompletion>,
+    pending: VecDeque<Pending>,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
 }
@@ -56,7 +107,6 @@ impl TensorParallelExecutor {
             }
             peers.push(Peer {
                 channel,
-                completion: None,
             });
         }
         // SAFETY: The caller retains all rank-local prepared resources through drain.
@@ -67,15 +117,14 @@ impl TensorParallelExecutor {
         Ok(Self {
             local,
             peers,
-            pending: None,
-            completion: None,
+            pending: VecDeque::with_capacity(2),
             poison: None,
             shutdown: None,
         })
     }
 
     pub fn outstanding(&self) -> usize {
-        usize::from(self.pending.is_some())
+        self.pending.len()
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
@@ -85,7 +134,7 @@ impl TensorParallelExecutor {
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
-            && self.pending.is_none()
+            && window_available(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }
 
@@ -96,7 +145,10 @@ impl TensorParallelExecutor {
         if self.shutdown.is_some() {
             return Err(invalid("tensor-parallel executor is closed"));
         }
-        self.local.next_fence()
+        match self.pending.back() {
+            Some(frame) if !frame.committed => Ok(Fence(frame.fence.0 + 1)),
+            _ => self.local.next_fence(),
+        }
     }
 
     pub fn submit(
@@ -111,55 +163,30 @@ impl TensorParallelExecutor {
         if self.shutdown.is_some() {
             return Err(invalid("tensor-parallel executor is closed"));
         }
-        if self.pending.is_some() {
-            return Ok(None);
-        }
+        let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
+            Some(super::GraphKind::Decode | super::GraphKind::Speculative));
+        if !self.can_submit(barrier) { return Ok(None); }
         let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
             return Ok(None);
         };
-        let result = self.prepare_and_commit(graph, uploads, grammar, fence);
-        if let Err(error) = &result {
-            self.poison = Some(error.clone());
-        }
-        result.map(Some)
-    }
-
-    fn prepare_and_commit(
-        &mut self,
-        graph: usize,
-        uploads: &[Upload<'_>],
-        grammar: bool,
-        fence: Fence,
-    ) -> Result<Fence> {
-        let dispatched = Instant::now();
-        for peer in &mut self.peers {
-            peer.channel.nonblocking(false)?;
-        }
-        wire::prepare(self.local.manifest(), fence, graph, grammar, uploads, |tag, bytes| {
-            for peer in &mut self.peers {
-                peer.channel.send(tag, bytes)?;
-            }
+        let queued = !self.pending.is_empty();
+        self.pending.push_back(Pending {
+            fence, graph, grammar, dispatched: Instant::now(), committed: false, queued,
+            uploads: uploads.iter().map(|u| OwnedUpload {
+                buffer: u.buffer.to_owned(), offset: u.offset, bytes: u.bytes.to_vec(),
+            }).collect(),
+            ready: vec![false; self.peers.len()],
+            completions: (0..=self.peers.len()).map(|_| None).collect(),
+        });
+        let result = wire::prepare(self.local.manifest(), fence, graph, grammar, uploads, |tag, bytes| {
+            for peer in &mut self.peers { peer.channel.send(tag, bytes)?; }
             Ok(())
-        })?;
-        for peer in &mut self.peers {
-            if !peer.channel.handoff(READY, HANDOFF_SPIN)?.is_empty() {
-                return Err(invalid("unexpected rank readiness payload"));
-            }
+        });
+        if let Err(error) = result {
+            self.poison = Some(error.clone());
+            return Err(error);
         }
-        // Every rank has validated the same inputs and reserved the same next fence.
-        self.pending = Some((fence, graph, dispatched));
-        for peer in &mut self.peers {
-            peer.channel.send(COMMIT, &[])?;
-        }
-        if self.local.submit(graph, uploads, grammar)? != Some(fence) {
-            return Err(invalid(
-                "rank-zero submission changed after coordinated validation",
-            ));
-        }
-        for peer in &self.peers {
-            peer.channel.nonblocking(true)?;
-        }
-        Ok(fence)
+        Ok(Some(fence))
     }
 
     pub fn poll(&mut self) -> Result<Option<FrameCompletion>> {
@@ -180,72 +207,78 @@ impl TensorParallelExecutor {
     }
 
     fn poll_ranks(&mut self) -> Result<Option<FrameCompletion>> {
-        let Some((fence, graph, started)) = self.pending else {
-            return Ok(None);
-        };
-        if started.elapsed() > TIMEOUT {
+        if self.pending.iter().any(|frame| frame.dispatched.elapsed() > TIMEOUT) {
             return Err(invalid("tensor-parallel graph completion deadline expired"));
         }
-        if self.completion.is_none() {
-            match self.local.poll() {
-                Ok(None) => {}
-                Ok(Some(completion)) => self.completion = Some(completion),
-                Err(error) => return Err(error),
+        if let Some(completion) = self.local.poll()? {
+            let frame = self.pending.iter_mut().find(|frame| frame.fence == completion.fence)
+                .ok_or_else(|| invalid("unexpected rank-zero completion fence"))?;
+            if frame.completions[0].replace(completion).is_some() {
+                return Err(invalid("duplicate rank-zero completion"));
             }
-        }
-        for peer in &mut self.peers {
-            if peer.completion.is_some() {
-                continue;
-            }
-            if let Some((tag, bytes)) = peer.channel.poll()? {
-                if tag != COMPLETE {
-                    return Err(invalid("expected rank graph completion"));
-                }
-                let mut reader = Reader(&bytes);
-                if reader.number()? != fence.0 as usize || reader.number()? != graph {
-                    return Err(invalid("rank completion fence or graph differs"));
-                }
-                let timing = wire::timing(&mut reader)?;
-                let proposal_confidence = wire::proposal_confidence(&mut reader)?;
-                let speculative_survival = wire::speculative_survival(&mut reader)?;
-                if reader.0.len() != self.local.manifest().completion_bytes() {
-                    return Err(invalid("rank completion size differs from its ABI"));
-                }
-                peer.completion = Some(FrameCompletion {
-                    logprobs: None,
-                    prompt_logprobs: None,
-                    proposal_confidence,
-                    speculative_survival,
-                    fence,
-                    graph_index: graph,
-                    timing,
-                    records: super::transport::decode_records(
-                        reader.0,
-                        fence,
-                        self.local.manifest().request_capacity(),
-                        self.local.manifest().completion_fields(),
-                    )?,
-                });
-            }
-        }
-        if self.completion.is_none() || self.peers.iter().any(|peer| peer.completion.is_none()) {
-            return Ok(None);
-        }
-        let root = self.completion.as_ref().unwrap();
-        for (index, peer) in self.peers.iter().enumerate() {
-            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::PackedSpeculative { agree_packed } else { agree };
-            agreement(root, peer.completion.as_ref().unwrap())
-                .map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
-            self.completion.as_mut().unwrap().timing.merge_rank(index + 1,
-                peer.completion.as_ref().unwrap().timing)?;
-            peer.completion = None;
+            peer.channel.nonblocking(true)?;
+            let result = (|| -> Result<()> {
+                while let Some((tag, bytes)) = peer.channel.poll()? {
+                    if tag == READY {
+                        let (fence, graph) = read_identity(&bytes)?;
+                        ready_frame(&mut self.pending, index, fence, graph)?;
+                    } else if tag == COMPLETE {
+                        let mut reader = Reader(&bytes);
+                        let fence = Fence(reader.number()? as u64);
+                        let graph = reader.number()?;
+                        let frame = completion_frame(&mut self.pending, index, fence, graph)?;
+                        let timing = wire::timing(&mut reader)?;
+                        let proposal_confidence = wire::proposal_confidence(&mut reader)?;
+                        let speculative_survival = wire::speculative_survival(&mut reader)?;
+                        if reader.0.len() != self.local.manifest().completion_bytes() {
+                            return Err(invalid("rank completion size differs from its ABI"));
+                        }
+                        frame.completions[index + 1] = Some(FrameCompletion {
+                            logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
+                            fence, graph_index: graph, timing,
+                            records: super::transport::decode_records(reader.0, fence,
+                                self.local.manifest().request_capacity(), self.local.manifest().completion_fields())?,
+                        });
+                    } else { return Err(invalid("unexpected rank message")); }
+                }
+                Ok(())
+            })();
+            peer.channel.nonblocking(false)?;
+            result?;
         }
-        self.completion.as_mut().unwrap().timing.wall_ns =
-            started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.pending = None;
-        Ok(self.completion.take())
+        for frame in &mut self.pending {
+            if frame.committed { continue; }
+            if !frame.ready.iter().all(|ready| *ready) { break; }
+            let uploads = frame.uploads();
+            if self.local.validate_submission(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
+                return Err(invalid("rank-zero reservation changed before commit"));
+            }
+            for peer in &mut self.peers {
+                peer.channel.send(COMMIT, &identity(frame.fence, frame.graph))?;
+            }
+            if self.local.submit(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
+                return Err(invalid("rank-zero submission changed after coordinated validation"));
+            }
+            frame.committed = true;
+        }
+        if !self.pending.front().is_some_and(|frame| frame.completions.iter().all(Option::is_some)) {
+            return Ok(None);
+        }
+        let mut frame = self.pending.pop_front().unwrap();
+        let mut root = frame.completions[0].take().unwrap();
+        for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
+            let completion = completion.unwrap();
+            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
+                agree_speculative
+            } else { agree };
+            agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
+            root.timing.merge_rank(index + 1, completion.timing)?;
+        }
+        root.timing.queued = frame.queued;
+        root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        Ok(Some(root))
     }
 
     pub fn close(&mut self) -> Shutdown {
@@ -253,7 +286,7 @@ impl TensorParallelExecutor {
             return shutdown.clone();
         }
         let result = (|| -> Result<()> {
-            while self.pending.is_some() {
+            while !self.pending.is_empty() {
                 self.poll()?;
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
@@ -352,17 +385,17 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
     Ok(())
 }
 
-pub(super) fn agree_packed(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()> {
+pub(super) fn agree_speculative(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()> {
     agree(root, peer)?;
     for (a, b) in root.records.iter().zip(peer.records.iter()) {
-        // ABI3 leaves inactive token/vector payload undefined. Retain the base
+        // Inactive token/vector payload is undefined. Retain the base
         // transport agreement above, and compare only committed active values.
         if a.status == 0 && b.status == 0 { continue; }
         if a.generation != b.generation || a.submission_sequence != b.submission_sequence
             || a.consumed_tokens != b.consumed_tokens || a.generated_tokens != b.generated_tokens
             || a.token_id != b.token_id || a.status != b.status || a.error_code != b.error_code
             || a.reserved != b.reserved || a.vector != b.vector {
-            return Err(invalid("packed combined rank completion prefixes or committed state differ"));
+            return Err(invalid("speculative rank completion prefixes or committed state differ"));
         }
     }
     Ok(())
@@ -404,65 +437,72 @@ pub unsafe fn serve_rank(
             if !channel.receive(READY)?.is_empty() {
                 return Err(invalid("unexpected coordinator readiness payload"));
             }
+            let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>)> = None;
+            let mut prepared_at: Option<Instant> = None;
+            let mut started = VecDeque::new();
             loop {
-                let (tag, bytes) = match channel.spin(HANDOFF_SPIN)? {
-                    Some(message) => message,
-                    None => channel.wait(true)?,
-                };
-                if tag == DRAIN && bytes.is_empty() {
-                    let shutdown = executor.close();
-                    if !shutdown.drained {
-                        return Err(shutdown
-                            .error
-                            .unwrap_or_else(|| invalid("rank did not drain")));
-                    }
-                    channel.send(DRAINED, &[])?;
-                    if !channel.receive(RELEASE)?.is_empty() {
-                        return Err(invalid("unexpected rank release payload"));
-                    }
-                    return Ok(());
-                }
-                if ![PREPARE, PREPARE_MORE].contains(&tag) {
-                    return Err(invalid("expected rank prepare or drain"));
-                }
-                let (fence, graph, grammar, owned) =
-                    receive_prepare(&mut channel, executor.manifest(), tag, bytes)?;
-                let uploads: Vec<_> = owned
-                    .iter()
-                    .map(|upload| Upload {
-                        buffer: &upload.buffer,
-                        offset: upload.offset,
-                        bytes: &upload.bytes,
-                    })
-                    .collect();
-                if executor.validate_submission(graph, &uploads, grammar)? != Some(fence) {
-                    return Err(invalid("rank submission sequence or capacity differs"));
-                }
-                channel.send(READY, &[])?;
-                if !channel.handoff(COMMIT, HANDOFF_SPIN)?.is_empty() {
-                    return Err(invalid("unexpected rank commit payload"));
-                }
-                if executor.submit(graph, &uploads, grammar)? != Some(fence) {
-                    return Err(invalid("rank lost its prepared submission"));
-                }
-                let started = Instant::now();
-                channel.nonblocking(true)?;
-                let completed = loop {
-                    match executor.poll() {
-                        Ok(None) => {}
-                        Ok(Some(completion)) => break completion,
-                        Err(error) => return Err(error),
-                    }
-                    if channel.poll()?.is_some() {
-                        return Err(invalid("rank command arrived before graph completion"));
-                    }
-                    if started.elapsed() > TIMEOUT {
-                        return Err(invalid("rank graph completion deadline expired"));
-                    }
-                    std::thread::yield_now();
-                };
+                let active = executor.outstanding() != 0 || prepared.is_some();
+                channel.nonblocking(active)?;
+                let message = if active { channel.poll()? } else { Some(channel.wait(true)?) };
                 channel.nonblocking(false)?;
-                channel.send(COMPLETE, &completion(&completed))?;
+                if let Some((tag, bytes)) = message {
+                    match tag {
+                        DRAIN if bytes.is_empty() => {
+                            if active { return Err(invalid("rank drain arrived with outstanding frames")); }
+                            let shutdown = executor.close();
+                            if !shutdown.drained {
+                                return Err(shutdown.error.unwrap_or_else(|| invalid("rank did not drain")));
+                            }
+                            channel.send(DRAINED, &[])?;
+                            if !channel.receive(RELEASE)?.is_empty() {
+                                return Err(invalid("unexpected rank release payload"));
+                            }
+                            return Ok(());
+                        }
+                        PREPARE | PREPARE_MORE => {
+                            if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
+                            let (fence, graph, grammar, owned) =
+                                receive_prepare(&mut channel, executor.manifest(), tag, bytes)?;
+                            let uploads: Vec<_> = owned.iter().map(|upload| Upload {
+                                buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
+                            }).collect();
+                            if executor.validate_submission(graph, &uploads, grammar)? != Some(fence) {
+                                return Err(invalid("rank submission sequence or capacity differs"));
+                            }
+                            channel.send(READY, &identity(fence, graph))?;
+                            prepared = Some((fence, graph, grammar, owned));
+                            prepared_at = Some(Instant::now());
+                        }
+                        COMMIT => {
+                            let (fence, graph) = read_identity(&bytes)?;
+                            prepared_at = None;
+                            let (expected, expected_graph, grammar, owned) = prepared.take()
+                                .ok_or_else(|| invalid("rank commit arrived without preparation"))?;
+                            if fence != expected || graph != expected_graph {
+                                return Err(invalid("rank commit identity differs"));
+                            }
+                            let uploads: Vec<_> = owned.iter().map(|upload| Upload {
+                                buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
+                            }).collect();
+                            if executor.submit(graph, &uploads, grammar)? != Some(fence) {
+                                return Err(invalid("rank lost its prepared submission"));
+                            }
+                            started.push_back(Instant::now());
+                        }
+                        _ => return Err(invalid("unexpected rank command")),
+                    }
+                }
+                if let Some(completed) = executor.poll()? {
+                    started.pop_front();
+                    channel.send(COMPLETE, &completion(&completed))?;
+                }
+                if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {
+                    return Err(invalid("rank commit deadline expired after preparation"));
+                }
+                if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
+                    return Err(invalid("rank graph completion deadline expired"));
+                }
+                if active { std::thread::yield_now(); }
             }
         })();
         if let Err(error) = &result {

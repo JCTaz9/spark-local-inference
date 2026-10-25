@@ -222,9 +222,27 @@ pub(super) struct PayloadFile {
     pub file: Arc<File>,
     pub start: u64,
     pub length: u64,
-    direct: Mutex<Option<Arc<File>>>,
+    direct: Arc<Mutex<Option<Arc<File>>>>,
 }
 impl PayloadFile {
+    pub(super) fn new(file: Arc<File>, start: u64, length: u64) -> Self {
+        Self::new_shared(file, start, length, Arc::new(Mutex::new(None)))
+    }
+    /// Share one cached direct-I/O handle with other payloads in the same container. Payloads that
+    /// live in one packed file must not each reopen it.
+    pub(super) fn new_shared(
+        file: Arc<File>,
+        start: u64,
+        length: u64,
+        direct: Arc<Mutex<Option<Arc<File>>>>,
+    ) -> Self {
+        Self {
+            file,
+            start,
+            length,
+            direct,
+        }
+    }
     pub fn direct(&self) -> Result<Arc<File>> {
         let mut cached = self.direct.lock().unwrap();
         if cached.is_none() {
@@ -269,12 +287,7 @@ impl PayloadFile {
         {
             return Err(invalid("invalid companion payload length or format"));
         }
-        Ok(Self {
-            file: Arc::new(file),
-            start: size + 8,
-            length,
-            direct: Mutex::new(None),
-        })
+        Ok(PayloadFile::new(Arc::new(file), size + 8, length))
     }
 }
 
@@ -294,7 +307,7 @@ pub fn package_companions(path: &Path) -> Result<Vec<String>> {
     }
     let envelope =
         wire::ProtectedIndex::decode(bytes.as_slice()).map_err(|e| invalid(e.to_string()))?;
-    if envelope.version != 4
+    if envelope.version != 6
         || envelope.groups.len() != 3
         || envelope.groups[0].kind != 1
         || envelope.ranks.is_empty()
@@ -361,9 +374,16 @@ pub(super) struct Archive {
     pub files: BTreeMap<String, PayloadFile>,
     layout: Option<Layout>,
     _directory: File,
+    /// SHA-256 of the exact signed envelope bytes read at open.
+    pub(super) envelope_digest: [u8; 32],
     pub(super) protection: Protection,
 }
 impl Archive {
+    /// SHA-256 of the exact signed envelope bytes authenticated for this copy.
+    pub(super) fn envelope_digest(&self) -> [u8; 32] {
+        self.envelope_digest
+    }
+
     /// Open the file and read its signed envelope: the file, the payload start and size, and the
     /// envelope bytes, none of them verified yet.
     pub(super) fn envelope(path: &Path) -> Result<(File, u64, u64, Vec<u8>)> {
@@ -463,18 +483,20 @@ impl Archive {
         #[cfg(windows)]
         let primary = path.to_owned();
         let (file, start, payload, bytes) = Self::envelope(&primary)?;
+        let envelope_digest: [u8; 32] = super::protection::sha256(&bytes)
+            .try_into()
+            .map_err(|_| invalid("signed envelope digest has the wrong length"))?;
         let (protection, index) = Protection::verify(&bytes, publishers, payload, rank)?;
         let layout = Layout::read(&file)?;
         let file = Arc::new(file);
         let mut files = BTreeMap::new();
         files.insert(
             String::new(),
-            PayloadFile {
-                file: file.clone(),
+            PayloadFile::new(
+                file.clone(),
                 start,
-                length: if layout.is_some() { 0 } else { payload },
-                direct: Mutex::new(None),
-            },
+                if layout.is_some() { 0 } else { payload },
+            ),
         );
         let mut names = std::collections::BTreeSet::new();
         let spans: Vec<_> = protection
@@ -564,6 +586,7 @@ impl Archive {
             files,
             layout,
             _directory: directory,
+            envelope_digest,
             protection,
         };
         for part in result.protection.data_parts() {
@@ -757,7 +780,19 @@ impl Archive {
     }
     pub fn validate(&self, package: &Package) -> Result<()> {
         for allocation in &package.allocations {
-            if let Some(key) = &allocation.file {
+            if allocation.is_payload_bound() {
+                for (source, span) in allocation.sources.iter().zip(&allocation.data_spans) {
+                    let payload = self.span(package, &source.resource)?;
+                    if source.nbytes != span[1] as u64
+                        || source
+                            .offset
+                            .checked_add(source.nbytes)
+                            .is_none_or(|end| end > payload.nbytes)
+                    {
+                        return Err(invalid("allocation source exceeds its payload resource"));
+                    }
+                }
+            } else if let Some(key) = &allocation.file {
                 if self.span(package, key)?.nbytes != allocation.stored_bytes() as u64 {
                     return Err(invalid("allocation payload size differs from its spans"));
                 }
@@ -894,5 +929,92 @@ mod tests {
                 .contains("index size")
         );
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+fn retain(file: &Arc<File>) -> Result<Arc<File>> {
+    #[cfg(windows)]
+    {
+        return Ok(Arc::new(crate::os::direct_read_guard(file).map_err(
+            |error| invalid(format!("retain read-only package: {error}")),
+        )?));
+    }
+    #[cfg(unix)]
+    {
+        Ok(file.clone())
+    }
+}
+
+impl super::payload::Files for Archive {
+    fn span<'a>(&self, package: &'a Package, key: &str) -> Result<&'a wire::Span> {
+        Archive::span(self, package, key)
+    }
+    fn source(&self, span: &wire::Span) -> Result<(&PayloadFile, u64)> {
+        Archive::source(self, span)
+    }
+    fn read(&self, package: &Package, key: &str) -> Result<Vec<u8>> {
+        Archive::read(self, package, key)
+    }
+    fn records<'a>(
+        &'a self,
+        package: &Package,
+        key: &str,
+    ) -> Result<super::payload::RecordReader<'a>> {
+        Ok(super::payload::RecordReader::Archive(Archive::records(
+            self, package, key,
+        )?))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    fn source_index(&self, span: &wire::Span) -> Result<usize> {
+        Archive::source_index(self, span)
+    }
+    fn asset_path(&self, span: &wire::Span) -> Result<std::path::PathBuf> {
+        let (file, offset) = self.source(span)?;
+        let _ = offset;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            Ok(std::path::PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                file.file.as_raw_fd()
+            )))
+        }
+        #[cfg(windows)]
+        {
+            let name = self.source_name(span)?;
+            let root = self.path.as_path();
+            Ok(if name.is_empty() {
+                root.to_owned()
+            } else {
+                root.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(name)
+            })
+        }
+    }
+    fn release_page_cache(&self) {
+        Archive::release_page_cache(self)
+    }
+    fn direct_files(&self) -> Box<dyn Iterator<Item = Result<Arc<File>>> + '_> {
+        Box::new(self.files.values().map(|file| file.direct()))
+    }
+    fn retained_files(&self) -> Result<Vec<Arc<File>>> {
+        self.files
+            .values()
+            .map(|payload| retain(&payload.file))
+            .chain(std::iter::once(retain(&self.file)))
+            .collect()
+    }
+    fn validate(&self, package: &Package) -> Result<()> {
+        Archive::validate(self, package)
+    }
+    fn resource_reader<'a>(
+        &'a self,
+        package: &Package,
+        key: &str,
+    ) -> Result<Box<dyn std::io::Read + 'a>> {
+        Ok(Box::new(self.reader(package, key)?))
     }
 }

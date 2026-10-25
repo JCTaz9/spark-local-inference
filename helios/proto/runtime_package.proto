@@ -43,7 +43,7 @@ message StoredData {
   // Empty retains the primary-file range above. Otherwise hashes the concatenated parts.
   repeated Span parts = 4;
 }
-// One rank's bundle, its encrypted executables, its supporting resources and its stored data.
+// One rank's bundle, its compressed executables, its supporting resources and its stored data.
 message RankProtection {
   uint32 rank = 1;
   BundleIndex bundle = 2;
@@ -109,6 +109,7 @@ message RebuildSpeculation {
   string draft_prefix_selection = 7;
   optional string draft_head_quantization = 8;
   optional string markov_head_quantization = 9;
+  optional uint64 graph_budget = 10;
 }
 // Views of retained prepared weight storage, with no additional payload copies.
 // Names are paths in the recipe's weight objects, not original checkpoint keys.
@@ -292,11 +293,10 @@ enum GraphOperation {
   VISION = 7;
   SPECULATIVE = 8;
   MIXED = 9;
-  PROPOSAL = 10;
-  VERIFICATION = 11;
+  reserved 10, 11, 13;
+  reserved "PROPOSAL", "VERIFICATION", "PACKED_SPECULATIVE";
   SCORED_PREFILL = 12;
-  // A bounded proposal, causal prefix allocation, and one target pass.
-  PACKED_SPECULATIVE = 13;
+
 }
 message GraphContract {
   string graph = 1;
@@ -697,9 +697,10 @@ message ExecutionGraph {
   optional bool speculation_enabled = 10;
   uint64 estimated_duration_ns = 11; // Zero denotes an indeterminate duration.
   uint64 prefill_capacity = 12; // Prompt capacity of a mixed graph; zero otherwise.
-  // Physical target rows of a verification graph. Zero retains batch_capacity *
-  // token_capacity for packages without a separate packed-row bound.
+  // Physical target rows of a complete speculative operation, including rectangular layouts.
   uint64 packed_token_capacity = 13;
+  // Number of confidence prefixes produced per request in the selected completion frame.
+  uint32 confidence_width = 14;
 }
 enum DraftSource { NO_DRAFT = 0; MTP = 1; COPY_DRAFT = 2; }
 message InputBinding { string buffer_name = 1; uint64 host_offset = 2; uint64 nbytes = 3; }

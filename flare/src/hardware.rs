@@ -7,16 +7,8 @@ use libloading::Library;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn platform(pci_id: u32) -> Option<&'static str> {
-    if pci_id & 0xffff != 0x10de {
-        return None;
-    }
-    match pci_id >> 16 {
-        0x2e12 => Some("gb10"),
-        0x2b85 | 0x2b87 | 0x2b8c | 0x2bb1 | 0x2bb2 | 0x2bb3 | 0x2bb4 | 0x2bb5 | 0x2bb9 | 0x2bbc => {
-            Some("gb202")
-        }
-        _ => None,
-    }
+    // Single mapping table shared with package export naming.
+    flare_helios::package::naming::platform_from_pci(pci_id)
 }
 
 /// Keep NVML's background threads out of the process that sets CUDA visibility.

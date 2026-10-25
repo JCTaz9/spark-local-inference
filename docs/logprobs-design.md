@@ -13,10 +13,10 @@ For every returned token `t`, report `logits[t] - logsumexp(logits)` over the fu
 vocabulary received by the sampler, accumulating in FP32. This precedes every
 sampling transformation: penalties, grammar, temperature, top-k, top-p, and min-p.
 Speculative positions always use target logits, including correction tokens,
-width-one rounds, split verification, packed verification, and history proposals.
+width-one rounds, complete speculative rounds with packed targets, and history proposals.
 Draft probabilities never enter the reporting path.
 
-New exports provide K=20 alternatives. Requests select zero through K. Alternatives
+Exports provide K=20 alternatives. Requests select zero through K. Alternatives
 are ordered by decreasing logprob and increasing token ID for equal values. The
 chosen token is stored separately, so it need not belong to the alternatives.
 The reduction does not change sampling or Philox state.
@@ -29,7 +29,7 @@ speculative completion vector. All tensors have contiguous row-major storage.
 
 | Buffer | dtype | Shape | Meaning |
 | --- | --- | --- | --- |
-| `completion_records` | int64 | `[2, capacity, 8 or 24]` | Existing ABI2/ABI3 records |
+| `completion_records` | int64 | `[2, capacity, 24]` | ABI4 completion vectors |
 | `completion_logprobs` | int32 | `[2, capacity, 8, 2+2*K]` | Packed token statistics |
 | `logprob_requested` | int32 | `[capacity]` | Nonzero for requesting lanes in this submission |
 
@@ -40,16 +40,17 @@ entries, unused alternative IDs are -1. The flags are ordinary graph inputs;
 the output buffer cannot be uploaded. Flags and output must both be declared.
 
 The native worker uploads the full flag vector on each submission, clearing
-unused slots. Only lanes in that submission can set flags. Older packages have
-neither buffer and receive neither flags nor new transfers. The prepared semantic
-contract and its Protobuf schema acquire no policy flags or model selectors.
+unused slots. Only lanes in that submission can set flags. Graphs without
+logprob outputs receive neither flags nor logprob transfers. The prepared
+semantic contract contains the requested output layout and its value bindings.
 
 ## Writers and committed positions
 
 The reduction reads the active completion frame after its token writer finishes.
 For a sampling row, the row's slot and epoch must match the record and the record
-must emit a token. ABI2 uses position zero; ABI3 uses its emitted prefix. The raw
-logit row corresponds to that slot's sampled token position.
+must emit a token. ABI4 records identify the emitted prefix; ordinary sampling
+emits position zero. The raw logit row corresponds to that slot's sampled token
+position.
 
 The speculative writer runs after verification's acceptance broadcast and after
 commit writes the physical-slot records. It therefore consumes the same emitted
@@ -59,11 +60,11 @@ request's columns beyond its committed prefix are never read, since they may
 refer to another request's packed rows. Token limits, budget, and EOS clipping
 remain the shared commit's responsibility.
 
-Raw logits remain separate from filtering scratch. Split verification may reuse
-that scratch; reporting never reads it. Logprob writes complete before subsequent
+Raw logits remain separate from filtering scratch. Target verification may
+reuse filtering scratch; reporting never reads it. Logprob writes complete before subsequent
 draft context updates or model work can reuse the target logits.
 
-Admission, maintenance, vision, and stale-proposal rejection write records only.
+Admission, maintenance, vision, and invalid rounds write records only.
 They do not create an emitted token requiring a payload. Readers use record
 emission, never stale payload contents, to decide which positions are meaningful.
 

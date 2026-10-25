@@ -423,9 +423,9 @@ not GPU occupancy or hardware efficiency.
 
 `python -m scripts.scheduling_sim.learning` compares timing estimators and
 exploration policies over the same useful-work and service-price objective.
-It preserves the fixed-cost CLI and its tests. This experiment has one graph in
-flight, with synthetic execution costs. It does not model native prerequisites,
-split proposal/verification ownership, queued submissions, cache storage, or
+It preserves the fixed-cost CLI and its tests. The timing simulator has one graph
+in flight with synthetic execution costs. It does not model native prerequisites,
+complete speculative B/D/W/P programs, queued submissions, cache storage, or
 tensor-parallel synchronization. Its results do not establish GPU performance
 or explain a particular service trace.
 

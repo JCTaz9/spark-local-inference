@@ -187,3 +187,25 @@ def test_projection_candidate_binding_failure_does_not_retain_fixture():
             values=None, scales=None, gain=None, bias=None, weight=None, selected_workspace=fail)
     gc.collect()
     assert references and references[0]() is None
+
+
+@pytest.mark.parametrize("native,requested,expected", [
+    (False, "auto", "auto"), (True, "auto", "quantized"),
+    (True, "a16", "a16"), (True, "quantized", "quantized"),
+])
+def test_native_dense_activations_only_override_auto(monkeypatch, native, requested, expected):
+    session, weight, *_ = projection_fixture(monkeypatch)
+    session.native_dense_activations = native
+    modes = []
+
+    def query(*args, activation_mode, **kwargs):
+        modes.append(activation_mode)
+        return Query()
+
+    monkeypatch.setattr(linear.blockscaled, "query_from_call", query)
+    source = torch.zeros((4, 6), dtype=torch.bfloat16)
+    output = torch.empty((4, 5), dtype=torch.bfloat16)
+    projection = linear.QuantizedProjection(source, weight, output, session=session,
+                                            name="projection", activation_mode=requested)
+    assert modes == [expected]
+    assert projection.activation_mode == expected

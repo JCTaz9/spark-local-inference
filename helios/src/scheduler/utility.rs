@@ -53,6 +53,7 @@ pub(super) struct LaneValue {
     pub prefill_token: f64,
     pub output_token: f64,
     pub delivery: f64,
+    pub terminal: f64,
     pub age_price: f64,
     pub age_ms: f64,
     pub reference_delivery_ms: f64,
@@ -71,7 +72,8 @@ impl LaneValue {
 
     pub fn finish(&self, completion_ms: f64, horizon_ms: f64) -> f64 {
         debug_assert!(horizon_ms == 0.0 || completion_ms <= horizon_ms);
-        let mut value = self.decode(0.0, horizon_ms);
+        let mut value = self.terminal
+            + self.age_price * self.reference_delivery_ms * (self.age_ms + horizon_ms);
         if horizon_ms > 0.0 {
             // A terminal delivery stops its age clock before the sequence ends.
             value += self.age_price
@@ -266,7 +268,7 @@ mod tests {
     #[test]
     fn completion_inside_a_sequence_matches_integrated_age_and_continuation() {
         let terminal = LaneValue {
-            delivery: 4.0,
+            terminal: 256.0,
             age_price: 0.2,
             age_ms: 13.0,
             reference_delivery_ms: 41.0,
@@ -284,7 +286,7 @@ mod tests {
         for finish in [1.0, 3.0, 6.0] {
             let value = terminal.finish(finish, total) + continuing.decode(8.0, total);
             let selected = ValueRate::new(6_000_000, value, 0.5).score;
-            let mut reward = 4.0 + 6.0 + 8.0 * 64.0;
+            let mut reward = 256.0 + 6.0 + 8.0 * 64.0;
             let mut potential = 0.0;
             let mut common = 0.0;
             for (lane, until) in [(terminal, finish), (continuing, total)] {

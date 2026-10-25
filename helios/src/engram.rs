@@ -167,6 +167,24 @@ pub(crate) struct Index {
     pub(crate) tables: Vec<Table>,
 }
 
+impl Table {
+    fn staging_payload_bytes(&self, max_tokens: usize) -> Result<usize> {
+        self.planes.iter().try_fold(0usize, |total, plane| total.checked_add(plane.row_bytes))
+            .and_then(|bytes| bytes.checked_mul(self.heads))
+            .and_then(|bytes| bytes.checked_mul(max_tokens))
+            .ok_or_else(|| "embedding staging exceeds host range".into())
+    }
+}
+
+pub(crate) fn staging_bytes(index: &Index, max_tokens: usize) -> Result<u64> {
+    index.tables.iter().try_fold(0u64, |total, table| {
+        let payload = table.staging_payload_bytes(max_tokens)? as u64;
+        payload.checked_add(4).and_then(|bytes| bytes.checked_mul(STAGING_FRAMES as u64))
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| "embedding staging exceeds the memory budget".into())
+    })
+}
+
 struct Staging {
     data: PinnedHost,
     ready: PinnedHost,
@@ -215,21 +233,68 @@ impl Requests {
         }
     }
 }
+const STAGING_FRAMES: usize = 2;
+
 struct Job {
+    frame: usize,
     generation: u32,
     requests: Requests,
 }
+#[derive(Clone, Copy, Default)]
 struct State {
     sequence: u64,
     generation: u32,
+    rows: usize,
     submitted: usize,
     completed: usize,
 }
+impl State {
+    fn prepare(&mut self, rank: usize, sequence: u64, rows: usize, ranks: usize) -> Result<bool> {
+        if sequence == 0 || rank >= ranks {
+            return Err("invalid Engram submission identity".into());
+        }
+        let fresh = self.sequence != sequence;
+        if fresh {
+            if self.sequence > sequence
+                || (self.sequence != 0 && self.completed != (1 << ranks) - 1)
+            {
+                return Err("Engram staging reused before all ranks completed".into());
+            }
+            *self = Self {
+                sequence,
+                generation: self.generation.wrapping_add(1),
+                rows,
+                submitted: 0,
+                completed: 0,
+            };
+        }
+        if self.rows != rows {
+            return Err("ranks submitted different Engram row counts".into());
+        }
+        if self.submitted & (1 << rank) != 0 {
+            return Err("rank submitted Engram generation twice".into());
+        }
+        self.submitted |= 1 << rank;
+        Ok(fresh)
+    }
+
+    fn finish(&mut self, rank: usize, sequence: u64) -> Result<()> {
+        if self.sequence != sequence || self.submitted & (1 << rank) == 0 {
+            return Err("Engram completion does not match its submission".into());
+        }
+        if self.completed & (1 << rank) != 0 {
+            return Err("rank completed Engram generation twice".into());
+        }
+        self.completed |= 1 << rank;
+        Ok(())
+    }
+}
+
 struct Layer {
-    staging: Arc<Staging>,
+    staging: Arc<[Staging; STAGING_FRAMES]>,
     sender: Option<mpsc::SyncSender<Job>>,
     worker: Option<JoinHandle<()>>,
-    state: Mutex<State>,
+    state: Mutex<[State; STAGING_FRAMES]>,
     cancelled: Arc<AtomicBool>,
 }
 impl Drop for Layer {
@@ -253,7 +318,10 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn layout_fixture(index: Index, ranks: usize) -> Arc<Self> {
         Arc::new(Self {
-            index: Arc::new(index), layers: Vec::new(), ranks, max_tokens: 4096,
+            index: Arc::new(index),
+            layers: Vec::new(),
+            ranks,
+            max_tokens: 4096,
             stats: Arc::new(Stats::default()),
         })
     }
@@ -321,19 +389,21 @@ impl Shared {
         let stream = Stream::open(context, device)?;
         let mut layers = Vec::new();
         for (table, mut reader) in index.tables.iter().zip(readers) {
-            let staging_bytes = table
-                .planes
-                .iter()
-                .try_fold(0usize, |total, plane| total.checked_add(plane.row_bytes))
-                .and_then(|n| n.checked_mul(table.heads))
-                .and_then(|n| n.checked_mul(max_tokens))
-                .ok_or("embedding staging exceeds host range")?;
-            let staging = Arc::new(Staging {
-                data: stream.mapped_host_buffer(staging_bytes)?,
-                ready: stream.mapped_host_buffer(4)?,
-                error: Mutex::new(None),
-            });
-            let (sender, receiver) = mpsc::sync_channel::<Job>(1);
+            let staging_bytes = table.staging_payload_bytes(max_tokens)?;
+            let mut staging = Vec::with_capacity(STAGING_FRAMES);
+            for _ in 0..STAGING_FRAMES {
+                staging.push(Staging {
+                    data: stream.mapped_host_buffer(staging_bytes)?,
+                    ready: stream.mapped_host_buffer(4)?,
+                    error: Mutex::new(None),
+                });
+            }
+            let staging: Arc<[Staging; STAGING_FRAMES]> = Arc::new(
+                staging
+                    .try_into()
+                    .map_err(|_| "invalid Engram staging frame count")?,
+            );
+            let (sender, receiver) = mpsc::sync_channel::<Job>(STAGING_FRAMES);
             let buffers = staging.clone();
             let planes = table.planes;
             let row_bytes = planes.iter().map(|p| p.row_bytes).sum::<usize>();
@@ -343,9 +413,9 @@ impl Shared {
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
                     while let Ok(job) = receiver.recv() {
-                        // A single reader owns these bytes. Every rank completes the previous
-                        // consumer graph before another job can reuse them; flag publication
-                        // precedes GPU DMA through the queued stream memory wait.
+                        // Each frame stays owned until every rank retires its consuming graph.
+                        // The reader alone writes its data before publishing the ready flag.
+                        let buffers = &buffers[job.frame];
                         let output = unsafe {
                             std::slice::from_raw_parts_mut(
                                 buffers.data.address() as *mut u8,
@@ -353,6 +423,9 @@ impl Shared {
                             )
                         };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if stop.load(Ordering::Acquire) {
+                                return Err("n-gram request cancelled".into());
+                            }
                             let ids = job.requests.read(&stop)?;
                             reader.gather(&planes, &ids, output)
                         }))
@@ -360,6 +433,7 @@ impl Shared {
                         if let Err(error) = result {
                             output.fill(0);
                             *buffers.error.lock().unwrap() = Some(error);
+                            stop.store(true, Ordering::Release);
                         }
                         // Release failed reads too, so graph shutdown can drain before reporting the error.
                         buffers.signal(job.generation);
@@ -371,12 +445,7 @@ impl Shared {
                 cancelled,
                 sender: Some(sender),
                 worker: Some(worker),
-                state: Mutex::new(State {
-                    sequence: 0,
-                    generation: 0,
-                    submitted: 0,
-                    completed: 0,
-                }),
+                state: Mutex::new(std::array::from_fn(|_| State::default())),
             });
         }
         Ok(Arc::new(Self {
@@ -395,6 +464,22 @@ impl Shared {
     pub(crate) fn cache_bytes(&self) -> u64 {
         self.stats.cache_bytes.load(Ordering::Relaxed)
     }
+    fn validate_start(&self, table: usize, rank: usize, sequence: u64, rows: usize) -> Result<()> {
+        if rows > self.max_tokens * self.index.tables[table].heads {
+            return Err("Engram input exceeds staged capacity".into());
+        }
+        let layer = &self.layers[table];
+        let states = layer.state.lock().unwrap();
+        for staging in layer.staging.iter() {
+            if let Some(error) = staging.error.lock().unwrap().as_ref() {
+                return Err(error.clone());
+            }
+        }
+        let mut state = states[sequence as usize % STAGING_FRAMES];
+        state.prepare(rank, sequence, rows, self.ranks)?;
+        Ok(())
+    }
+
     fn start(
         &self,
         table: usize,
@@ -407,48 +492,37 @@ impl Shared {
             return Err("Engram input exceeds staged capacity".into());
         }
         let layer = &self.layers[table];
-        let mut state = layer.state.lock().unwrap();
-        if let Some(error) = layer.staging.error.lock().unwrap().as_ref() {
-            return Err(error.clone());
-        }
-        if state.sequence != sequence {
-            if state.sequence > sequence
-                || (state.sequence != 0 && state.completed != (1 << self.ranks) - 1)
-            {
-                return Err("Engram staging reused before all ranks completed".into());
+        let mut states = layer.state.lock().unwrap();
+        for staging in layer.staging.iter() {
+            if let Some(error) = staging.error.lock().unwrap().as_ref() {
+                return Err(error.clone());
             }
-            let generation = state.generation.wrapping_add(1);
+        }
+        let frame = sequence as usize % STAGING_FRAMES;
+        let mut state = states[frame];
+        let fresh = state.prepare(rank, sequence, rows, self.ranks)?;
+        if fresh {
             layer
                 .sender
                 .as_ref()
                 .unwrap()
                 .send(Job {
-                    generation,
+                    frame,
+                    generation: state.generation,
                     requests,
                 })
                 .map_err(|_| "Engram reader disconnected")?;
-            *state = State {
-                sequence,
-                generation,
-                submitted: 0,
-                completed: 0,
-            };
         }
-        if state.submitted & (1 << rank) != 0 {
-            return Err("rank submitted Engram generation twice".into());
-        }
-        state.submitted |= 1 << rank;
+        states[frame] = state;
         Ok((rows, state.generation))
     }
     fn finish(&self, rank: usize, sequence: u64) -> Result<()> {
         let mut error = None;
         for layer in &self.layers {
-            let mut state = layer.state.lock().unwrap();
-            if state.sequence != sequence || state.submitted & (1 << rank) == 0 {
-                return Err("Engram completion does not match its submission".into());
-            }
-            state.completed |= 1 << rank;
-            error = error.or_else(|| layer.staging.error.lock().unwrap().clone());
+            let mut states = layer.state.lock().unwrap();
+            let frame = sequence as usize % STAGING_FRAMES;
+            states[frame].finish(rank, sequence)?;
+            error = error.or_else(|| layer.staging[frame].error.lock().unwrap().clone());
         }
         error.map_or(Ok(()), Err)
     }
@@ -469,7 +543,7 @@ impl std::fmt::Debug for Binding {
 }
 struct Transfer {
     stream: Stream,
-    flag: usize,
+    flags: [usize; STAGING_FRAMES],
     weights: usize,
     scales: usize,
     event: usize,
@@ -481,15 +555,27 @@ pub(crate) struct Transfers {
 }
 impl Transfers {
     pub fn new(binding: Binding, manifest: &ExecutionManifest) -> Result<Self> {
-        if let Some(buffer) = manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps") {
+        if let Some(buffer) = manifest
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "readiness_timestamps")
+        {
             if buffer.shape[1] / 3 != binding.shared.index.tables.len() {
-                return Err("readiness interval count differs from the embedding table catalog".into());
+                return Err(
+                    "readiness interval count differs from the embedding table catalog".into(),
+                );
             }
         }
         let mut layers = Vec::new();
         for (i, table) in binding.shared.index.tables.iter().enumerate() {
             let stream = Stream::open(manifest.context, manifest.device)?;
-            let flag = stream.mapped_address(&binding.shared.layers[i].staging.ready)?;
+            let mut flags = [0; STAGING_FRAMES];
+            for (flag, staging) in flags
+                .iter_mut()
+                .zip(binding.shared.layers[i].staging.iter())
+            {
+                *flag = stream.mapped_address(&staging.ready)?;
+            }
             let request = table
                 .request
                 .as_ref()
@@ -501,7 +587,7 @@ impl Transfers {
                 .transpose()?;
             layers.push(Transfer {
                 stream,
-                flag,
+                flags,
                 weights: manifest.buffer(&table.weights)?.address,
                 scales: manifest.buffer(&table.scales)?.address,
                 event: binding.events[i],
@@ -510,6 +596,34 @@ impl Transfers {
         }
         Ok(Self { binding, layers })
     }
+    pub fn validate(&self, sequence: u64, tokens: usize, uploads: &[Upload<'_>]) -> Result<()> {
+        for (i, (transfer, table)) in self
+            .layers
+            .iter()
+            .zip(&self.binding.shared.index.tables)
+            .enumerate()
+        {
+            let rows = if transfer.request.is_some() {
+                tokens
+                    .checked_mul(table.heads)
+                    .ok_or("Engram row count overflow")?
+            } else {
+                let upload = uploads
+                    .iter()
+                    .find(|u| u.buffer == table.hashes)
+                    .ok_or("step lacks n-gram hash IDs")?;
+                if upload.offset != 0 || upload.bytes.len() % (table.heads * 8) != 0 {
+                    return Err("invalid n-gram hash upload".into());
+                }
+                upload.bytes.len() / 8
+            };
+            self.binding
+                .shared
+                .validate_start(i, self.binding.rank, sequence, rows)?;
+        }
+        Ok(())
+    }
+
     pub fn enqueue(
         &self,
         sequence: u64,
@@ -517,6 +631,7 @@ impl Transfers {
         uploads: &[Upload<'_>],
         inputs_ready: &Event,
     ) -> Result<()> {
+        self.validate(sequence, tokens, uploads)?;
         for (i, (transfer, table)) in self
             .layers
             .iter()
@@ -551,12 +666,16 @@ impl Transfers {
                 self.binding
                     .shared
                     .start(i, self.binding.rank, sequence, requests)?;
-            let staging = &self.binding.shared.layers[i].staging;
-            // The host reader may wait for IDs produced by the model graph. Express its input
-            // upload prerequisite to CUDA before an otherwise opaque stream-memory wait.
+            let frame = sequence as usize % STAGING_FRAMES;
+            let staging = &self.binding.shared.layers[i].staging[frame];
+            // The model stream records inputs_ready after the preceding graph, so DMA
+            // cannot overwrite tables still consumed by that graph. Each graph waits for
+            // its host gather before the following graph can overwrite the mailbox.
             transfer.stream.wait(inputs_ready)?;
             unsafe {
-                transfer.stream.wait_value(transfer.flag, generation)?;
+                transfer
+                    .stream
+                    .wait_value(transfer.flags[frame], generation)?;
                 transfer.stream.upload(
                     transfer.weights,
                     &staging.data,
@@ -569,6 +688,7 @@ impl Transfers {
                     rows * table.planes[0].row_bytes,
                     rows * table.planes[1].row_bytes,
                 )?;
+                // The consumer is enqueued before a following submission re-records this event.
                 transfer.stream.record_borrowed(transfer.event)?;
             }
         }
@@ -598,8 +718,83 @@ pub(crate) fn consumes(kind: GraphKind) -> bool {
             | GraphKind::ScoredPrefill
             | GraphKind::Decode
             | GraphKind::Speculative
-            | GraphKind::Verification
-            | GraphKind::PackedSpeculative
             | GraphKind::Mixed
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_budget_covers_two_payloads_and_ready_flags_per_table() {
+        let table = Table {
+            planes: [Plane { file: 0, offset: 0, nbytes: 1024, row_bytes: 64 },
+                Plane { file: 0, offset: 1024, nbytes: 128, row_bytes: 8 }],
+            heads: 4, weights: "weights".into(), scales: "scales".into(),
+            hashes: "hashes".into(), event: "ready".into(), request: None,
+        };
+        let index = Index { tables: vec![table.clone(), table] };
+        assert_eq!(staging_bytes(&index, 128).unwrap(), 2 * 2 * (128 * 4 * (64 + 8) + 4));
+        assert!(staging_bytes(&index, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn two_frames_require_all_rank_retirement_before_reuse() {
+        let mut states: [State; STAGING_FRAMES] = std::array::from_fn(|_| State::default());
+        for sequence in 1..=2 {
+            let state = &mut states[sequence as usize % STAGING_FRAMES];
+            assert!(state.prepare(0, sequence, 24, 2).unwrap());
+            assert!(!state.prepare(1, sequence, 24, 2).unwrap());
+        }
+        let first = &mut states[1];
+        first.finish(0, 1).unwrap();
+        assert!(first.prepare(0, 3, 48, 2).is_err());
+        assert_eq!(first.sequence, 1);
+        first.finish(1, 1).unwrap();
+        assert!(first.prepare(0, 3, 48, 2).unwrap());
+        assert_eq!(first.generation, 2);
+        assert_eq!(first.rows, 48);
+        assert_eq!(states[0].sequence, 2);
+        assert_eq!(states[0].completed, 0);
+    }
+
+    #[test]
+    fn frame_rejects_stale_duplicate_and_mismatched_rank_work() {
+        let mut state = State::default();
+        assert!(state.prepare(0, 0, 24, 2).is_err());
+        assert!(state.prepare(2, 1, 24, 2).is_err());
+        state.prepare(0, 1, 24, 2).unwrap();
+        assert!(state.prepare(0, 1, 24, 2).is_err());
+        assert!(state.prepare(1, 1, 48, 2).is_err());
+        assert!(state.finish(1, 1).is_err());
+        assert!(state.finish(0, 3).is_err());
+        state.prepare(1, 1, 24, 2).unwrap();
+        state.finish(0, 1).unwrap();
+        assert!(state.finish(0, 1).is_err());
+        state.finish(1, 1).unwrap();
+        state.prepare(0, 3, 24, 2).unwrap();
+        assert!(state.prepare(1, 1, 24, 2).is_err());
+    }
+
+    #[test]
+    fn device_request_wait_observes_publication_and_cancellation() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        let request = || Requests::Device {
+            address: ids.as_ptr() as usize,
+            flag: &flag as *const AtomicU64 as usize,
+            sequence: 7,
+            rows: ids.len(),
+        };
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| request().read(&cancelled));
+            flag.store(7, Ordering::Release);
+            assert_eq!(worker.join().unwrap().unwrap(), ids);
+        });
+        flag.store(0, Ordering::Release);
+        cancelled.store(true, Ordering::Release);
+        assert!(request().read(&cancelled).is_err());
+    }
 }

@@ -50,7 +50,6 @@ impl RequestScheduler {
         let mut references = rates.map(|r| r.map(|r| count / r));
         let family = |r: &LiveRequest| match r.phase {
             RequestPhase::Decode if self.speculative_widths.is_empty() => Some(GraphKind::Decode),
-            RequestPhase::Decode if self.retained_proposal(r).is_some() => Some(GraphKind::Verification),
             RequestPhase::Decode => Some(GraphKind::Speculative),
             RequestPhase::Resume => Some(GraphKind::Resume),
             RequestPhase::Snapshot if policy::terminal_cleanup(r) => Some(GraphKind::Snapshot),
@@ -59,7 +58,6 @@ impl RequestScheduler {
         for kind in [
             GraphKind::Decode,
             GraphKind::Speculative,
-            GraphKind::Verification,
             GraphKind::Resume,
             GraphKind::Snapshot,
         ] {
@@ -91,13 +89,13 @@ impl RequestScheduler {
                 .into_iter()
                 .take_while(|b| *b <= self.limits.max_active.next_power_of_two())
             {
-                let widths: &[usize] = if matches!(kind, GraphKind::Speculative | GraphKind::Verification) {
+                let widths: &[usize] = if matches!(kind, GraphKind::Speculative) {
                     &self.speculative_catalog[batch.ilog2() as usize]
                 } else {
                     &[1]
                 };
                 for &width in widths {
-                    if matches!(kind, GraphKind::Speculative | GraphKind::Verification) {
+                    if matches!(kind, GraphKind::Speculative) {
                         let mut eligible = 0;
                         let mut nanos = None;
                         for slot in policy::bits(mask) {
@@ -259,7 +257,8 @@ impl RequestScheduler {
                 .find(|l| l.request == request.handle);
             let (tokens, delivery) = match (submission.kind, lane) {
                 (GraphKind::Prefill | GraphKind::ScoredPrefill, Some(l)) => (l.tokens as f64, 0.0),
-                (GraphKind::Decode, Some(_)) => (1.0, 1.0),
+                (GraphKind::Decode | GraphKind::Speculative, Some(_)) =>
+                    (submission.expected_tokens[request.handle.slot as usize], 1.0),
                 _ => (0.0, 0.0),
             };
             if let (Some(price), Some(rate)) = (&mut service.tokens, participant.token_rate) {

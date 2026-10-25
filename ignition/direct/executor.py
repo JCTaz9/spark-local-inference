@@ -38,14 +38,8 @@ class StepRunner:
         self.device = torch.device("cuda", model.device)
         self.inputs = {name: frozenset((*signature.inputs, *_RESERVED))
                        for name, signature in model.signatures.items()}
-        self.packed = frozenset(name for name, signature in model.signatures.items()
-                                if signature.kind == "packed_speculative")
-        self.proposals = {}
-        for name, signature in model.signatures.items():
-            if signature.kind == "verification" and signature.token_capacity > 1:
-                candidates = [(s.token_capacity, n) for n, s in model.signatures.items()
-                              if s.kind == "proposal" and s.batch_capacity == signature.batch_capacity]
-                self.proposals[name] = max(candidates)[1]
+        self.confidence_graphs = frozenset(name for name, signature in model.signatures.items()
+                                           if signature.confidence_width)
         self.staging = {}
         # Collective runtimes that report transport failures only when asked, after each step.
         health, seen = [], set()
@@ -94,16 +88,8 @@ class StepRunner:
                     raise ValueError(f"graph {name} does not bind input {buffer}")
                 self._upload(buffer, offset, data)
             self._upload("frame_index", 0, struct.pack("<i", step["frame"]))
-            proposal = self.proposals.get(name)
-            self._upload("submission_sequence", 0, struct.pack("<q", step["sequence"] - bool(proposal)),
-                         staging_key="proposal_sequence" if proposal is not None else None)
+            self._upload("submission_sequence", 0, struct.pack("<q", step["sequence"]))
             self.started.record(self.stream)
-            if proposal is not None:
-                if self.eager:
-                    self.model.forwards[proposal]()
-                else:
-                    self.model.graphs[proposal].replay()
-                self._upload("submission_sequence", 0, struct.pack("<q", step["sequence"]))
             if self.eager:
                 self.model.forwards[name]()
             else:
@@ -147,10 +133,10 @@ class RankSteps:
     def records(self, frame):
         return self.runner.records(frame)
 
-    def confidence(self, graph):
-        if graph not in self.runner.proposals and graph not in self.runner.packed:
+    def confidence(self, graph, frame):
+        if graph not in self.runner.confidence_graphs:
             return None
-        return self.runner.model.proposal_confidence.tolist()
+        return self.runner.model.buffers["proposal_confidence"][frame].cpu().tolist()
 
     def stop(self):
         """End every peer's step loop; peers then close their models with this rank."""

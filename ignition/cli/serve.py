@@ -125,19 +125,13 @@ def _check_host_shape(args) -> None:
 
 def export(args) -> int:
     from ignition.preparation.package_snapshot import export_options
-    from .publishing import snapshot_destination, validate_repository
+    from .publishing import validate_repository
     configuration = Configuration.load(args.config)
     _check_host_shape(args)
     model = _resolve_preparation_model(configuration, args)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
         validate_repository(repository)
-    if args.output is None:
-        args.output = snapshot_destination(configuration, repository or model.recipe.name)
-    if args.output.suffix != ".safetensors":
-        args.output = args.output.with_name(args.output.name + ".safetensors")
-    if args.output.exists():
-        raise UsageError(f"export destination already exists: {args.output}")
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
@@ -146,16 +140,16 @@ def export(args) -> int:
         raise UsageError('--no-weights requires an existing blob cache; export or convert a package first')
     with export_options(cache, no_weights=getattr(args, 'no_weights', False)):
         if args.ranks > 1:
-            code = _export_hosts(args, export_path=args.output)
+            code, result = _export_hosts(args)
         else:
-            code = _prepare(args, export_path=args.output)
-    print(f'Exported package: {args.output}')
+            code, result = _prepare(args)
+    print(f'Exported cache entry: {result.entry_path}')
     if repository:
         print(f'Hugging Face target: {repository}')
     return code
 
 
-def _export_hosts(args, *, export_path) -> int:
+def _export_hosts(args):
     """Prepare one rank per host and collect a shared package snapshot on rank zero."""
     import uuid
 
@@ -196,7 +190,8 @@ def _export_hosts(args, *, export_path) -> int:
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
+                   native_dense_activations=args.native_dense_activations)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -225,19 +220,19 @@ def _export_hosts(args, *, export_path) -> int:
                 from ignition.preparation.rebuild_manifest import from_plan
 
                 options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
-                prepared.export(export_path, options=options, export_id=uuid.uuid4().hex, images=recorder,
+                result = prepared.export(None, options=options, export_id=uuid.uuid4().hex, images=recorder,
                                 storage=storage, publisher=_publisher(configuration, args, model, hub_cache),
-                                shard_size=configuration.shard_size(getattr(args, "shard_size", None)),
-                                progress=progress if args.verbose else None)
-                stage.update(f"{export_path} on each of {plan.world_size} hosts")
+                                staging=configuration.directory("export_staging"),
+                                progress=progress)
+                stage.update(f"{result.entry_path} ({plan.world_size} ranks)")
         for region in storage.host_regions:
             region.close()
-        return 0
+        return 0, result
     finally:
         signals.__exit__(None, None, None)
 
 
-def _prepare(args, *, export_path) -> int:
+def _prepare(args):
     from ignition.progress import StartupProgress, phase
 
     class Progress(StartupProgress):
@@ -260,6 +255,7 @@ def _prepare(args, *, export_path) -> int:
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      native_dense_activations=args.native_dense_activations,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -290,7 +286,8 @@ def _prepare(args, *, export_path) -> int:
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
-                     f" · autotune effort {plan.autotune_effort}")
+                     f" · autotune effort {plan.autotune_effort}"
+                     f"{' · native dense activations' if plan.native_dense_activations else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -347,16 +344,15 @@ def _prepare(args, *, export_path) -> int:
                     from ignition.preparation.rebuild_manifest import from_plan
 
                     options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
-                    export_package(prepared, recorder, storage, export_path, options=options, publisher=publisher,
-                                 progress=progress if args.verbose else None, console=progress.console,
-                                 staging=configuration.directory("export_staging"),
-                                 shard_size=configuration.shard_size(getattr(args, "shard_size", None)))
+                    result = export_package(prepared, recorder, storage, None, options=options, publisher=publisher,
+                                 progress=progress, console=progress.console,
+                                 staging=configuration.directory("export_staging"))
                 except Exception as error:
                     if args.verbose:
                         traceback.print_exc()
                     raise PreparationError(f"native package export failed: {error}") from error
-                stage.update(str(export_path))
-            return 0
+                stage.update(str(result.entry_path))
+            return 0, result
     finally:
         signals.__exit__(None, None, None)
 
@@ -444,7 +440,8 @@ def serve(args) -> int:
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
-                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort),
+                   native_dense_activations=args.native_dense_activations)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
@@ -480,7 +477,7 @@ def serve(args) -> int:
             prepared.close()
             raise UsageError("this prepared recipe does not declare packed verification capacities")
         if plan.speculation.draft_prefix_selection == "gpu" and not any(
-                signature.kind == "packed_speculative" for signature in local_model.signatures.values()):
+                signature.kind == "speculative" and signature.confidence_width > 0 for signature in local_model.signatures.values()):
             prepared.close()
             raise UsageError("this prepared recipe does not declare GPU prefix-selection rounds")
     if args.direct:

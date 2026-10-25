@@ -291,3 +291,17 @@ def test_draft_window_group_survives_layer_buffers(monkeypatch):
             value.fill_(42)
     for field in FIELDS:
         assert getattr(shared, field).eq(17).all()
+
+
+def test_deepseek4_ragged_window_staging_uses_request_width():
+    metadata = Metadata.allocate(5, 2, 4, "cpu", max_query_tokens=4)
+    set_metadata(metadata, [127, 255], [4, 1])
+    buffers = GraphBufferPool(torch.device("cpu"))
+    actual = AttentionIndices(metadata, mode="verify", tokens=5, visible=None, buffers=buffers.cursor())
+    assert actual.window_page_size == 132
+    actual()
+    assert actual.window_slots.tolist() == [128, 129, 130, 131, 260]
+    expected = LiteralDeepSeek4WindowIndices(metadata, mode="verify", tokens=5,
+        page_size=132, width=128, visible=None)
+    expected()
+    assert_metadata_equal(actual, expected)

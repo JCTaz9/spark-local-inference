@@ -12,6 +12,7 @@ pub(crate) mod protection;
 pub(crate) mod reachability;
 pub(crate) mod recorder;
 pub(crate) mod source_identity;
+pub(crate) mod weight_payload;
 #[cfg(unix)]
 pub(crate) mod transfer;
 
@@ -173,12 +174,14 @@ pub(crate) struct CaptureRequest {
     #[serde(default)]
     pub transports: Vec<serde_json::Value>,
     pub rebuild_weights: Option<serde_json::Value>,
+    /// Thin semantic weight declaration; resolved against retained allocations.
+    #[serde(default)]
+    pub weight_payload: Option<serde_json::Value>,
     pub package_data: Option<serde_json::Value>,
     #[serde(default)]
     pub options: ExportOptions,
     #[serde(default)]
     pub sources: bool,
-    pub shard_size: u64,
 }
 
 impl CaptureRequest {
@@ -188,6 +191,99 @@ impl CaptureRequest {
             return Err(invalid("local preparation ranks must be positive and fit the rank group"));
         }
         Ok(count)
+    }
+}
+
+/// One declared weight group with its bytes mapped into the rank's logical
+/// payload concatenation. The publisher turns these into initializers.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadGroup {
+    pub name: String,
+    pub storage: String,
+    pub nbytes: u64,
+    #[serde(default)]
+    pub spans: Vec<WeightPayloadSourceSpan>,
+    /// Shared cache object holding these bytes; empty when capture staged a file.
+    #[serde(default)]
+    pub payload_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadSourceSpan {
+    pub allocation: String,
+    pub destination_offset: u64,
+    /// Offset of these bytes in the rank's logical payload concatenation.
+    pub source_offset: u64,
+    pub nbytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadPiece {
+    /// Raw checkpoint tensor byte offset.
+    pub source_offset: u64,
+    /// Retained owner byte offset.
+    pub destination_offset: u64,
+    /// Innermost contiguous byte run.
+    pub contiguous_bytes: u64,
+    pub extents: Vec<u64>,
+    pub source_strides: Vec<u64>,
+    pub destination_strides: Vec<u64>,
+}
+
+/// One logical checkpoint source of a prepared view.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadSource {
+    pub tensor: String,
+    /// One half-open `[begin, end)` range per source axis, in axis order.
+    #[serde(default)]
+    pub ranges: Vec<(u64, u64)>,
+    #[serde(default)]
+    pub concatenation_axis: Option<u32>,
+    /// Affine raw-byte maps. Empty keeps the legacy single-source semantics.
+    #[serde(default)]
+    pub pieces: Vec<WeightPayloadPiece>,
+    /// Empty names raw checkpoint bytes; a nonempty encoding names canonical
+    /// encoded-tile coordinates without executable transform semantics.
+    #[serde(default)]
+    pub piece_encoding: String,
+}
+
+/// One declared view and the semantic group it belongs to.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadView {
+    pub name: String,
+    pub group: String,
+    pub storage: String,
+    #[serde(default)]
+    pub sources: Vec<WeightPayloadSource>,
+    #[serde(default)]
+    pub packing: String,
+    /// Structured packing geometry recorded by the producer, when declared.
+    #[serde(default)]
+    pub packing_parameters: Option<weight_payload::WeightPackingParameters>,
+    #[serde(default)]
+    pub statistics_domain: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct WeightPayloadSources {
+    #[serde(default)]
+    pub groups: Vec<WeightPayloadGroup>,
+    #[serde(default)]
+    pub initial_state: WeightPayloadGroup,
+    /// Semantic group of every declared view, independent of retained coverage.
+    #[serde(default)]
+    pub views: Vec<WeightPayloadView>,
+}
+
+/// Leases for captured cache objects, held from capture through publication and
+/// rank transfer so collection cannot unlink a payload between phases.
+#[derive(Clone, Default)]
+pub(crate) struct PayloadLeases(pub Vec<crate::package::cache::PayloadObject>);
+
+impl std::fmt::Debug for PayloadLeases {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PayloadLeases({})", self.0.len())
     }
 }
 
@@ -203,4 +299,13 @@ pub(crate) struct RankOutput {
     pub external: Vec<(u64, u64)>,
     #[serde(default)]
     pub staging: Option<PathBuf>,
+    /// Stable semantic weight groups resolved against retained byte sources.
+    #[serde(default)]
+    pub weight_payload: Option<WeightPayloadSources>,
+    /// Platform identifier detected from the capture device (gb10, gb202).
+    #[serde(default)]
+    pub hardware: Option<String>,
+    /// Live object leases; serialized rank sources carry none.
+    #[serde(skip)]
+    pub payload_leases: PayloadLeases,
 }

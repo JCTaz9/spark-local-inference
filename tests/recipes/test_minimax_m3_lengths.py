@@ -88,3 +88,33 @@ def test_decoder_layers_share_mutable_cache_lengths(monkeypatch, device, fused):
         torch.testing.assert_close(observed, expected, rtol=0, atol=0)
     if graph is not None:
         graph.reset()
+
+
+def test_attention_binds_declared_query_width_for_ragged_rows(monkeypatch):
+    from ignition.components.paged_batch import Metadata
+
+    metadata = Metadata.allocate(5, 2, 1, "cpu", max_query_tokens=4)
+    source = torch.zeros((5, 8), dtype=torch.bfloat16)
+    scratch = SimpleNamespace(projected=source, query=source, index_query=source,
+        selected=torch.zeros((5, 1), dtype=torch.int32), attended=source, output=source)
+    weights = SimpleNamespace(qkv_index=None, q_norm=None, k_norm=None,
+        index_q_norm=None, index_k_norm=None, output=None)
+    observed = {}
+
+    def indexer(*args, max_q_per_request, **kwargs):
+        observed["index_width"] = max_q_per_request
+        return lambda: None
+
+    def attention(*args, width, **kwargs):
+        observed["attention_width"] = width
+        return lambda: None
+
+    monkeypatch.setattr(module, "projection", lambda *args, **kwargs: lambda source: None)
+    monkeypatch.setattr(module, "PreparedPackedAttention", lambda *args, **kwargs: lambda: None)
+    monkeypatch.setattr(module, "PreparedMSAIndexer", indexer)
+    monkeypatch.setattr(module, "PreparedPagedAttention", attention)
+    module.PreparedAttention(0, weights, SimpleNamespace(text={"rms_norm_eps": 1e-6}), None,
+        source, scratch, metadata, SimpleNamespace(cache=lambda *args: source), mode="verify",
+        inverse_frequency=None, session=None, name="attention", workspace=None,
+        cache_lengths=torch.zeros(2, dtype=torch.int32))
+    assert observed == {"index_width": 4, "attention_width": 4}

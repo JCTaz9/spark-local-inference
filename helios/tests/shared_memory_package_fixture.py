@@ -60,7 +60,8 @@ extern "C" __global__ void shared_requirement(int *out, int bytes) {
     package = RuntimePackage(allocations=[Allocation("output", output.value, 4, initialize="zero")],
         modules={"shared": cubin}, kernels=[Kernel(function.value, "shared", (
             Argument(8, (Relocation(0, Reference("output")),)), Argument(4)))])
-    package.write(root / "package", graphs, publisher=publisher())
+    from fixture_frontend import server_config
+    package.write(root / "package", graphs, publisher=publisher(), server=server_config(root))
     cuda.call("cuCtxDestroy_v2", context)
 
 
