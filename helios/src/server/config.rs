@@ -515,6 +515,16 @@ mod tests {
             native["frontend"]["prompt_encoder"] = selector.into();
             let loaded = Bootstrap::load(&native.to_string(), &manifest).unwrap();
             assert_eq!(loaded.frontend.prompt_encoder(), expected);
+            assert!(loaded.server.api_key.is_none());
+            native["api_key"] = Value::Null;
+            assert!(Bootstrap::load(&native.to_string(), &manifest).err().unwrap()
+                .to_string().contains("api_key must be a string"));
+            native["api_key"] = "".into();
+            assert!(Bootstrap::load(&native.to_string(), &manifest).unwrap().server.api_key.is_none());
+            native["api_key"] = "configured-key".into();
+            assert_eq!(Bootstrap::load(&native.to_string(), &manifest).unwrap().server.api_key.as_deref(),
+                Some("configured-key"));
+            native.as_object_mut().unwrap().remove("api_key");
             for assets in [
                 json!({}),
                 json!({"chat_template":template_asset}),

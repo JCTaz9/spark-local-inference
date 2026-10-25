@@ -15,6 +15,14 @@ class PromptEncoder(IntEnum):
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")
 
 
+def file_asset(path):
+    """Pin frontend file bytes for native validation after model preparation."""
+    path = Path(path).expanduser().resolve()
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return {"path": str(path), "sha256": digest}
+
+
 def annotated_template_asset(source: bytes, annotated: Path):
     """Validate output-preserving message annotations against a checkpoint template."""
     annotated = annotated.resolve()

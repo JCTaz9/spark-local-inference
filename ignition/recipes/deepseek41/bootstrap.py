@@ -28,7 +28,7 @@ from ignition.preparation.collectives import (CollectivePreparation, create_all_
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import virtual_device_memory, release_unused
-from ignition.preparation.frontend import PromptEncoder, prepare_frontend
+from ignition.preparation.frontend import PromptEncoder, file_asset, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
@@ -311,7 +311,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     torch.cuda.set_device(device)
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
-    metadata_path = manifest.metadata_path
+        metadata_path = manifest.metadata_path
+        assets = {"tokenizer": file_asset(metadata_path / "tokenizer.json")}
     with package_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.split_speculation,
@@ -555,8 +556,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    assets = {role: {"path": str(path)}
-        for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name,
         "max_sequence_tokens": config.context, "prefill_chunk_size": config.prefill_chunk_size,

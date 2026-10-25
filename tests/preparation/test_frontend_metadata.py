@@ -6,12 +6,27 @@ import json
 from google.protobuf.json_format import MessageToDict, ParseError
 import pytest
 
-from ignition.preparation.frontend import annotated_template_asset, image_settings, prepare_frontend, tokenizer_settings
+from ignition.preparation.frontend import annotated_template_asset, file_asset, image_settings, prepare_frontend, tokenizer_settings
 from ignition.preparation.package_file import combine, read_index, write_sources
 from ignition.preparation.package_proto import serving
 from ignition.preparation.runtime_package_pb2 import BundleIndex, ModelIndex
 from ignition.recipes import recipes
 from ignition.recipes.declaration import SamplingDefaults, SamplingRange
+
+
+def test_file_asset_pins_bytes_before_preparation_and_resolves_relative_paths(tmp_path, monkeypatch):
+    import hashlib
+
+    monkeypatch.chdir(tmp_path)
+    path = Path("tokenizer.json")
+    path.write_bytes(b"original frontend bytes\x00\xff")
+    asset = file_asset(path)
+    assert asset == {"path": str(path.resolve()),
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    path.write_bytes(b"changed frontend bytes")
+    assert asset["sha256"] != hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(FileNotFoundError):
+        file_asset("missing-tokenizer.json")
 
 
 def test_template_annotations_require_exact_checkpoint_source(tmp_path):

@@ -100,6 +100,40 @@ def test_resident_binding_is_retained_for_diagnostics_and_excluded_from_export(m
         model.prepare_embedding_tables()
 
 
+@pytest.mark.parametrize("configured,options,expected", [
+    ({}, {}, {}),
+    ({"api_key": None}, {}, {}),
+    ({"api_key": "configured-key"}, {"api_key": None}, {}),
+    ({"api_key": None}, {"api_key": "supplied-key"}, {"api_key": "supplied-key"}),
+    ({"api_key": "configured-key"}, {}, {"api_key": "configured-key"}),
+    ({}, {"api_key": ""}, {"api_key": ""}),
+])
+def test_native_server_handoff_omits_only_an_unset_api_key(monkeypatch, configured, options, expected):
+    import json
+    import flare_heliopause
+    import torch
+    from ignition.preparation.model import PreparedModel
+
+    captured = []
+    runtime = object()
+    config = {**configured, "assets": {"tokenizer": {"path": "/tokenizer.json", "sha256": "a" * 64}}}
+    original = json.dumps(config, sort_keys=True)
+    original_options = dict(options)
+    model = _execution(model_class=PreparedModel, server_config=config, memory_report={}, session=None)
+    monkeypatch.setattr(model, "manifest", lambda: {"fixture": "manifest"})
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    def start(owner, manifest, config_json):
+        assert owner is model and manifest == {"fixture": "manifest"}
+        captured.append(json.loads(config_json))
+        return runtime
+    monkeypatch.setattr(flare_heliopause, "Server", start, raising=False)
+    assert model.start_server(options=options) is runtime
+    assert {key: value for key, value in captured[0].items() if key == "api_key"} == expected
+    assert captured[0]["assets"] == config["assets"]
+    assert json.dumps(config, sort_keys=True) == original
+    assert options == original_options
+
+
 def test_resident_tables_reject_an_extension_without_table_registration_before_cuda(monkeypatch):
     import flare_heliopause
     from ignition.preparation.model import PreparedModel

@@ -81,6 +81,8 @@ class PreparedModel(PreparedExecution):
                 self.prepare_embedding_tables()
             config = {**self.server_config, **(options or {}), "bind": bind,
                       "template_defaults": {} if template_defaults is None else template_defaults}
+            if config.get("api_key") is None:
+                config.pop("api_key", None)
             manifest = self.manifest()
             torch.cuda.synchronize(self.device)
             try:
