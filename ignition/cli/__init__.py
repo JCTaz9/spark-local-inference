@@ -41,6 +41,9 @@ def _parser() -> argparse.ArgumentParser:
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
     _preparation_arguments(serving)
+    serving.add_argument("--mtp-verification-token-budget", type=int, metavar="N",
+                         help="prepare one exact packed target-row capacity per batch, capped at batch * (drafts + 1);"
+                              " DeepSeek V4.1 adaptive packed serving only (default: prepare the full catalog)")
     for spanning in (serving, exporting):
         hosts = spanning.add_argument_group("multi-host tensor parallelism")
         hosts.add_argument("--roce-ring", action="store_true",

@@ -110,8 +110,15 @@ class Speculation:
     graph_budget: int | None = None
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
+    verification_token_budget: int | None = None
 
     def __post_init__(self):
+        if self.verification_token_budget is not None:
+            if type(self.verification_token_budget) is not int or self.verification_token_budget < 1:
+                raise ValueError("verification token budget must be a positive integer")
+            if (self.draft_tokens < 1 or not self.adaptive or not self.packed_verification
+                    or self.draft_prefix_selection != "gpu"):
+                raise ValueError("verification token budget requires adaptive packed GPU speculation")
         for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4",))):
             value = getattr(self, f"{head}_head_quantization")
             if value is not None and value not in choices:

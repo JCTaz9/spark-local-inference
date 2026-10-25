@@ -69,7 +69,7 @@ def speculative_shapes(concurrency, widths, token_capacity=None):
                  if width == 1 or batch * width <= capacity)
 
 
-def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_budget=64):
+def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_budget=64, *, verification_token_budget=None):
     """Refine physical row capacities with a bounded, nested packed graph catalog.
 
     Every eligible batch retains its smallest positive draft budget and largest
@@ -77,6 +77,8 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
     gap at its integer geometric midpoint, minimizing the remaining padding ratio.
     Width-one graphs are separate and do not consume this budget. Budgets beyond
     the complete integer capacity range saturate without duplicate graphs.
+    An exact verification-token budget retains only each batch's matching
+    capacity, using the native loader's selection rule and missing-graph checks.
     """
     batches = batch_capacities(concurrency)
     if type(width) is not int or not 2 <= width <= 8:
@@ -107,6 +109,19 @@ def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_bud
         shapes.add((batch, middle))
         interval(batch, lower, middle)
         interval(batch, middle, upper)
+    if verification_token_budget is not None:
+        if type(verification_token_budget) is not int or verification_token_budget < 1:
+            raise ValueError("verification token budget must be a positive integer")
+        shapes = {(batch, tokens) for batch, tokens in shapes
+                  if tokens == min(verification_token_budget, batch * width)}
+        # Match native exact-budget selection; larger batches retain width-one
+        # continuations when the selected row envelope cannot offer drafts.
+        for batch in batches:
+            required = min(verification_token_budget, batch * width)
+            if batch * 2 <= min(capacity, verification_token_budget) and (batch, required) not in shapes:
+                raise ValueError(f"packed catalog lacks exact verification capacity {required} for batch {batch}")
+        if not shapes:
+            raise ValueError("verification token budget leaves no packed graph")
     return tuple(sorted(shapes))
 
 

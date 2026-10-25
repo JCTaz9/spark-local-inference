@@ -16,6 +16,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
         "speculative_graph_budget": speculation.graph_budget,
+        "verification_token_budget": speculation.verification_token_budget,
         "speculative_fixed_width": speculation.fixed_width, "packed_verification": speculation.packed_verification,
         "draft_prefix_selection": speculation.draft_prefix_selection,
         "draft_head_quantization": speculation.draft_head_quantization,

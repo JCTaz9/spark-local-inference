@@ -132,6 +132,14 @@ def stream_overlap(args, model: ResolvedModel) -> bool:
 def speculation(args, model: ResolvedModel, configuration: Configuration | None = None) -> Speculation | None:
     """Apply the command line's speculation overrides to the recipe's settings; None disables speculation."""
     recipe, alias = model.recipe, model.checkpoint.alias
+    verification_budget = getattr(args, "mtp_verification_token_budget", None)
+    if verification_budget is not None:
+        if getattr(args, "command", None) != "serve":
+            raise UsageError("--mtp-verification-token-budget is available only with ignition serve")
+        if recipe.name not in ("deepseek41", "deepseek41-reference-gemv"):
+            raise UsageError("--mtp-verification-token-budget requires DeepSeek V4.1 packed serving")
+        if type(verification_budget) is not int or verification_budget < 1:
+            raise UsageError("--mtp-verification-token-budget must be a positive integer")
     default, limit = recipe.speculation, recipe.max_draft_tokens
     graph_budget = Setting(args.speculative_graph_budget, "flag")
     if configuration is not None:
@@ -143,6 +151,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     given = [flag for flag, value in (
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
+        ("--mtp-verification-token-budget", verification_budget),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
         ("--markov-head-quantization", getattr(args, "markov_head_quantization", None))) if value is not None]
@@ -172,6 +181,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     prefix_selection = default.draft_prefix_selection if drafts else "cpu"
     if packed and not adaptive:
         raise UsageError(f"{alias} requires adaptive verification; --no-mtp-adaptive-verification does not apply")
+    if verification_budget is not None and not (packed and adaptive and prefix_selection == "gpu"):
+        raise UsageError("--mtp-verification-token-budget requires positive adaptive packed GPU speculation")
     if explicit_graph_budget and not (packed and adaptive):
         raise UsageError("--speculative-graph-budget requires packed adaptive learned speculation with positive draft depth")
     budget = graph_budget.value if packed else None
@@ -183,7 +194,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         raise UsageError("draft head quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
-                       draft_head_quantization=draft_head, markov_head_quantization=markov_head)
+                       draft_head_quantization=draft_head, markov_head_quantization=markov_head,
+                       verification_token_budget=verification_budget)
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

@@ -306,6 +306,8 @@ class Plan:
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
                 "markov_head_quantization": self.speculation.markov_head_quantization,
+                **({"verification_token_budget": self.speculation.verification_token_budget}
+                   if self.speculation.verification_token_budget is not None else {}),
                 **({"graph_budget": self.speculation.graph_budget}
                    if self.speculation.graph_budget is not None else {})},
             "context": self.context, "checkpoint_context": self.recipe.context,
@@ -346,6 +348,9 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
     if speculation is not None:
+        if (speculation.verification_token_budget is not None
+                and recipe.name not in ("deepseek41", "deepseek41-reference-gemv")):
+            raise UsageError("--mtp-verification-token-budget requires DeepSeek V4.1 packed serving")
         for head in ("draft", "markov"):
             value = getattr(speculation, f"{head}_head_quantization")
             if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):
@@ -363,9 +368,11 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
 
         try:
             packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
-                                      speculation.token_capacity, speculation.graph_budget)
+                                      speculation.token_capacity, speculation.graph_budget,
+                                      verification_token_budget=speculation.verification_token_budget)
         except ValueError as error:
-            raise UsageError(f"--speculative-graph-budget: {error}") from error
+            flag = "--mtp-verification-token-budget" if speculation.verification_token_budget is not None else "--speculative-graph-budget"
+            raise UsageError(f"{flag}: {error}") from error
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,

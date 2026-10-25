@@ -77,3 +77,13 @@ def test_budget_must_cover_mandatory_endpoints(budget):
 def test_logical_width_is_a_supported_positive_draft_block(width):
     with pytest.raises(ValueError, match="width"):
         packed_speculative_shapes(32, width)
+
+
+def test_exact_budget_selects_native_row_capacity_and_rejects_missing_graphs():
+    for concurrency in (1, 4, 8):
+        catalog = packed_speculative_shapes(concurrency, 8, 64, 1000)
+        for budget in (8, 16, 24):
+            selected = packed_speculative_shapes(concurrency, 8, 64, 1000, verification_token_budget=budget)
+            assert selected == tuple((b, p) for b, p in catalog if p == min(budget, b * 8))
+    with pytest.raises(ValueError, match="exact verification capacity 3"):
+        packed_speculative_shapes(1, 8, 8, 2, verification_token_budget=3)

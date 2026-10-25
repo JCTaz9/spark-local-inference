@@ -89,6 +89,7 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
     speculative_graph_budget: int = 64
+    verification_token_budget: int | None = None
     # Overlap shared and routed experts within each eligible text graph.
     stream_overlap: bool = True
     expert_scale_compression: str | None = None
@@ -135,6 +136,8 @@ class PreparationConfig:
                 raise ValueError("DeepSeek V4.1 DSpark requires adaptive packed GPU rounds")
         elif self.split_speculation or self.packed_verification or self.draft_prefix_selection != "cpu" or self.speculation_reference_graphs:
             raise ValueError("packed GPU speculation requires positive DSpark draft depth")
+        if self.verification_token_budget is not None and not drafting:
+            raise ValueError("verification token budget requires positive DSpark draft depth")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
@@ -189,7 +192,8 @@ class PreparationConfig:
         from ignition.components.capacity import packed_speculative_shapes
 
         return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
-            self.speculative_token_capacity, self.speculative_graph_budget) if self.draft_tokens else ()
+            self.speculative_token_capacity, self.speculative_graph_budget,
+            verification_token_budget=self.verification_token_budget) if self.draft_tokens else ()
 
     @property
     def decode_tokens(self):
@@ -588,11 +592,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     memory["split_speculation"] = config.split_speculation
     memory["draft_prefix_selection"] = config.draft_prefix_selection
     if config.dspark:
+        token_capacity = speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity)
+        if config.verification_token_budget is not None:
+            token_capacity = min(token_capacity, config.verification_token_budget)
         server_config.update(speculative_widths=config.speculative_widths,
-            speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
+            speculative_token_capacity=token_capacity,
             speculative_fixed_width=config.speculative_fixed_width)
         memory.update(speculative_shapes=config.speculative_shapes,
             packed_speculative_shapes=config.packed_speculative_shapes,
+            verification_token_budget=config.verification_token_budget,
             speculative_graph_budget=config.speculative_graph_budget,
             packed_speculative_graphs=len(config.packed_speculative_shapes))
     disposable = [activation_buffers, arena.tensor, metadata, tables.buffers(), graph_buffers]

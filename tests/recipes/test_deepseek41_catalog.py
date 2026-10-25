@@ -120,6 +120,16 @@ def test_default_catalog_contains_only_packed_rounds_and_width_one_continuations
     assert storage.depth == 5
 
 
+def test_exact_eight_row_catalog_keeps_seven_drafts_and_width_one_continuation(register_catalog):
+    config = PreparationConfig(max_active=1, speculative_widths=tuple(range(1, 9)),
+        speculative_token_capacity=8, verification_token_budget=8, prefill_chunk_size=4096)
+    records, _, storage, constructed, _ = register_catalog(config)
+    assert [(s.kind, s.token_capacity, s.packed_token_capacity, s.draft_tokens) for _, _, s in records] == [
+        ("speculative", 1, 0, None), ("packed_speculative", 8, 8, 7)]
+    assert storage.depth == 7
+    assert [p.width for p in constructed if p.options.get("proposal_only")] == [8]
+
+
 def test_small_physical_budget_keeps_every_width_one_batch(register_catalog):
     records, _, _, constructed, _ = register_catalog(PreparationConfig(speculative_token_capacity=6))
     packed = [s for _, _, s in records if s.kind == "packed_speculative"]

@@ -402,6 +402,23 @@ With four serving GPUs, run:
   --speculative-token-capacity 128 --host 0.0.0.0 --port 8001 --verbose
 ```
 
+For a fixed physical target-row budget, `ignition serve` accepts
+`--mtp-verification-token-budget N` for DeepSeek V4.1. It selects one packed
+capacity per batch before capture, capped at `batch * (drafts + 1)`, and retains
+width-one continuations. Omission prepares the complete configured catalog.
+Use this flag for comparisons at a fixed row budget; it keeps adaptive packed
+proposal selection and cannot accompany `--no-mtp-adaptive-verification`.
+The export command rejects this serve-only setting. For one request, seven
+drafts, and an eight-row target graph:
+
+```sh
+.venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --max-concurrency 1 --mtp-draft-tokens 7 --mtp-verification-token-budget 8 \
+  --speculative-token-capacity 8 --prefill-chunk-size 4096 \
+  --autotune-effort medium --mla-compute-mode bf16 \
+  --host 127.0.0.1 --port 8001 --verbose
+```
+
 The command prepares and captures graphs, loads the RAM tables once, and starts
 Helios directly. It does not write or reload a runtime package. The extension
 build above is required once; model edits reuse cached kernel and forward
