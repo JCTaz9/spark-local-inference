@@ -31,6 +31,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, max_active=plan.concurrency, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
+        kv_pages=plan.development_kv_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
         dspark=speculation is not None,

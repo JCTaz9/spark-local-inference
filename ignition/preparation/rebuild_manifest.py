@@ -205,6 +205,8 @@ def _members(value):
 
 
 def from_plan(model, plan, *, compiled_forwards):
+    if plan.development_context_tokens is not None:
+        raise ValueError("serve-only development context backing cannot be exported")
     if plan.speculation is not None and plan.speculation.verification_token_budget is not None:
         raise ValueError("serve-only verification token budgets cannot be exported")
     from .source_identity import source_identity

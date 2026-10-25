@@ -192,6 +192,36 @@ class Plan:
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
 
+    # Physical KV backing for in-process DeepSeek V4.1 serving, independent of graph shapes.
+    development_context_tokens: int | None = None
+
+    def __post_init__(self):
+        if self.development_context_tokens is not None:
+            self.development_kv_pages
+
+    @property
+    def development_kv_pages(self) -> int | None:
+        tokens = self.development_context_tokens
+        if tokens is None:
+            return None
+        setting = "development context backing"
+        if self.recipe.name not in ("deepseek41", "deepseek41-reference-gemv"):
+            raise UsageError(f"{setting} supports only DeepSeek V4.1 development serving")
+        if type(tokens) is not int or tokens <= 0:
+            raise UsageError(f"{setting} must be a positive integer")
+        pages = (tokens + self.page_tokens - 1) // self.page_tokens
+        from ignition.components.capacity import request_capacity
+
+        warmup_pages = ((self.prefill_chunk + self.page_tokens - 1) // self.page_tokens
+                        + 2 * request_capacity(self.concurrency))
+        minimum = max(self.minimum_pages, warmup_pages)
+        if pages < minimum:
+            raise UsageError(f"{setting} needs at least {minimum * self.page_tokens} tokens"
+                             " for request capacity and preparation warmup")
+        if pages > self.pages or pages * self.page_tokens > self.context:
+            raise UsageError(f"{setting} exceeds the planned memory or {self.context}-token context")
+        return pages
+
     @property
     def world_size(self) -> int:
         return len(self.gpus)
@@ -299,6 +329,8 @@ class Plan:
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
             "native_dense_activations": self.native_dense_activations,
+            "development_context_tokens": self.development_context_tokens,
+            "development_kv_pages": self.development_kv_pages,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,

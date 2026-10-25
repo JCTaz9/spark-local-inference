@@ -441,7 +441,9 @@ def serve(args) -> int:
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   native_dense_activations=args.native_dense_activations)
+                   native_dense_activations=args.native_dense_activations,
+                   development_context_tokens=plan.context if plan.recipe.name in
+                       ("deepseek41", "deepseek41-reference-gemv") else None)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus

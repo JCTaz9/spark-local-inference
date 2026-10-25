@@ -363,9 +363,10 @@ Helios in the same process. It requires a cached checkpoint and a Heliopause
 build with the `qualification` feature. Requests execute in Rust without Python
 callbacks. This command skips package export and reload; weight loading, kernel
 tuning, compilation of missing forwards, and graph capture still run.
-Diagnostics retain the bounded cache backing allocated during preparation.
-Use an exported package for long-context capacity tests; native package loading
-sizes the serving cache from the memory available after loading the model.
+DeepSeek V4.1 backs its full planned single-request context for development
+serving. Other recipes retain the smaller preparation working set; use exported
+packages for their long-context capacity tests. Native package loading sizes the
+serving cache from the memory available after loading the model.
 
 Select idle serving GPUs explicitly. Tensor-parallel preparation distributes
 forward compilation across the ranks within their memory budgets. Compiler
@@ -401,13 +402,14 @@ immutable resident storage. Requests gather rows from RAM without reading the
 checkpoint files or calling Python. Each rank owns its delivery staging and CUDA
 events. This development path supports ranks on one host and uses RAM only.
 
-With four serving GPUs, run:
-
-```sh
-.venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3 \
-  --max-concurrency 32 --mtp-draft-tokens 5 --prefill-chunk-size 4096 \
-  --speculative-token-capacity 128 --host 0.0.0.0 --port 8001 --verbose
-```
+DeepSeek V4.1 development serving backs a shared KV pool large enough for the
+plan's full single-request context, independently of the prefill chunk and
+concurrency. When memory permits the checkpoint's 1,048,576-token context, this
+backs 8,192 pages; active requests and cached prefixes share that pool. Requests
+can span the full planned context while processing prompts in 4,096-token
+prefill steps. Startup prints the selected token and page capacities. Export
+preparation retains its smaller warmup allocation, and native package loading
+sizes its serving pool.
 
 For a fixed physical target-row budget, `ignition serve` accepts
 `--mtp-verification-token-budget N` for DeepSeek V4.1. It selects one packed
@@ -416,13 +418,15 @@ width-one continuations. Omission prepares the complete configured catalog.
 Use this flag for comparisons at a fixed row budget; it keeps adaptive packed
 proposal selection and cannot accompany `--no-mtp-adaptive-verification`.
 The export command rejects this serve-only setting. For one request, seven
-drafts, and an eight-row target graph:
+drafts, an eight-row target graph, reference FP8 attention projections, BF16 MLA,
+and an MXFP8 draft head, use:
 
 ```sh
 .venv/bin/ignition serve deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 1 --mtp-draft-tokens 7 --mtp-verification-token-budget 8 \
   --speculative-token-capacity 8 --prefill-chunk-size 4096 \
-  --autotune-effort medium --mla-compute-mode bf16 \
+  --draft-head-quantization mxfp8 --attention-projection-policy reference-gemv \
+  --mla-compute-mode bf16 --autotune-effort medium \
   --host 127.0.0.1 --port 8001 --verbose
 ```
 
