@@ -27,6 +27,19 @@ _COLLECTIVES_PER_JOB = 96
 _REQUESTS_PER_JOB = 192
 
 
+def _prepare_compiler_toolchain():
+    """Resolve forward math libraries before native program identities are recorded."""
+    from torch._inductor import config
+    from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
+
+    from .compilation import _OPTIONS
+
+    # Inductor selects the CUDA toolkit's libdevice for eager precision. Native
+    # discovery and later materialization must see that same library identity.
+    with config.patch(emulate_precision_casts=_OPTIONS["emulate_precision_casts"]):
+        _set_triton_libdevice_path()
+
+
 def with_autotune_effort(prepare):
     """Apply the preparation config's effort throughout bootstrap declarations."""
     @wraps(prepare)
@@ -65,6 +78,7 @@ class RecordedPreparationSession(PreparationSession):
                         numerical_policy=numerical_policy)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
+        _prepare_compiler_toolchain()
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
                              namespace=identity, race_budget=race_budget, prime=False,
@@ -476,6 +490,7 @@ def declare(session, requests, *, coordinator=None):
     if isinstance(session, RecordedPreparationSession):
         session.declare(requests, coordinator=coordinator)
     else:
+        _prepare_compiler_toolchain()
         options = {} if coordinator is None else {"coordinator": coordinator}
         session.prepare(requests, **options)
 
