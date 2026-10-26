@@ -6,7 +6,7 @@ import torch
 
 from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
-from ignition.components.vocabulary import nvfp4_draft_head
+from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 
 from .config import ModelConfig
 
@@ -79,6 +79,8 @@ class ModelWeights:
             if draft is not None:
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
+                elif draft_head_quantization == "mxfp8":
+                    draft = replace(draft, draft_head=mxfp8_draft_head(head))
                 if markov_head_quantization == "nvfp4":
                     draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
             vision = ({name: loader.load_tensor(name) for name in loader._sources

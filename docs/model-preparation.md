@@ -512,6 +512,24 @@ it cannot change an existing package at serving time. The same options apply to
 the DeepSeek V4 Flash recipe. Quantization changes proposal probabilities and can
 change acceptance and throughput; measure both separately and together.
 
+DeepSeek V4.1 also accepts `--draft-head-quantization mxfp8` for an E4M3
+proposal head with one power-of-two scale per 32 weights. The recommended
+default is checkpoint precision: omit `--draft-head-quantization` to select it.
+Use `--draft-head-quantization mxfp8` when reducing draft projection bandwidth
+is useful while retaining BF16 activations, target checkpoint weight storage,
+and the checkpoint Markov projection. It retains a separate quantized copy in
+addition to the target weights, using more GPU memory. The initial weight
+estimate excludes the extra copy;
+preparation reports the actual allocation and sizes cache backing after loading.
+It changes the proposal distribution and seeded text;
+verification must use the actual proposal probabilities. Rebuild the package
+when changing this preparation option.
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --draft-head-quantization mxfp8
+```
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

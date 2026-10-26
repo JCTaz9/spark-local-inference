@@ -41,6 +41,19 @@ def test_draft_precision_preserves_graph_capacities(draft, markov):
                 configuration(dspark=False, draft_head_quantization=draft, markov_head_quantization=markov)
 
 
+def test_mxfp8_draft_head_preserves_deepseek41_capacities_and_markov_precision():
+    from dataclasses import replace
+    from ignition.recipes.deepseek4.bootstrap import PreparationConfig as V4Config
+
+    control = PreparationConfig(max_active=16)
+    candidate = replace(control, draft_head_quantization="mxfp8")
+    assert candidate.speculative_shapes == control.speculative_shapes
+    assert candidate.prefill_capacities == control.prefill_capacities
+    assert candidate.markov_head_quantization is None
+    with pytest.raises(ValueError, match="DeepSeek V4 draft head"):
+        V4Config(draft_head_quantization="mxfp8")
+
+
 @pytest.mark.parametrize("width", range(1, 9))
 def test_explicit_draft_limit_sizes_the_parallel_block(width):
     config = PreparationConfig(max_active=4, speculative_widths=tuple(range(1, width + 1)))

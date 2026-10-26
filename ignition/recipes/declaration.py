@@ -113,9 +113,10 @@ class Speculation:
     markov_head_quantization: str | None = None
 
     def __post_init__(self):
-        for value in (self.draft_head_quantization, self.markov_head_quantization):
-            if value not in (None, "nvfp4"):
-                raise ValueError("draft head quantization must be omitted or nvfp4")
+        for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4",))):
+            value = getattr(self, f"{head}_head_quantization")
+            if value is not None and value not in choices:
+                raise ValueError(f"{head} head quantization must be omitted or one of: {', '.join(choices)}")
             if value is not None and self.draft_tokens < 1:
                 raise ValueError("draft head quantization requires positive learned draft depth")
         if self.graph_budget is not None:

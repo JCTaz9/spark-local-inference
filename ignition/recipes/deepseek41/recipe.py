@@ -44,7 +44,7 @@ def usage(prepared):
 RECIPE = Recipe(
     name="deepseek41", served_model_name="DeepSeek-V4.1-Flash", prepare=prepare, usage=usage,
     mla_compute_modes=("auto", "bf16"), mla_compute_mode="bf16", expert_scale_compression="csf",
-    draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",),
+    draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4",),
     # Recommended sampling: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference.
     sampling_defaults=SamplingDefaults(temperature=1., top_p=1., top_k=-1),
     checkpoints=(Checkpoint(alias="deepseek-v4.1-flash", repository="deepseek-ai/DeepSeek-V4.1-Flash-1017",

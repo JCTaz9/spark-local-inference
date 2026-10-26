@@ -89,3 +89,28 @@ def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 8192):
         scales[start:start + rows_per_chunk] = scale.view(-1, columns // 16)
     return pack_weight(values, swizzle_block_scale(scales), recipe="nvfp4",
                        global_scale=(1.0 / global_scale).reshape(1).float(), global_scale_kind="multiplier")
+
+
+@torch.no_grad()
+def mxfp8_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 1024):
+    """Prepare an MXFP8 proposal head while retaining the BF16 target weights.
+
+    Each 32-value input block uses E4M3 values and a power-of-two scale rounded
+    upward from its maximum magnitude. Chunking bounds conversion storage.
+    """
+    from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
+    from b12x.gemm.blockscaled import pack_weight
+
+    if (weight.ndim != 2 or weight.dtype != torch.bfloat16 or not weight.is_contiguous()
+            or weight.shape[0] % 64 or weight.shape[1] % 128):
+        raise ValueError("MXFP8 draft head requires contiguous BF16 storage with 64-aligned rows and 128-aligned columns")
+    if rows_per_chunk < 1:
+        raise ValueError("MXFP8 draft head conversion requires a positive chunk size")
+    rows, columns = weight.shape
+    values = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((rows, columns // 32), dtype=torch.uint8, device=weight.device)
+    for start in range(0, rows, rows_per_chunk):
+        block = quantize_mxfp8_rows_torch(weight[start:start + rows_per_chunk])
+        values[start:start + rows_per_chunk].copy_(block.values)
+        scales[start:start + rows_per_chunk].copy_(block.scale_rows.view(torch.uint8).reshape(-1, columns // 32))
+    return pack_weight(values, scales, recipe="mxfp8")

@@ -85,7 +85,7 @@ def test_pages_take_all_remaining_supply():
     assert whole.supply_bytes - whole.page_bytes - whole.fixed_bytes < 2 * MIB
 
 
-@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"), ("nvfp4", "nvfp4")])
+@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"), ("nvfp4", "nvfp4"), ("mxfp8", None)])
 def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypatch):
     from types import SimpleNamespace
     from ignition.cli import display
@@ -94,13 +94,13 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
     # Source identity needs the native export extension; the record's precision keys do not.
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
 
-    model = replace(SOLO, draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",))
+    model = replace(SOLO, draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4",))
     spec = replace(DRAFTING, draft_head_quantization=draft, markov_head_quantization=markov)
     result = derive(model=model, speculation=spec)
     assert result.to_dict()["speculation"]["draft_head_quantization"] == draft
     assert result.to_dict()["speculation"]["markov_head_quantization"] == markov
     summary = display.speculation(spec)
-    assert ("draft head NVFP4" in summary) == bool(draft)
+    assert (f"draft head {(draft or '').upper()}" in summary) == bool(draft)
     assert ("markov head NVFP4" in summary) == bool(markov)
     from google.protobuf import json_format
     from ignition.preparation import runtime_package_pb2 as proto
