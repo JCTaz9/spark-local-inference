@@ -309,6 +309,63 @@ fn section_identities(text: &str, title: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
+fn plain_section<'a>(text: &'a str, title: &str) -> &'a str {
+    text.trim()
+        .split("\n\n")
+        .find(|section| section.lines().next() == Some(title))
+        .unwrap_or_else(|| panic!("missing section {title}:\n{text}"))
+}
+
+fn assert_plain_row(section: &str, key: &str, value: &str) {
+    let expected = format!("{key} {value}");
+    assert!(
+        section
+            .lines()
+            .any(|line| { line.split_whitespace().collect::<Vec<_>>().join(" ") == expected }),
+        "missing row {expected}:\n{section}"
+    );
+}
+
+fn assert_plain_graph(text: &str, deployment: &str, rank: usize) {
+    let graph = plain_section(
+        text,
+        &format!("Graphs · rank {rank} · deployment {deployment}"),
+    );
+    assert_plain_row(graph, "Graph", "decode");
+    assert_plain_row(graph, "Nodes / edges", "3 / 2");
+    assert_plain_row(graph, "Kind / sampling", "decode / sample");
+    assert_plain_row(graph, "Batch / tokens", "1 / 1");
+    assert_plain_row(graph, "Duration", "1 µs");
+}
+
+fn assert_plain_memory(text: &str, deployment: &str, rank: usize) {
+    let memory = plain_section(
+        text,
+        &format!("Memory map · rank {rank} · deployment {deployment}"),
+    );
+    assert_plain_row(memory, "device-0", "128 B");
+    assert_plain_row(memory, "Reservation", "8192 · 4 KiB");
+    assert_plain_row(memory, "Buffer", "input");
+    assert_plain_row(memory, "Allocation / offset", "device-0 / 0");
+    assert_plain_row(memory, "Initializer", "device-0 + 0");
+    assert_plain_row(memory, "Offset / size", "0 / 128 B");
+    let tensor_parallel = deployment.strip_prefix("sm120-tp").unwrap();
+    let weights = [
+        b"payload weights".repeat(8),
+        format!("tp{tensor_parallel}rank{rank}").into_bytes(),
+    ]
+    .concat();
+    let payload = PayloadId::of(&weights);
+    // Payload identifiers can wrap across aligned continuation rows.
+    assert!(
+        memory
+            .split_whitespace()
+            .collect::<String>()
+            .contains(&format!("Payload{payload}")),
+        "{memory}"
+    );
+}
+
 fn companion_files(root: &Path) -> Vec<PathBuf> {
     let metadata = reader::Metadata::open(root).unwrap();
     metadata
@@ -557,19 +614,14 @@ fn unverified_payload_plain_renders_capacities_and_real_detail_names() {
         String::from_utf8_lossy(&default.stderr)
     );
     let text = String::from_utf8(default.stdout).unwrap();
-    assert!(text.contains("payload (unverified)"), "{text}");
-    assert!(text.contains("unverified-test"), "{text}");
-    let context = text
-        .lines()
-        .find(|line| line.contains("context"))
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!(context.contains("32 tokens"), "{text}");
-    assert!(!context.contains("tokens tokens"), "{text}");
-    assert!(
-        text.lines()
-            .any(|line| line.contains("concurrency") && line.contains("7 requests")),
-        "{text}"
-    );
+    let summary = plain_section(&text, "unverified/model");
+    assert_plain_row(summary, "Format", "payload");
+    assert_plain_row(summary, "Signatures", "unverified");
+    assert_plain_row(summary, "Publisher", "unverified-test");
+    let deployment = plain_section(&text, "Deployment sm120-tp2");
+    assert_plain_row(deployment, "Context", "32 tokens");
+    assert_plain_row(deployment, "Concurrency", "7 requests");
+    assert!(!deployment.contains("tokens tokens"), "{text}");
     assert!(!text.contains("Graphs ·"), "{text}");
     assert!(!text.contains("Memory map"), "{text}");
 
@@ -586,12 +638,9 @@ fn unverified_payload_plain_renders_capacities_and_real_detail_names() {
         BTreeSet::from([("sm120-tp2".to_owned(), 0), ("sm120-tp2".to_owned(), 1),]),
         "{text}"
     );
-    assert!(
-        text.lines()
-            .any(|line| line.contains("decode") && line.contains("nodes 3 edges 2")),
-        "{text}"
-    );
-    assert!(text.contains("duration 1234 ns"), "{text}");
+    for rank in 0..2 {
+        assert_plain_graph(&text, "sm120-tp2", rank);
+    }
 
     let memory = flare(&["inspect", path, "--unverified", "--plain", "--memory-map"]);
     assert!(
@@ -606,18 +655,9 @@ fn unverified_payload_plain_renders_capacities_and_real_detail_names() {
         BTreeSet::from([("sm120-tp2".to_owned(), 0), ("sm120-tp2".to_owned(), 1),]),
         "{text}"
     );
-    let allocation = text
-        .lines()
-        .find(|line| line.contains("device-0"))
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!(!allocation.contains("0 B virtual"), "{allocation}");
-    assert!(!allocation.contains("0 B stored"), "{allocation}");
-    assert!(
-        text.contains("reservation address 8192 nbytes 4096"),
-        "{text}"
-    );
-    assert!(text.contains("buffer input allocation device-0"), "{text}");
-    assert!(text.contains("initializer allocation device-0"), "{text}");
+    for rank in 0..2 {
+        assert_plain_memory(&text, "sm120-tp2", rank);
+    }
 
     let frontend = flare(&["inspect", path, "--unverified", "--plain", "--frontend"]);
     assert!(
@@ -739,18 +779,18 @@ fn unverified_payload_multi_deployment_capacities_and_details_are_qualified() {
         String::from_utf8_lossy(&summary.stderr)
     );
     let text = String::from_utf8(summary.stdout).unwrap();
-    let tp2_line = text
-        .lines()
-        .find(|line| line.contains("sm120-tp2"))
-        .unwrap_or_else(|| panic!("{text}"));
-    let tp4_line = text
-        .lines()
-        .find(|line| line.contains("sm120-tp4"))
-        .unwrap_or_else(|| panic!("{text}"));
-    assert!(tp2_line.contains("32 tokens"), "{text}");
-    assert!(tp2_line.contains("7 requests"), "{text}");
-    assert!(tp4_line.contains("64 tokens"), "{text}");
-    assert!(tp4_line.contains("9 requests"), "{text}");
+    let model = plain_section(&text, "unverified/model");
+    assert_plain_row(model, "Format", "payload");
+    assert_plain_row(model, "Signatures", "unverified");
+    for (deployment, context, prefill, concurrency) in [
+        ("sm120-tp2", "32 tokens", "4 tokens", "7 requests"),
+        ("sm120-tp4", "64 tokens", "8 tokens", "9 requests"),
+    ] {
+        let section = plain_section(&text, &format!("Deployment {deployment}"));
+        assert_plain_row(section, "Context", context);
+        assert_plain_row(section, "Prefill", prefill);
+        assert_plain_row(section, "Concurrency", concurrency);
+    }
 
     let details = flare(&[
         "inspect",
@@ -783,17 +823,10 @@ fn unverified_payload_multi_deployment_capacities_and_details_are_qualified() {
             .collect::<BTreeSet<_>>();
         assert_eq!(identified, expected, "{title}: {text}");
     }
-    assert!(
-        text.lines()
-            .any(|line| line.contains("decode") && line.contains("nodes 3 edges 2")),
-        "{text}"
-    );
-    assert!(text.contains("duration 1234 ns"), "{text}");
-    assert!(
-        text.lines()
-            .any(|line| line.contains("allocation device-0") && line.contains("128 bytes")),
-        "{text}"
-    );
+    for (deployment, rank) in expected {
+        assert_plain_graph(&text, &deployment, rank);
+        assert_plain_memory(&text, &deployment, rank);
+    }
 }
 
 #[test]
