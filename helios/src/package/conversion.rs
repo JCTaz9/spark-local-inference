@@ -3206,12 +3206,32 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
         package.payloads.clear();
         package.deployments.clear();
         if let Some(target) = request.target_publisher {
+            // The license describes the checkpoint, not the publisher. A promoted
+            // package keeps the source license unless the target names another.
+            let (source_license_name, source_license_link) = package
+                .publisher
+                .as_ref()
+                .map(|publisher| {
+                    (
+                        publisher.license_name.clone(),
+                        publisher.license_link.clone(),
+                    )
+                })
+                .unwrap_or_default();
             package.publisher = Some(wire::PublisherMetadata {
                 namespace: target.namespace.clone(),
                 official_source: target.official_source.clone(),
                 development: target.development,
-                license_name: target.license_name.clone(),
-                license_link: target.license_link.clone(),
+                license_name: if target.license_name.is_empty() {
+                    source_license_name
+                } else {
+                    target.license_name.clone()
+                },
+                license_link: if target.license_link.is_empty() {
+                    source_license_link
+                } else {
+                    target.license_link.clone()
+                },
                 ranks: 0,
             });
         }
@@ -5049,6 +5069,7 @@ mod tests {
                 namespace: publisher.namespace.clone(),
                 official_source: "https://huggingface.co/example/model".into(),
                 license_name: "Example".into(),
+                license_link: "https://huggingface.co/example/model/LICENSE".into(),
                 ..Default::default()
             }),
             frontend: Some(Default::default()),
@@ -7492,6 +7513,61 @@ mod tests {
             )
             .unwrap();
         payloads.verify().unwrap();
+    }
+
+    #[test]
+    fn promotion_inherits_the_source_license_when_the_target_omits_it() {
+        let scratch = Scratch::new("license-inherit");
+        let rng = SystemRandom::new();
+        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let publisher = Publisher {
+            name: "Example".into(),
+            namespace: "example".into(),
+            public_key,
+            development: false,
+        };
+        let matrix: Vec<u8> = (10..18).collect();
+        let full: Vec<u8> = (0..8).collect();
+        let source = publish_source(
+            &scratch,
+            "license-source",
+            1,
+            &[full.as_slice()],
+            &[matrix.as_slice()],
+            &key,
+            &publisher,
+            "model",
+            false,
+        );
+        let output = scratch.join("license-promoted");
+        let target = TargetPublisher {
+            namespace: "example".into(),
+            official_source: "https://huggingface.co/example/other".into(),
+            development: false,
+            license_name: String::new(),
+            license_link: String::new(),
+        };
+        promote(
+            &source,
+            &output,
+            std::slice::from_ref(&publisher),
+            "example",
+            "example",
+            Some(&target),
+            &key,
+        )
+        .unwrap();
+        let metadata = Metadata::open(&output).unwrap();
+        let envelope = protect::envelope(&metadata.envelope).unwrap();
+        let package = wire::PackageBody::decode(envelope.package_body.as_slice()).unwrap();
+        let publisher = package.publisher.unwrap();
+        assert_eq!(publisher.license_name, "Example");
+        assert_eq!(
+            publisher.license_link,
+            "https://huggingface.co/example/model/LICENSE"
+        );
     }
 
     #[test]

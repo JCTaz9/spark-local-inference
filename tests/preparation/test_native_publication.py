@@ -86,6 +86,29 @@ def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
     assert after_deployment.rebuild.SerializeToString(deterministic=True) == index.rebuild.SerializeToString(deterministic=True)
 
 
+def test_payload_promotion_preserves_the_source_license(tmp_path):
+    from dataclasses import replace
+    from ignition.preparation.protection import License
+
+    link = 'https://huggingface.co/flare-tests/fixture/blob/main/LICENSE'
+    source_signer = replace(publisher(), license=License('apache-2.0', link))
+    source = publish(tmp_path, source_signer)
+    target = publisher()
+    promoted = tmp_path / 'promoted'
+    payload_promote(
+        source, promoted, publisher=target,
+        profiles=[{'namespace': source_signer.namespace, 'development': False,
+                   'public_key': list(source_signer.public_key)}],
+        accepted=source_signer.namespace, target_accepted=target.namespace,
+        target_publisher=dict(namespace=target.namespace,
+                              official_source=target.official_source,
+                              development=False, license_name='', license_link=''))
+    envelope = verify_signatures(promoted, Ed25519PublicKey.from_public_bytes(target.public_key))
+    package = schema()('PackageBody').FromString(envelope.package_body)
+    assert package.publisher.license_name == 'apache-2.0'
+    assert package.publisher.license_link == link
+
+
 @pytest.mark.parametrize('operation', ['convert', 'sign'])
 def test_cli_rejects_legacy_publication_without_creating_output(tmp_path, operation):
     from types import SimpleNamespace
