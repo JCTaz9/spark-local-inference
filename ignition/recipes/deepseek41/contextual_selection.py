@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 import torch
-from b12x.preparation import ContextCandidate, FinalistPolicy
+from b12x.preparation import ContextCandidate, FinalistPolicy, FrozenMapping
 from b12x.gemm import blockscaled
 from b12x.quantization import mla_norm_mxfp8
 
@@ -134,7 +134,7 @@ class CatalogContextualSelection:
     def _tuple_name(self, index, configs, selection):
         plans = _role_plans(self.layers[0])
         payload = [{"component": plan.component_id,
-                    "query": dict(plan.contract.encode_query(plan.query)),
+                    "query": FrozenMapping(plan.contract.encode_query(plan.query)).to_dict(),
                     "config": plan.contract.config_payload(configs[role][offset]).to_dict()}
                    for plan, role, offset in zip(plans, _ROLES, selection, strict=True)]
         encoded = json.dumps({"operators": payload,

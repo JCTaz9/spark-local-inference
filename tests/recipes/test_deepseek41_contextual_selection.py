@@ -1,11 +1,14 @@
 """Prepared layer variants retain catalog storage and isolate candidate plans."""
 
+from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+from b12x.preparation import Finalist, FrozenMapping, PreparedCall, Selection
 
-from ignition.recipes.deepseek41.contextual_selection import prepared_layer_variant
+from ignition.recipes.deepseek41.contextual_selection import CatalogContextualSelection, prepared_layer_variant
 
 
 class Plan:
@@ -62,3 +65,86 @@ def test_variant_rejects_unprepared_plan_and_undersized_overlap_storage():
     with pytest.raises(ValueError, match="caller-owned scratch"):
         prepared_layer_variant(layer, qkv_plan=qkv, norm_plan=norm, query_plan=query,
                                side_workspace=torch.empty(32, dtype=torch.uint8))
+
+
+def test_tuple_identity_serializes_nested_b12x_query_metadata():
+    selector = object.__new__(CatalogContextualSelection)
+    contract = SimpleNamespace(
+        encode_query=lambda query: {"codegen": FrozenMapping({"target": "sm120"}), "rows": 8},
+        config_payload=lambda config: FrozenMapping({"split_k_slices": config}))
+    plans = [SimpleNamespace(component_id=name, contract=contract, query=object())
+             for name in ("qkv", "norm", "query")]
+    attention = SimpleNamespace(projections={"qkv_a": SimpleNamespace(plan=plans[0]),
+                                              "q_b": SimpleNamespace(plan=plans[2])},
+                                norm_quant=SimpleNamespace(plan=plans[1]))
+    selector.layers = (SimpleNamespace(attention=attention),)
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0),
+                         SimpleNamespace(layer_index=37))
+    configs = {"qkv_a": (1,), "norm": (2,), "q_b": (3,)}
+    identity = selector._tuple_name(0, configs, (0, 0, 0))
+    assert identity == selector._tuple_name(0, configs, (0, 0, 0))
+    assert identity.startswith("context-00-")
+
+
+def test_public_b12x_declarations_supply_selector_families_and_override_requests():
+    from b12x.gemm import blockscaled
+    from b12x.gemm._tuning import DenseGemmConfig, DenseGemmQuery
+    from b12x.quantization import mla_norm_mxfp8
+    from b12x.quantization.mla_norm_mxfp8._tuning import Config, Query
+
+    qkv_query = DenseGemmQuery(recipe="mxfp8", entry_point="gemm.blockscaled.mm",
+        weight_storage="native", output_dtype="bfloat16", batch=1, max_rows=8,
+        in_features=5120, out_features=1792, output_mode="provided", alpha_mode="unit",
+        workspace_form="provided", rhs_prefetch_ready=True,
+        allow_bf16_atomic_reduction=False)
+    qb_query = replace(qkv_query, in_features=1280, out_features=8192)
+    norm_query = Query(rows=8, query_weight_dtype="bfloat16", kv_weight_dtype="bfloat16",
+                       affine_prefetch_ready=True, release_dependents=True)
+    dense_config = DenseGemmConfig(backend="cutedsl", tile_m=16, tile_n=64, tile_k=128,
+        load_path="tma", swap_ab=False, split_k_slices=1, large_m_unroll=None,
+        target_occupancy=1)
+    config_by_role = {"qkv_a": dense_config, "norm": Config(), "q_b": dense_config}
+    selector = object.__new__(CatalogContextualSelection)
+    layers, requests = [], {}
+    for index in (0, 37):
+        plans = (blockscaled.plan(qkv_query), mla_norm_mxfp8.plan(norm_query),
+                 blockscaled.plan(qb_query))
+        attention = SimpleNamespace(projections={"qkv_a": SimpleNamespace(plan=plans[0]),
+                                                  "q_b": SimpleNamespace(plan=plans[2])},
+                                    norm_quant=SimpleNamespace(plan=plans[1]))
+        layers.append(SimpleNamespace(attention=attention))
+        for role, plan in zip(("qkv_a", "norm", "q_b"), plans, strict=True):
+            name = f"layer{index}.{role}"
+            call = lambda state: PreparedCall(run=lambda: None)
+            requests[name] = plan.request(name=name, prepare_call=call, benchmark_call=call)
+    selector.layers = tuple(layers)
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0),
+                         SimpleNamespace(layer_index=37))
+    names = selector._names(requests)
+    policies = selector.finalist_policies(requests)
+    assert set(policies) == set(requests)
+    assert all(replace(request, finalist_policy=policies[name]).finalist_policy == policies[name]
+               for name, request in requests.items())
+    finalists = {}
+    for role_index, role in enumerate(("qkv_a", "norm", "q_b")):
+        for group in names:
+            plan = requests[group[role_index]].plan
+            finalists[group[role_index]] = (Finalist(selection=Selection(
+                component_id=plan.component_id,
+                query=FrozenMapping(plan.contract.encode_query(plan.query)),
+                config=config_by_role[role], source="tuned"),
+                family=FrozenMapping({"family": role}), candidate_index=0, latency_us=1.0),)
+    configs = selector._configs(names, finalists)
+    assert {role: len(values) for role, values in configs.items()} == {
+        "qkv_a": 1, "norm": 1, "q_b": 1}
+    for role_index, role in enumerate(("qkv_a", "norm", "q_b")):
+        original_request = requests[names[0][role_index]]
+        alternative = selector._override_plan(role, original_request.plan, configs[role][0])
+        assert alternative.override == configs[role][0]
+        assert original_request.plan.same_declaration_except_override(alternative)
+        pinned = replace(original_request, plan=alternative, finalist_policy=None,
+                         benchmark_call=None)
+        assert pinned.finalist_policy is None and pinned.benchmark_call is None
+    identity = selector._tuple_name(0, configs, (0, 0, 0))
+    assert json.dumps({"winner": identity, "query": FrozenMapping(
+        requests[names[0][0]].plan.contract.encode_query(qkv_query)).to_dict()})
