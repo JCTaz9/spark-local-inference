@@ -11,6 +11,8 @@ pub mod driver;
 mod engram;
 #[cfg(test)]
 mod event_tests;
+#[cfg(test)]
+mod programmatic_edge_tests;
 mod format;
 #[cfg(any(windows, test))]
 mod host;
@@ -956,16 +958,12 @@ impl NativeResources {
                     phase.advance(1);
                 }
                 let mut dependencies = format::Dependencies::new(graph.node_count);
-                for begin in (0..graph.edge_count).step_by(4096) {
-                    let mut sources = Vec::new();
-                    let mut destinations = Vec::new();
-                    let mut data = Vec::new();
-                    for _ in begin..(begin + 4096).min(graph.edge_count) {
-                        let edge = protobuf::edge(records.read()?)?;
-                        dependencies.add(&edge)?;
-                        sources.push(nodes[edge.source]);
-                        destinations.push(nodes[edge.destination]);
-                        data.push(edge.data);
+                let add_dependencies = |sources: &mut Vec<Handle>,
+                                        destinations: &mut Vec<Handle>,
+                                        data: &mut Vec<[u8; 8]>|
+                 -> Result<()> {
+                    if sources.is_empty() {
+                        return Ok(());
                     }
                     driver.check(
                         "cuGraphAddDependencies_v2",
@@ -977,6 +975,29 @@ impl NativeResources {
                             data.len(),
                         ),
                     )?;
+                    sources.clear();
+                    destinations.clear();
+                    data.clear();
+                    Ok(())
+                };
+                for begin in (0..graph.edge_count).step_by(4096) {
+                    let mut sources = Vec::new();
+                    let mut destinations = Vec::new();
+                    let mut data = Vec::new();
+                    for _ in begin..(begin + 4096).min(graph.edge_count) {
+                        let edge = protobuf::edge(records.read()?)?;
+                        dependencies.add(&edge)?;
+                        if data.last().is_some_and(|previous| previous != &edge.data) {
+                            // A mixed batch can apply its first annotation to every
+                            // edge. Flush at each change so programmatic ports and
+                            // types survive without changing captured edge order.
+                            add_dependencies(&mut sources, &mut destinations, &mut data)?;
+                        }
+                        sources.push(nodes[edge.source]);
+                        destinations.push(nodes[edge.destination]);
+                        data.push(edge.data);
+                    }
+                    add_dependencies(&mut sources, &mut destinations, &mut data)?;
                 }
                 dependencies.finish()?;
                 records.finish()?;
