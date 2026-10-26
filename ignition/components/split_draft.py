@@ -84,6 +84,16 @@ class PreparedDraftConfidence:
             return (torch.empty(shape, dtype=dtype, device=markov.device) if buffers is None
                     else buffers.zeros(shape, dtype))
         self.embeddings = allocate((b, w - 1, markov.shape[1]), markov.dtype)
+        self.source = source
+        self.canonical_embedding = None
+        if getattr(source, "proposal_block", None) is not None:
+            from .embedding import PreparedEmbedding
+
+            self.preceding = allocate((b, w - 1), torch.int64)
+            self.canonical_embedding = PreparedEmbedding(
+                source.markov.embed.weight, self.preceding.view(-1),
+                self.embeddings.view(-1, markov.shape[1]), session=o.session,
+                name=name + ".canonical_predecessors")
         self.features = allocate((b, w - 1, weight.shape[1]), weight.dtype)
         self.logits = allocate((b, w - 1), torch.float32)
         self.output = output
@@ -91,9 +101,14 @@ class PreparedDraftConfidence:
             self.logits.view(-1, 1), session=o.session, name=name, bias=bias)
 
     def record_embedding(self, position, embedding):
-        self.embeddings[:, position].copy_(embedding)
+        if self.canonical_embedding is None:
+            self.embeddings[:, position].copy_(embedding)
 
     def __call__(self):
+        if self.canonical_embedding is not None:
+            self.preceding[:, 0].copy_(torch.where(self.source.active, self.source.candidates[:, 0], 0))
+            self.preceding[:, 1:].copy_(self.source.drafts[:, :-1])
+            self.canonical_embedding()
         self.features[:, :, :self.hidden.shape[-1]].copy_(self.hidden)
         self.features[:, :, self.hidden.shape[-1]:].copy_(self.embeddings)
         self.projection(self.features.view(-1, self.features.shape[-1]))
