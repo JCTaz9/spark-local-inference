@@ -48,6 +48,38 @@ def allocation_reference(allocations, tensor):
     return {"allocation": allocation.name, "offset": address - allocation.address}
 
 
+def prepared_cuda_projection():
+    """Prepare one bounded MXFP8 graph node with the ordinary b12x CUDA carrier."""
+    from b12x import gemm
+    from b12x._lib.intrinsics.reference import as_grouped_scale_view_mx
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    values = torch.ones((8, 128, 1), device="cuda").to(torch.float8_e4m3fn)
+    weight = torch.ones((128, 128, 1), device="cuda").to(torch.float8_e4m3fn)
+    lhs_storage = torch.full((1, 512), 127, device="cuda", dtype=torch.uint8)
+    rhs_storage = torch.full((1, 512), 127, device="cuda", dtype=torch.uint8)
+    lhs_scales = as_grouped_scale_view_mx(lhs_storage, 8, 128)
+    rhs_scales = as_grouped_scale_view_mx(rhs_storage, 128, 128)
+    output = torch.zeros((8, 128, 1), device="cuda", dtype=torch.bfloat16)
+    query = gemm.DenseGemmQuery(
+        recipe="mxfp8", entry_point="gemm.mm", weight_storage="native",
+        output_dtype="bfloat16", batch=1, max_rows=8, in_features=128,
+        out_features=128, output_mode="provided", alpha_mode="unit",
+        scale_domain="bounded_fp32_products", rhs_prefetch_ready=True)
+    config = gemm.DenseGemmConfig(
+        backend="cuda_streaming", tile_m=16, tile_n=8, tile_k=128,
+        load_path="streaming", swap_ab=False, split_k_slices=1,
+        large_m_unroll=False, target_occupancy=None,
+        programmatic_serialization=True, evict_first=True)
+    plan = gemm.plan(query, override=config)
+    session = PreparationSession(device="cuda:0", autotune=False, compile_workers=1)
+    session.prepare((plan.request(name="projection", prepare_call=lambda state:
+        PreparedCall(run=lambda: state.run(values, lhs_scales, weight,
+            rhs_scales, None, output, None, torch.bfloat16, None))),))
+    return (plan, session, values, lhs_storage, weight, rhs_storage, output,
+            lhs_scales, rhs_scales)
+
+
 TRANSFORM_SYMBOL = "transform_" + "template_parameter_" * 32
 BIAS_SYMBOL = "bias_" + "template_parameter_" * 32
 
@@ -84,7 +116,7 @@ __global__ void no_arguments() {}
     return module, function, empty
 
 
-def prepare(root, shard_size=64 << 30, legacy=False):
+def prepare(root, shard_size=64 << 30, legacy=False, *, cuda_program=False):
     with ModuleImages() as images:
         torch.cuda.set_device(0)
         with PackageStorage() as storage:
@@ -94,6 +126,7 @@ def prepare(root, shard_size=64 << 30, legacy=False):
                                           device=torch.device("cuda", 0), nbytes=65536)
             source.copy_(torch.arange(128, device="cuda", dtype=torch.float32))
             output = torch.zeros_like(source)
+            projection = prepared_cuda_projection() if cuda_program else None
             transient = torch.full((1 << 20,), 0xA5, dtype=torch.uint8, device="cuda")
             unused = torch.empty(20 << 20, dtype=torch.uint8, device="cuda")
             unused_address = unused.data_ptr()
@@ -143,6 +176,13 @@ def prepare(root, shard_size=64 << 30, legacy=False):
                 storage.cuda.call("cuLaunchKernel", empty, C.c_uint(1), C.c_uint(1), C.c_uint(1),
                                   C.c_uint(1), C.c_uint(1), C.c_uint(1), C.c_uint(0),
                                   C.c_void_p(torch.cuda.current_stream().cuda_stream), None, None)
+                if projection is not None:
+                    from b12x import gemm
+
+                    plan, _, values, _, weight, _, result, lhs_scales, rhs_scales = projection
+                    gemm.mm((values, lhs_scales), (weight, rhs_scales),
+                            out=result, plan=plan)
+                    output.add_(result[0, :, 0].float())
             run()
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -151,11 +191,16 @@ def prepare(root, shard_size=64 << 30, legacy=False):
             graph.instantiate()
             graph.replay()
             torch.cuda.synchronize()
+            if projection is not None:
+                assert torch.equal(projection[6], torch.full_like(projection[6], 128))
             expected = output.view(torch.uint8).cpu().numpy().tobytes()
             output.zero_()
+            if projection is not None:
+                projection[6].zero_()
             prepared = PreparedExecution(device=0, graphs={"decode": graph}, buffers=buffers,
                 signatures={"decode": GraphSignature("decode", 1, 1, ("source",))}, max_active=1,
-                resources=(storage, region, transient, floating_alias),
+                resources=(storage, region, transient, floating_alias) +
+                    (() if projection is None else projection),
                 export_events={"input_ready": ready.cuda_event},
                 export_zero_ranges=((transient.data_ptr(), transient.nbytes),))
             prepared.server_config = server_config(root)
@@ -176,6 +221,9 @@ def prepare(root, shard_size=64 << 30, legacy=False):
                for a in package.allocations)
     zero_reference = allocation_reference(package.allocations, transient)
     document = read_sources(root / "rank.json")[0].ranks[0]
+    if cuda_program:
+        assert any(function.symbol == "b12x_mxfp8_stream_p1_c1"
+                   for function in document.functions)
     allocation = next(a for a in document.allocations if a.name == zero_reference["allocation"])
     start, end = zero_reference["offset"], zero_reference["offset"] + transient.nbytes
     assert all(span.offset + span.nbytes <= start or span.offset >= end for span in allocation.data_spans)
@@ -202,8 +250,10 @@ if __name__ == "__main__":
     parser.add_argument("executable", nargs="?")
     parser.add_argument("--shard-size", type=int, default=64 << 30)
     parser.add_argument("--legacy", action="store_true")
+    parser.add_argument("--cuda-program", action="store_true")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
-    prepare(args.directory, args.shard_size, args.legacy)
+    prepare(args.directory, args.shard_size, args.legacy,
+            cuda_program=args.cuda_program)
     if args.executable:
         os.execv(args.executable, [args.executable, str(args.directory)])

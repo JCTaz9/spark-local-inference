@@ -102,17 +102,23 @@ def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
-@pytest.mark.parametrize("fixture,binary,expected", [
-    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches"),
-    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed"),
+@pytest.mark.parametrize("fixture,binary,expected,cuda_program", [
+    ("runtime_package_fixture.py", "test_runtime_package", "192 graph launches", False),
+    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed", False),
+    ("fixed_package_fixture.py", "test_fixed_runtime_package", "native fixed-address replay passed", True),
 ])
-def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected):
+def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary, expected, cuda_program):
     import shutil
 
     import flare_heliopause
     from safetensors import safe_open
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
+    if cuda_program:
+        from b12x.gemm._tuning import DenseGemmQuery
+
+        if "scale_domain" not in DenseGemmQuery.__dataclass_fields__:
+            pytest.skip("prepared MXFP8 streaming operator is not installed")
     root = Path(__file__).resolve().parents[2]
     subprocess.run([
         "cargo", "build", "--manifest-path", str(root / "helios/Cargo.toml"),
@@ -122,6 +128,7 @@ def test_payload_forms_preserve_signatures_and_replay(tmp_path, fixture, binary,
     original = tmp_path / "original"
     result = subprocess.run([
         sys.executable, str(root / "helios/tests" / fixture), str(original),
+        *(("--cuda-program",) if cuda_program else ()),
     ], cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
     if fixture == "runtime_package_fixture.py":
