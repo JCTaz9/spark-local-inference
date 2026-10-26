@@ -14,7 +14,7 @@ from ignition.components.attention_output import PreparedGroupedOutputProjection
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.components.rms_norm import PreparedRMSNorm
-from ignition.components.state import gather_rows, save_hidden
+from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from ignition.components.window_indices import PreparedWindowIndices
 from ignition.preparation.tuning import declare, register_finalizer
 
@@ -167,8 +167,8 @@ class PreparedCompressor:
     def __call__(self, source):
         m = self.metadata
         if self.ratio == 2:
-            for key, value in self.pending.items():
-                gather_rows(self.pool.region(f"layer{self.layer}.{key}"), m.state_rows, value.view(value.shape[0], -1))
+            gather_rows_three(tuple(self.pool.region(f"layer{self.layer}.{key}") for key in self.pending),
+                              m.state_rows, tuple(self.pending.values()))
             self.project_gates(source)
         self.project_values(source)
         mla_compress.run(self.binding)
