@@ -268,6 +268,38 @@ def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
         _winners([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
+def test_sharded_finalists_merge_families_and_keep_ordinary_winner():
+    from dataclasses import dataclass
+    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping
+    from ignition.preparation.collectives import _winners
+
+    @dataclass(frozen=True)
+    class Contribution:
+        key: str
+        latency_us: float
+        candidate_index: int
+        assignment: object
+        finalist_policy: FinalistPolicy
+        finalists: tuple[FinalistRecord, ...]
+
+    policy = FinalistPolicy(family_fields=("split_k_slices",), per_family=1, max_total=2)
+    def finalist(index, split, latency):
+        return FinalistRecord(assignment=FrozenMapping({"candidate": index}),
+            family=FrozenMapping({"split_k_slices": split}), candidate_index=index,
+            latency_us=latency)
+
+    first = Contribution("qkv", 5.0, 4, {"candidate": 4}, policy,
+        (finalist(4, 1, 5.0), finalist(6, 2, 4.0)))
+    second = Contribution("qkv", 4.5, 8, {"candidate": 8}, policy,
+        (finalist(8, 2, 4.5), finalist(9, 1, 3.0)))
+    (winner,) = _winners((first, second))
+    assert winner.candidate_index == 8
+    assert {item.candidate_index for item in winner.finalists} == {8, 9}
+    with pytest.raises(ValueError, match="policies differ"):
+        _winners((first, Contribution("qkv", 4.5, 8, {"candidate": 8},
+            FinalistPolicy(family_fields=("tile_n",)), second.finalists)))
+
+
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
     owner = coordinator(monkeypatch)
     assert owner.same_on_every_rank("NVIDIA GB10")

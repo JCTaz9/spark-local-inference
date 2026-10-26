@@ -6,7 +6,7 @@ from b12x.quantization import mla_norm_mxfp8, mxfp8
 
 from ignition.preparation.fixtures.projection import input_factory
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare
+from ignition.preparation.tuning import declare, register_context_plan
 
 
 class PreparedMLANormQuant:
@@ -52,6 +52,7 @@ class PreparedMLANormQuant:
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: prepare(state),
             benchmark_call=lambda state: prepare(state, representative())),))
+        register_context_plan(session, name, self)
 
     def __call__(self, projected):
         mla_norm_mxfp8.run(projected, *self.weights, self.query, self.kv,
