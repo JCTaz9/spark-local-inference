@@ -148,3 +148,19 @@ def test_public_b12x_declarations_supply_selector_families_and_override_requests
     identity = selector._tuple_name(0, configs, (0, 0, 0))
     assert json.dumps({"winner": identity, "query": FrozenMapping(
         requests[names[0][0]].plan.contract.encode_query(qkv_query)).to_dict()})
+
+
+def test_context_progress_counts_each_candidate_once_per_balanced_round(monkeypatch):
+    import torch.distributed as dist
+
+    selector = object.__new__(CatalogContextualSelection)
+    selector.coordinator = SimpleNamespace(group=object(), ranks=(0, 1))
+    advances = []
+    selector._race_stage = SimpleNamespace(update=lambda *, advance: advances.append(advance))
+    monkeypatch.setattr(dist, "all_gather_object",
+        lambda peers, value, *, group: peers.__setitem__(slice(None), [value, value]))
+    for repetition in (0, 1):
+        peers = selector._context_exchange("launch", {"indices": (4,), "turn": 2,
+                                                       "repetition": repetition})
+        assert len(peers) == 2 and all(peer["indices"] == (4,) for peer in peers)
+    assert advances == [1]

@@ -15,6 +15,7 @@ from b12x.gemm import blockscaled
 from b12x.quantization import mla_norm_mxfp8
 
 from ignition.preparation.capture import capture_forwards
+from ignition.progress import phase
 
 from .contextual_tuning import CatalogCompressedLayerFixture, CatalogLayer0Fixture
 
@@ -66,6 +67,7 @@ class CatalogContextualSelection:
         self.compile_decoder, self.warmup_storage = compile_decoder, warmup_storage
         self.progress = progress
         self._free_after = {}
+        self._race_stage = None
 
     def _names(self, requests):
         by_plan = {}
@@ -201,6 +203,8 @@ class CatalogContextualSelection:
         dist.all_gather_object(peers, send, group=self.coordinator.group)
         if any(peer.get("step") != step for peer in peers):
             raise ValueError("tensor-parallel context ranks reached different race steps")
+        if step == "launch" and payload.get("repetition") == 0 and self._race_stage is not None:
+            self._race_stage.update(advance=len(payload["indices"]))
         return tuple(peers)
 
     def _race_layer(self, session, fixture, fixture_index, configs, plans, workspace, selections):
@@ -230,9 +234,15 @@ class CatalogContextualSelection:
             candidates = tuple(ContextCandidate(name=name, plans=members[name][0],
                 call=fixture.prepared_call(name, graphs[name], compiled.get(name), members[name][1]))
                 for name in functions)
-            result = session.race_contexts(candidates,
-                collective_exchange=self._context_exchange,
-                collective_ranks=self.coordinator.ranks, max_candidates=len(candidates))
+            with phase(self.progress, f"Compare complete layer {fixture.layer_index}",
+                       total=len(candidates) * session.rounds) as stage:
+                self._race_stage = stage
+                try:
+                    result = session.race_contexts(candidates,
+                        collective_exchange=self._context_exchange,
+                        collective_ranks=self.coordinator.ranks, max_candidates=len(candidates))
+                finally:
+                    self._race_stage = None
             return result, after_free
         finally:
             # A declaration check can fail before b12x enters its race cleanup.
