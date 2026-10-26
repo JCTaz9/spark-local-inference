@@ -356,7 +356,13 @@ class PreparedAllReduceAdd:
         _all_reduce_add(source, residual, self.handle, self.input_addend, self.group_weights, self.group_ids)
 
 
+def _gather_transport_view(tensor):
+    # Two BF16 transport lanes preserve every FP32 bit without conversion.
+    return tensor.view(torch.bfloat16) if tensor.dtype == torch.float32 else tensor
+
+
 def _gather_columns(source, output, handle):
+    source, output = _gather_transport_view(source), _gather_transport_view(output)
     owner = _OWNERS[handle]
     runtime = owner.runtime
     if owner.roce:
@@ -529,36 +535,41 @@ class PreparedAllGather:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank gather copies its source into a matching output")
             return
+        if (source.ndim != 2 or source.dtype not in (torch.bfloat16, torch.float32, torch.float8_e4m3fn)
+                or output.dtype != source.dtype or not source.is_contiguous() or not output.is_contiguous()):
+            raise ValueError("column gathers require contiguous matching BF16, FP32 or E4M3 matrices")
+        transport_source = _gather_transport_view(source)
+        transport_output = _gather_transport_view(output)
         self.roce = _roce(runtime)
         if self.roce:
-            if (source.ndim != 2 or source.dtype != torch.bfloat16 or output.dtype != source.dtype
-                    or not source.is_contiguous() or not output.is_contiguous()
-                    or output.shape != (source.shape[0], source.shape[1] * runtime.world_size)
-                    or source.shape[1] * 2 % 16 or not 0 < source.numel() * 2 <= runtime.max_gather_bytes):
-                raise ValueError("RoCE gathers require contiguous BF16 column partitions within the runtime's capacity")
+            if (transport_source.dtype != torch.bfloat16
+                    or transport_output.shape != (source.shape[0], transport_source.shape[1] * runtime.world_size)
+                    or transport_source.shape[1] * 2 % 16
+                    or not 0 < transport_source.numel() * 2 <= runtime.max_gather_bytes):
+                raise ValueError("RoCE gathers require BF16 or FP32 column partitions within the byte capacity")
             self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather")
             ranks = tuple(dist.get_process_group_ranks(runtime._group))
             # Priming runs before the plan is published, so it launches the materialized gather directly.
             declare(session, (self.plan.request(name=name,
                 prepare_call=lambda state: PreparedCall(
-                    run=lambda: runtime._run_prepared_all_gather(source, prepared=state, dim=-1, out=output),
+                    run=lambda: runtime._run_prepared_all_gather(transport_source, prepared=state, dim=-1, out=transport_output),
                     output=output, owners=(runtime, source, output)),
                 collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
             self.handle = next(_HANDLES)
             _OWNERS[self.handle] = self
             return
         if (runtime.world_size < 2 or source.ndim != 2
-                or source.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or output.dtype != source.dtype
+                or source.dtype not in (torch.bfloat16, torch.float32, torch.float8_e4m3fn) or output.dtype != source.dtype
                 or source.device != runtime.device or output.device != source.device
                 or not source.is_contiguous() or not output.is_contiguous()
                 or not 0 < source.shape[0] <= runtime.max_batch_size
-                or source.shape[1] != runtime.heads_per_rank * runtime.query_head_dim
+                or transport_source.shape[1] != runtime.heads_per_rank * runtime.query_head_dim
                 or output.shape != (source.shape[0], source.shape[1] * runtime.world_size)):
-            raise ValueError("all-gather requires contiguous BF16 or E4M3 column partitions matching its collective "
+            raise ValueError("all-gather requires contiguous BF16, FP32 or E4M3 column partitions matching its collective "
                              "channel")
         self.runtime, self.output = runtime, output
-        call = {"local_input": source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
-                "out": output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
+        call = {"local_input": transport_source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
+                "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))

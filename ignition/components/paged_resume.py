@@ -27,8 +27,11 @@ class PreparedResume:
         session,
         name,
         activation_mode="a16",
+        logits_dtype=torch.bfloat16,
         buffers=None,
     ):
+        if logits_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("resume logits require BF16 or FP32 storage")
         self.state = PreparedResumeState(
             requests,
             pool.last_hidden,
@@ -48,8 +51,8 @@ class PreparedResume:
             name=name + ".validation",
         )
         def empty(shape):
-            return (torch.empty(shape, dtype=torch.bfloat16, device=pool.backing.device) if buffers is None
-                    else buffers.zeros(shape, torch.bfloat16))
+            return (torch.empty(shape, dtype=logits_dtype, device=pool.backing.device) if buffers is None
+                    else buffers.zeros(shape, logits_dtype))
         self.local_logits = empty((rows, weights.head.shape[0] if isinstance(weights.head, torch.Tensor)
                                    else weights.head.out_features))
         self.logits = empty((rows, requests.vocab_size))

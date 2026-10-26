@@ -1,5 +1,7 @@
 """Block drafts conditioned on accepted target states, with sequential Markov logits."""
 
+import torch
+
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
@@ -10,6 +12,8 @@ from .decoder import PreparedLayer
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
                  coordinator, session, name, workspace, mla_compute_mode="auto"):
+        if scratch.local_logits.dtype != torch.bfloat16 or scratch.logits.dtype != torch.bfloat16:
+            raise ValueError("DSpark proposal vocabulary logits require BF16 storage")
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")

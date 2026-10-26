@@ -39,7 +39,7 @@ from ignition.progress import phase
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import RECIPE
 from .attention import INDEXER_QUERY_ROWS
-from .decoder import PreparedDecoder, Scratch
+from .decoder import PreparedDecoder, Scratch, DraftScratch
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -53,11 +53,19 @@ from .weights import ModelWeights
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
 
 
-def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision):
-    """Bind one arithmetic contract to target, prefill, and draft attention."""
+def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
+    # Fixed-width PCIe channels distinguish FP32 target words from BF16 proposals.
+    runtime = vocabulary_runtime if draft_vocabulary_runtime is None else draft_vocabulary_runtime
+    return PreparedDraft(*args, vocabulary_runtime=runtime, **kwargs)
+
+
+def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision,
+                       draft_vocabulary_runtime=None):
+    """Bind attention arithmetic and the proposal head's BF16 gather channel."""
     return (partial(PreparedDecoder, window_staging=window_staging, suffix_scratch=suffix_scratch,
                     vision=vision, mla_compute_mode=mla_compute_mode),
-            partial(PreparedDraft, mla_compute_mode=mla_compute_mode))
+            partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
+                    mla_compute_mode=mla_compute_mode))
 
 
 @dataclass(frozen=True)
@@ -268,21 +276,23 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
         # Vocabulary partitions and packed sampling results use the same serial gather channel.
         result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in layouts), default=0)
         _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
-        gather_bytes = max(sample_rows * local_vocab * 2,
+        gather_bytes = max(sample_rows * local_vocab * 4,
                            (result_bytes + 15) // 16 * 16)
         decode_tokens = config.all_reduce_tokens
         runtime = create_roce_runtime(group, device, max_tokens=decode_tokens, pipe_tokens=tokens,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
-        return runtime, runtime, runtime, runtime if layouts else None
+        return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
     collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
-        columns=local_vocab * len(config.devices), ipc=ipc)
+        columns=local_vocab * len(config.devices) * 2, ipc=ipc)
+    draft_vocabulary = (create_all_gather_runtime(group, device, max_rows=sample_rows,
+        columns=local_vocab * len(config.devices), ipc=ipc) if config.dspark else None)
     result = create_result_broadcast_runtime(group, device, layouts=layouts, ipc=ipc) if layouts else None
-    return collective, prefill, vocabulary, result
+    return collective, prefill, vocabulary, result, draft_vocabulary
 
 
 @torch.no_grad()
@@ -304,6 +314,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization)
         release_unused()
+    if progress is not None:
+        progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
     if progress is not None:
@@ -337,7 +349,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         coordinator = CollectivePreparation(group)
         verification_samples = (slots * max(config.speculative_widths)
                                 if config.packed_verification else config.decode_tokens)
-        collective, prefill_collective, vocabulary_collective, result_collective = _collective_runtimes(
+        collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, package_storage=package_storage,
             verification_samples=verification_samples)
         tables = replace(tables, readiness_runtime=collective)
@@ -386,7 +398,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 feature_type=1, image_slots=config.image_concurrency, arena=feature_arena)
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
-            window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state)
+            window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state,
+            draft_vocabulary_runtime=draft_vocabulary_collective)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -405,7 +418,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 markov_runtime=None, coordinator=coordinator, result_runtime=result_collective,
                 buffers=activation_buffers.cursor(),
-                forwards=DSparkForwards(decoder_factory, Scratch, _CONTEXT,
+                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
                     draft_factory, PreparedMarkov))
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -484,7 +497,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 name = f"resume{capacity}" + suffix
                 forward = PreparedResume(mode_weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name, buffers=graph_buffers.cursor())
+                    coordinator=coordinator, session=session, name=name, logits_dtype=torch.float32,
+                    buffers=graph_buffers.cursor())
                 add(name, forward, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix
@@ -554,6 +568,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "mla_compute_mode": config.mla_compute_mode,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
+        "target_logits_dtype": "float32",
+        "draft_logits_dtype": "bfloat16" if config.dspark else None,
         "offloaded_bytes": sum(source.nbytes for pair in tables.sources.values() for source in pair),
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
@@ -595,11 +611,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         package_data=tables if rank == 0 else None,
         resources=(scoring, scored_storage, weights, tables, pool, requests, inputs, admission, commands, arena, forwards,
             prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, result_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, coordinator, speculation, confidence,
             vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
             scratch_pool, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, result_collective, prefill_collective, vocabulary_collective, collective) if c is not None)))
+            (scoring, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

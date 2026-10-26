@@ -89,3 +89,23 @@ def test_three_rank_scratch_preserves_grouped_attention_and_unpadded_experts():
     assert scratch.logits.shape == (32, 129280)
     assert scratch.shared.intermediate.shape == (128, 768)
     assert scratch.engram.local.shape == (128, 2048)
+
+
+@pytest.mark.parametrize("world", [3, 4])
+def test_target_logits_remain_fp32_across_capacity_views(world):
+    scratch = Scratch.allocate(128, 32, world, "meta")
+    assert scratch.hidden.dtype == torch.bfloat16
+    for view in (scratch, scratch.rows(8, 8), scratch.rows(32, 1)):
+        assert view.local_logits.dtype == torch.float32
+        assert view.logits.dtype == torch.float32
+        assert view.local_logits.element_size() == 4
+
+
+def test_draft_logits_keep_bf16_storage_independently_of_target():
+    from ignition.recipes.deepseek41.decoder import DraftScratch
+
+    scratch = DraftScratch.allocate(32, 32, 4, "meta")
+    assert scratch.local_logits.dtype == scratch.logits.dtype == torch.bfloat16
+    sliced = scratch.rows(8, 8)
+    assert isinstance(sliced, DraftScratch)
+    assert sliced.local_logits.dtype == sliced.logits.dtype == torch.bfloat16

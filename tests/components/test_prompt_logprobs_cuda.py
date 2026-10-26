@@ -126,8 +126,9 @@ def test_prompt_partial_combination_excludes_padding_and_counts_cross_shard_ties
         assert actual[row, 3::2].tolist() == expected
 
 
+@pytest.mark.parametrize('logits_dtype', [torch.bfloat16, torch.float32])
 @torch.no_grad()
-def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
+def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory(logits_dtype):
     from ignition.components.prompt_logprobs import PromptOutputs, PreparedPromptScoring, BLOCK_ROWS
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.tuning import RecordedPreparationSession
@@ -141,7 +142,7 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
     with RecordedPreparationSession(device=torch.device('cuda'), checkpoint='prompt-projection-test',
             workload_schema='prompt-blocks-v1', numerical_policy='default') as session:
         op = PreparedPromptScoring(source, weight, outputs, frame, vocabulary=vocab,
-            session=session, name='score')
+            session=session, name='score', logits_dtype=logits_dtype)
         session.tune()
         call = compile_forward(op)
         call()
@@ -165,12 +166,13 @@ def test_blocked_projection_capture_crosses_row_blocks_with_fixed_peak_memory():
         # Every declared projection output has the fixed block bound, including the tail.
         assert max(projection.output.shape[0] for _, projection, _ in op.parts) == BLOCK_ROWS
         assert op.parts[-1][0].shape[0] == 1
-        logits = (source.cpu().float() @ weight.cpu().float().T).bfloat16().double()
+        assert all(projection.output.dtype == logits_dtype for _, projection, _ in op.parts)
+        logits = (source.cpu().float() @ weight.cpu().float().T).to(logits_dtype).double()
         ref = logits.log_softmax(-1)
         result = outputs.values[1].cpu()
         for row in [0, BLOCK_ROWS - 1, BLOCK_ROWS, rows - 1]:
             actual = result[row, 1:2].view(torch.float32).item()
-            assert abs(actual - ref[row, row].item()) < .03
+            assert abs(actual - ref[row, row].item()) < (.03 if logits_dtype == torch.bfloat16 else 5e-5)
 
 
 def _prompt_tp_rank(rank, rendezvous):

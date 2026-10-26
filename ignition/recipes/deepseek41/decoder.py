@@ -23,6 +23,10 @@ from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
 @dataclass(frozen=True)
 class Scratch:
+    """BF16 decoder activations and FP32 target vocabulary logits."""
+
+    logits_dtype = torch.float32
+
     embedding: torch.Tensor
     residual: torch.Tensor
     engram_residual: torch.Tensor
@@ -53,7 +57,7 @@ class Scratch:
             if is_dataclass(value):
                 return type(value)(*(select(getattr(value, field.name), count) for field in fields(value)))
             raise TypeError("decoder scratch must contain tensors and tensor dataclasses")
-        return Scratch(*(select(getattr(self, field.name), samples if field.name in
+        return type(self)(*(select(getattr(self, field.name), samples if field.name in
             ("hidden", "local_logits", "logits") else tokens) for field in fields(self)))
 
     @classmethod
@@ -70,7 +74,9 @@ class Scratch:
         attention = AttentionScratch.allocate(tokens, world, device, buffers=buffers, candidate_tokens=candidate_tokens)
         attention_output, mlp_output = zeros(tokens, 5120), zeros(tokens, 5120)
         _, vocabulary = TensorParallelShard(0, world).padded_partition(129280, alignment=64)
-        hidden, local_logits, logits = zeros(samples, 5120), zeros(samples, vocabulary), zeros(samples, 129280)
+        hidden = zeros(samples, 5120)
+        local_logits = zeros(samples, vocabulary, dtype=cls.logits_dtype)
+        logits = zeros(samples, 129280, dtype=cls.logits_dtype)
         # Embedding, Engram projection, and feed-forward intermediates execute serially.
         embed, lookup, ffn = buffers.fork(), buffers.fork(), buffers.fork()
         embedding = zeros(tokens, 5120, cursor=embed)
@@ -83,6 +89,12 @@ class Scratch:
         return cls(embedding, residual, engram_residual, engram, pre_mix, attn_mix, attention_hc, ffn_hc,
             attention, attention_output, shared, router_logits, router, routed, partial, mlp_output,
             hidden, local_logits, logits, buffers)
+
+
+class DraftScratch(Scratch):
+    """Retain BF16 proposal logits independently of FP32 target logits."""
+
+    logits_dtype = torch.bfloat16
 
 
 def _mhc_weights(weights, kind, norm):
@@ -216,6 +228,8 @@ class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
                  window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None):
+        if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
+            raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
@@ -290,7 +304,8 @@ class PreparedDecoder:
             carry = defer
         buffers.join(*layer_cursors)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
-            vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True)
+            vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True,
+            logits_dtype=torch.float32)
         self.compact_head = scratch.hidden.shape[0] > self.output_metadata.token_ids.numel()
         head_rows = self.output_metadata.token_ids.numel() if self.compact_head else scratch.hidden.shape[0]
         self.head_hidden = scratch.hidden[:head_rows]

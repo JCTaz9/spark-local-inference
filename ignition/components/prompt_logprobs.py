@@ -177,14 +177,14 @@ class PreparedPromptReduction:
 
 class PreparedPromptScoring:
     def __init__(self, source, weight, outputs, frame, *, vocabulary, rank=0,
-                 runtime=None, session, coordinator=None, name, copy_source=False):
+                 runtime=None, session, coordinator=None, name, copy_source=False, logits_dtype=torch.bfloat16):
         local = weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
         buffers = outputs.scratch.cursor()
         if copy_source:
             source = buffers.zeros(source.shape, source.dtype)
         self.source = source
         rows = min(BLOCK_ROWS, source.shape[0])
-        logits = buffers.zeros((rows, local), torch.bfloat16)
+        logits = buffers.zeros((rows, local), logits_dtype)
         stage = buffers.fork()
         self.offset = torch.tensor([rank * local], dtype=torch.int32, device=source.device)
         self.parts = []
@@ -247,10 +247,11 @@ class PromptScoring:
 
         return storage_ranges((self.outputs.buffers(), self.outputs.scratch.chunks))
 
-    def prepare(self, source, weight, *, vocabulary, session, coordinator, name, copy_source=False):
+    def prepare(self, source, weight, *, vocabulary, session, coordinator, name, copy_source=False,
+                logits_dtype=torch.bfloat16):
         return PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
             rank=self.rank, runtime=self.runtime, session=session, coordinator=coordinator,
-            name=name, copy_source=copy_source)
+            name=name, copy_source=copy_source, logits_dtype=logits_dtype)
 
 
 def scored_prefill_capacities(chunk):
