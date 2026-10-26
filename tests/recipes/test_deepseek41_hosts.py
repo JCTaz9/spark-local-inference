@@ -59,12 +59,13 @@ def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypat
     channels = bootstrap._collective_runtimes(config, None, None,
         coordinator=SimpleNamespace(spans_hosts=True), package_storage=storage,
         verification_samples=config.decode_tokens)
-    assert channels == (runtime, runtime, runtime, runtime if draft_tokens else None)
+    assert channels == (runtime, runtime, runtime, runtime if draft_tokens else None,
+                        runtime if draft_tokens else None)
     assert calls[0]["package_storage"] is storage
     assert calls[0]["pipe_tokens"] == 4096
     assert calls[0]["max_tokens"] >= config.decode_tokens
     sample_rows = max(config.decode_tokens, config.request_capacity * draft_tokens)
-    assert calls[0]["gather_bytes"] >= sample_rows * (129280 // 4) * 2
+    assert calls[0]["gather_bytes"] >= sample_rows * (129280 // 4) * 4
     if draft_tokens:
         from ignition.components.collectives import packed_broadcast_layout
         from ignition.components.draft_sampling import PreparedDraftDistribution
@@ -73,3 +74,35 @@ def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypat
         layouts = (PreparedDraftDistribution.broadcast_layout(16),
                    SpeculativeAcceptance.broadcast_layout(16, draft_tokens + 1))
         assert calls[0]["gather_bytes"] >= max(packed_broadcast_layout(layout.values())[1] for layout in layouts)
+
+
+def test_local_target_and_draft_channels_preserve_their_element_widths(monkeypatch):
+    config = bootstrap.PreparationConfig(max_active=1,
+        speculative_widths=tuple(range(1, 9)))
+    channels = []
+    def gather(group, device, **kwargs):
+        result = object()
+        channels.append((result, kwargs))
+        return result
+    monkeypatch.setattr(bootstrap, 'create_all_gather_runtime', gather)
+    for name in ('create_all_reduce_runtime', 'create_dma_all_reduce_runtime', 'create_result_broadcast_runtime'):
+        monkeypatch.setattr(bootstrap, name, lambda *args, **kwargs: object())
+    result = bootstrap._collective_runtimes(config, None, None,
+        coordinator=SimpleNamespace(spans_hosts=False),
+        package_storage=SimpleNamespace(peer_storage=object()), verification_samples=8)
+    assert result[2] is channels[0][0]
+    assert result[4] is channels[1][0]
+    assert channels[0][1]['columns'] == 2 * 129280
+    assert channels[1][1]['columns'] == 129280
+    assert channels[0][1]['max_rows'] == channels[1][1]['max_rows'] == 8
+
+
+def test_draft_factory_uses_its_bf16_channel_without_changing_target(monkeypatch):
+    target_runtime, draft_runtime = object(), object()
+    calls = []
+    monkeypatch.setattr(bootstrap, 'PreparedDraft', lambda *args, **kwargs: calls.append(kwargs) or object())
+    target, draft = bootstrap._forward_factories('bf16', window_staging=None,
+        suffix_scratch=None, vision=None, draft_vocabulary_runtime=draft_runtime)
+    draft(vocabulary_runtime=target_runtime)
+    assert calls[0]['vocabulary_runtime'] is draft_runtime
+    assert target.keywords['mla_compute_mode'] == calls[0]['mla_compute_mode'] == 'bf16'

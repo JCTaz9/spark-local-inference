@@ -12,6 +12,8 @@ class PreparedVocabularyProjection:
     Local and full-vocabulary outputs are caller-owned. Every rank participates
     in the gather; the recipe chooses which rank samples from the full logits.
     A quantized shard, such as an NVFP4 draft head, runs as a b12x A16 projection.
+    Unquantized shards honor the output buffer's arithmetic contract; BF16
+    checkpoint weights can accumulate and produce logits in FP32.
     Optional row indices expand gathered physical rows into caller-owned sample
     slots after communication, avoiding repeated projection and transfer.
     """

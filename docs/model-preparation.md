@@ -358,6 +358,9 @@ which must agree with checkpoint `image_token_id`. Packages without explicit
 prompt-encoder metadata continue to use their tokenizer and Jinja template.
 Sampling defaults are temperature 1.0 and top-p 1.0, following the
 [model card](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference).
+Target vocabulary projections keep the checkpoint's BF16 weights and produce
+FP32 logits for generation, prompt scoring, and cached-prefix resume. Proposal
+head precision is configured separately with `--draft-head-quantization`.
 Preparation losslessly compresses backbone and DSpark MXFP4 expert scales with
 CSF by default. Compressed scales stay resident, with shared
 expansion buffers reused by serial expert layers. Planning conservatively estimates
