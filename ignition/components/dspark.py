@@ -46,6 +46,7 @@ class SpeculativePreparation:
         forwards,
         page_tokens=128,
         result_runtime=None,
+        block_proposal_broadcast=False,
         buffers=None,
     ):
         self.forwards = forwards
@@ -60,6 +61,7 @@ class SpeculativePreparation:
         self.markov_runtime = markov_runtime
         # Only sampling uses the result channel; model forwards receive the collectives above.
         self.result_runtime = result_runtime
+        self.block_proposal_broadcast = block_proposal_broadcast
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation = torch.zeros_like(requests.generation)
         self.offset = torch.zeros_like(requests.generation)
