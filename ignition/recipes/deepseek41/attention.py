@@ -13,10 +13,12 @@ from ignition.components.compressed_mla import PreparedCompressedCacheWriter, Pr
 from ignition.components.attention_output import PreparedGroupedOutputProjection
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
+from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from ignition.components.window_indices import PreparedWindowIndices
 from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.scratch import ScratchArena
 
 from ignition.components.rotary import CompressedRotary as Rotary
 from ignition.components.parallel import TensorParallelShard
@@ -351,6 +353,22 @@ class PreparedAttention:
             decode_row_capacity=tokens if mode in ("decode", "verify", "draft") else None,
             session=session, name=f"{name}.attention",
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
+        self.concurrent_query = None
+        if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
+                and isinstance(workspace, ScratchArena) and workspace.overlap):
+            parallel_plans = [self.window_norm.plan, self.window_writer.plan]
+            if self.global_kv is not None:
+                global_kv = self.global_kv
+                compressor = global_kv.compressor
+                parallel_plans.extend((compressor.project_values.plan, compressor.plan,
+                    global_kv.index_key.plan, global_kv.index_norm.plan, global_kv.writer.plan))
+                if hasattr(compressor, "project_gates"):
+                    parallel_plans.append(compressor.project_gates.plan)
+            if self.selectors:
+                parallel_plans.extend((self.index_query.plan, self.index_weight.plan))
+                parallel_plans.extend(selector.plan for selector in self.selectors)
+            self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
+                parallel_plans=parallel_plans, session=session, workspace=workspace)
 
     def __call__(self, source):
         m, s = self.metadata, self.scratch
@@ -361,11 +379,15 @@ class PreparedAttention:
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         self.projections["qkv_a"](source)
         self.query_norm(s.projected[:, :1280])
+        if self.concurrent_query is not None:
+            self.concurrent_query.start(s.query_low)
         self.window_norm(s.projected[:, 1280:])
-        self.projections["q_b"](s.query_low)
-        self.rotary.apply(s.query, position, compressed=bool(self.ratio))
+        if self.concurrent_query is None:
+            self.projections["q_b"](s.query_low)
+            self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
         self.window_writer(s.window_values)
+        dependency = self.window_cache
         if self.ratio:
             if self.global_kv is not None:
                 self.global_kv(source, self.selectors[0])
@@ -375,7 +397,12 @@ class PreparedAttention:
                 self.index_weight(source)
                 s.index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 for selector in self.selectors:
-                    selector()
+                    dependency = selector()
+        if self.concurrent_query is not None:
+            # The indexer only reads query_low. Its output and all main-stream
+            # scratch uses must complete before the query branch rejoins.
+            self.concurrent_query.finish(s.query_low, dependency)
+            self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.attention()
         self.rotary.apply(s.attended, position, compressed=bool(self.ratio), inverse=True)
         self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
