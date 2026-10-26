@@ -9,6 +9,7 @@ from ignition.components.paged_batch import Metadata
 from ignition.preparation.execution import GraphSignature
 from ignition.recipes.deepseek41.contextual_tuning import (
     CatalogCompressedLayerFixture, CatalogLayer0Fixture, _Case,
+    _PrefillLayerSetup, _TargetLayerSeed,
 )
 
 
@@ -151,6 +152,29 @@ def test_trial_restores_only_bounded_model_state_and_keeps_collective_sequence()
     assert runtime.sequence.item() == 17
     call.close()
     assert graph.closed
+
+
+def test_text_only_setup_uses_embedding_without_unbacked_vision_features():
+    forwards, signatures, _, _, _ = _catalog()
+    prefill = forwards["prepared-prefill"].decoder
+    prefill.vision = SimpleNamespace(token_base=6,
+        inject=lambda *_: pytest.fail("text setup must not read vision features"))
+    fixture = CatalogLayer0Fixture(forwards, signatures)
+    assert bool((fixture._token_rows(7101, 128, "cpu") < prefill.vision.token_base).all())
+
+    scratch = SimpleNamespace(embedding=torch.zeros((2, 1)),
+        residual=torch.zeros((2, 1, 1)), pre_mix=torch.zeros((2, 1)))
+    metadata = SimpleNamespace(token_ids=torch.tensor([3, 4]))
+    decoder = SimpleNamespace(vision=prefill.vision, metadata=metadata,
+        weights=SimpleNamespace(embedding=torch.empty((6, 1))),
+        safe_tokens=torch.zeros(2, dtype=torch.int64), scratch=scratch)
+    decoder.embedding = lambda: scratch.embedding.copy_(decoder.safe_tokens[:, None])
+    decoder.window_metadata = lambda: None
+    decoder.layers = (lambda: None,)
+    _PrefillLayerSetup(decoder)()
+    assert torch.equal(scratch.residual[:, 0, 0], metadata.token_ids.float())
+    _TargetLayerSeed(decoder)()
+    assert torch.equal(scratch.residual[:, 0, 0], metadata.token_ids.float())
 
 
 def test_compressed_context_selects_closed_catalog_seam_and_backed_page_prefix():

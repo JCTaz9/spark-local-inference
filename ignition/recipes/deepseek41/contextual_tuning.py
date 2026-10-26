@@ -37,8 +37,9 @@ class _PrefillLayerSetup:
             decoder.safe_tokens.copy_(decoder.metadata.token_ids.clamp(
                 0, decoder.weights.embedding.shape[0] - 1))
         decoder.embedding()
-        if decoder.vision is not None:
-            decoder.vision.inject(decoder.metadata, scratch.embedding)
+        # This setup uses only text embedding IDs. Vision injection would
+        # return the embedding unchanged but read the unmaterialized feature
+        # arena during preparation-only compilation.
         scratch.residual.copy_(scratch.embedding[:, None, :])
         scratch.pre_mix.zero_()
         scratch.pre_mix[:, 0].fill_(1)
@@ -57,8 +58,6 @@ class _TargetLayerSeed:
             decoder.safe_tokens.copy_(decoder.metadata.token_ids.clamp(
                 0, decoder.weights.embedding.shape[0] - 1))
         decoder.embedding()
-        if decoder.vision is not None:
-            decoder.vision.inject(decoder.metadata, scratch.embedding)
         scratch.residual.copy_(scratch.embedding[:, None, :])
         scratch.pre_mix.zero_()
         scratch.pre_mix[:, 0].fill_(1)
@@ -179,6 +178,9 @@ class CatalogLayer0Fixture:
         generator = torch.Generator(device="cpu").manual_seed(seed)
         weights = self.target_decoder.weights
         vocabulary = min(int(weights.config.text["vocab_size"]), weights.embedding.shape[0])
+        for decoder in (self.prefill_decoder, self.target_decoder):
+            if decoder is not None and decoder.vision is not None:
+                vocabulary = min(vocabulary, decoder.vision.token_base)
         if vocabulary <= 3:
             raise ValueError("contextual embedding vocabulary lacks ordinary in-range IDs")
         return torch.randint(3, vocabulary, (1, rows), generator=generator,
@@ -190,10 +192,16 @@ class CatalogLayer0Fixture:
         target_start = start if rows == self.TARGET_TOKENS else start + self.PREFILL_TOKENS
         pages[0, (target_start - self.PREFILL_TOKENS) // 128] = 1
         pages[0, target_start // 128] = 2
+        tokens = self._token_rows(seed, rows, device)
+        for decoder in (self.prefill_decoder, self.target_decoder):
+            if (decoder is not None and metadata is decoder.metadata
+                    and decoder.vision is not None
+                    and not bool((tokens < decoder.vision.token_base).all())):
+                raise ValueError("contextual setup requires text-only embedding IDs")
         metadata.set(torch.tensor([start], dtype=torch.int64, device=device),
             torch.tensor([rows], dtype=torch.int32, device=device),
             torch.tensor([self.state_row], dtype=torch.int64, device=device),
-            pages, self._token_rows(seed, rows, device),
+            pages, tokens,
             torch.ones((1,), dtype=torch.int32, device=device))
 
     @staticmethod
