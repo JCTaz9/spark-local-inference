@@ -486,3 +486,60 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
             self.broadcast()
             self._restore_support()
         return self.probabilities
+
+
+class PreparedDraftBlockBroadcast:
+    """Canonicalize a replicated proposal chain after its final conditional draw.
+
+    Every rank may execute a different local chain, but only rank zero's tokens,
+    exact proposal probabilities and validity survive. No peer-dependent operation
+    may consume a local proposal before finish(). Subsequent confidence features
+    must be reconstructed from the canonical preceding tokens.
+    """
+
+    @staticmethod
+    def broadcast_layout(batch, depth):
+        return dict(support_ids=((depth, batch, DRAFT_CANDIDATES), torch.int64),
+                    support_probabilities=((depth, batch, DRAFT_CANDIDATES), torch.float32),
+                    sampled=((depth, batch), torch.int64), valid=((depth, batch), torch.bool))
+
+    def __init__(self, proposals, drafts, probabilities, valid, sampled, *, runtime,
+                 session, coordinator, name, buffers=None):
+        from .collectives import PreparedBroadcast
+
+        batch, depth = drafts.shape
+        if not proposals or len(proposals) != depth or any(p.broadcast is not None for p in proposals):
+            raise ValueError("block proposal broadcast requires an unbroadcast complete proposal chain")
+        if (probabilities.shape[:2] != (batch, depth) or valid.shape != drafts.shape
+                or sampled.shape != (batch,)):
+            raise ValueError("block proposal outputs must cover every request and draft position")
+        layout = self.broadcast_layout(batch, depth)
+        def allocate(shape, dtype):
+            return (torch.zeros(shape, dtype=dtype, device=drafts.device) if buffers is None
+                    else buffers.zeros(shape, dtype))
+        self.support_ids, self.support_probabilities, self.sampled, self.valid = (
+            allocate(*field) for field in layout.values())
+        self.drafts, self.probabilities, self.output_valid = drafts, probabilities, valid
+        self.output_sampled = sampled
+        self.positions = torch.arange(depth, device=drafts.device)
+        for index, proposal in enumerate(proposals):
+            proposal.proposal.bind_support(self.support_ids[index], self.support_probabilities[index])
+        self.broadcast = PreparedBroadcast(
+            (self.support_ids, self.support_probabilities, self.sampled, self.valid),
+            runtime=runtime, session=session, coordinator=coordinator, name=name, buffers=buffers)
+
+    def retain(self, position, proposal):
+        self.sampled[position].copy_(proposal.sampled)
+        self.valid[position].copy_(proposal.valid[:, 0])
+
+    def finish(self, active, limits):
+        self.broadcast()
+        self.drafts.copy_(self.sampled.T)
+        self.output_sampled.copy_(self.sampled[-1])
+        self.output_valid.copy_(self.valid.T & active[:, None]
+                                & (self.positions[None, :] < limits[:, None] - 1))
+        # Local supports can differ at every position. Clear the complete retained
+        # rows before restoring root q; padding repeats token zero with identical bits.
+        self.probabilities.zero_()
+        self.probabilities.scatter_(2, self.support_ids.permute(1, 0, 2),
+                                   self.support_probabilities.permute(1, 0, 2))
