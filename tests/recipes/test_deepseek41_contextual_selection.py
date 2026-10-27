@@ -8,7 +8,9 @@ import pytest
 import torch
 from b12x.preparation import Finalist, FrozenMapping, PreparedCall, Selection
 
-from ignition.recipes.deepseek41.contextual_selection import CatalogContextualSelection, prepared_layer_variant
+from ignition.recipes.deepseek41.contextual_selection import (
+    CatalogContextualSelection, contextual_summary, prepared_layer_variant,
+)
 
 
 class Plan:
@@ -164,3 +166,23 @@ def test_context_progress_counts_each_candidate_once_per_balanced_round(monkeypa
                                                        "repetition": repetition})
         assert len(peers) == 2 and all(peer["indices"] == (4,) for peer in peers)
     assert advances == [1]
+
+
+def test_export_summary_identifies_tuple_configs_and_both_measured_layers():
+    report = {"objective": "equal-weight sum of complete layer GPU replay, each timed as TP max-rank",
+        "winner": "context-selected", "standalone_tuple": "context-standalone",
+        "winner_configs": {"qkv_a": {"split_k_slices": 4},
+                           "norm": {"programmatic_serialization": False},
+                           "q_b": {"split_k_slices": 2}},
+        "latencies_us": {"context-selected": {"0": 90.0, "37": 105.0},
+                         "context-standalone": {"0": 92.0, "37": 106.0}},
+        "total_us": {"context-selected": 195.0}, "standalone_total_us": 198.0,
+        "cache_policy": {"0": "cold", "37": "cold"}, "rounds": 3, "samples": 2,
+        "lock_gpu_clocks": False}
+    line = contextual_summary(report)
+    assert line.startswith("Selected complete-layer plans: ")
+    payload = json.loads(line.split(": ", 1)[1])
+    assert payload["configs"] == report["winner_configs"]
+    assert payload["layer_us"] == {"0": 90.0, "37": 105.0}
+    assert payload["standalone_layer_us"] == {"0": 92.0, "37": 106.0}
+    assert payload["sum_us"] == 195.0 and payload["standalone_sum_us"] == 198.0

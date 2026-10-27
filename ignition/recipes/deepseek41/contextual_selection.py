@@ -30,6 +30,20 @@ _POLICIES = {
 }
 
 
+def contextual_summary(report):
+    """One export line identifying the selected tuple and its measured layers."""
+    winner, standalone = report["winner"], report["standalone_tuple"]
+    detail = {"objective": report["objective"], "winner": winner,
+              "configs": report["winner_configs"],
+              "layer_us": report["latencies_us"][winner],
+              "standalone_layer_us": report["latencies_us"][standalone],
+              "sum_us": report["total_us"][winner],
+              "standalone_sum_us": report["standalone_total_us"],
+              "cache_policy": report["cache_policy"], "rounds": report["rounds"],
+              "samples": report["samples"], "lock_gpu_clocks": report["lock_gpu_clocks"]}
+    return "Selected complete-layer plans: " + json.dumps(detail, sort_keys=True, separators=(",", ":"))
+
+
 def _role_plans(layer):
     attention = layer.attention
     if attention.norm_quant is None:
@@ -346,6 +360,9 @@ class CatalogContextualSelection:
             session.release_many(unused)
         report = {"objective": "equal-weight sum of complete layer GPU replay, each timed as TP max-rank",
             "tuples": len(selections), "winner": self._tuple_name(winner_index, configs, winning_selection),
+            "winner_configs": {role: plan.contract.config_payload(configs[role][offset]).to_dict()
+                               for plan, role, offset in zip(_role_plans(self.layers[0]), _ROLES,
+                                                              winning_selection, strict=True)},
             "standalone_tuple": standalone_name,
             "standalone_total_us": totals[standalone_name],
             "target_rows": self.fixtures[0].target_signature.token_capacity,

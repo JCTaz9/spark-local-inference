@@ -541,6 +541,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
             tuning = session.tune(show_progress=progress is not None and rank == 0,
                                   console=stage.console, contextual=contextual)
+        if contextual is not None and progress is not None:
+            from .contextual_selection import contextual_summary
+
+            summary = contextual_summary(tuning["contextual_tuning"])
+            if hasattr(progress, "console"):
+                progress.console.print(summary, markup=False)
+            else:
+                progress(summary)
         stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
         arena.allocation_pool = graph_buffers.allocation_pool = activation_buffers.allocation_pool = None
         scratch_pool.retire()
