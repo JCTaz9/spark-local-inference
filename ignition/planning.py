@@ -308,6 +308,7 @@ class Plan:
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
                 "markov_head_quantization": self.speculation.markov_head_quantization,
+                "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
                 **({"graph_budget": self.speculation.graph_budget}
                    if self.speculation.graph_budget is not None else {})},
             "context": self.context, "checkpoint_context": self.recipe.context,
@@ -348,6 +349,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
     if speculation is not None:
+        if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
+            raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
         for head in ("draft", "markov"):
             value = getattr(speculation, f"{head}_head_quantization")
             if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):

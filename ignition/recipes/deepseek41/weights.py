@@ -68,7 +68,8 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
-             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None):
+             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
+             vocabulary_parallel_sampling=False):
         config = ModelConfig.load(manifest.metadata_path)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
@@ -78,6 +79,13 @@ class ModelWeights:
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
             if draft is not None:
+                if vocabulary_parallel_sampling:
+                    first, last = shard.padded_partition(129280, alignment=64)
+                    local = torch.zeros((last - first, draft.markov_head.shape[1]),
+                                        device=device, dtype=draft.markov_head.dtype)
+                    covered = min(last, 129280) - first
+                    local[:covered].copy_(draft.markov_head[first:first + covered])
+                    draft = replace(draft, markov_head=local)
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
                 elif draft_head_quantization == "mxfp8":

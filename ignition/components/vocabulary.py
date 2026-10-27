@@ -15,11 +15,13 @@ class PreparedVocabularyProjection:
     Unquantized shards honor the output buffer's arithmetic contract; BF16
     checkpoint weights can accumulate and produce logits in FP32.
     Optional row indices expand gathered physical rows into caller-owned sample
-    slots after communication, avoiding repeated projection and transfer.
+    slots after communication, avoiding repeated projection and transfer. With
+    ``gather=False``, consumers receive the local projection directly and own
+    any distributed normalization or sampling.
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, workspace=None):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, workspace=None, gather=True):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -34,6 +36,12 @@ class PreparedVocabularyProjection:
         else:
             self.projection = QuantizedProjection(source, weight, local_output,
                 session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
+        self.local_only = not gather
+        if self.local_only:
+            if row_indices is not None:
+                raise ValueError("local vocabulary projections require unexpanded physical rows")
+            self.output = local_output
+            return
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
         if columns < output.shape[1]:
@@ -47,6 +55,8 @@ class PreparedVocabularyProjection:
         self.padded = columns != output.shape[1]
 
     def __call__(self, source):
+        if self.local_only:
+            return self.projection(source)
         gathered = self.gather(self.projection(source))
         if self.row_indices is not None:
             # Indexed reads materialize before the overlapping destination write.
