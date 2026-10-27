@@ -14,7 +14,12 @@ pub struct StartupProgress {
     enabled: bool,
     terminal: bool,
     output: Arc<Mutex<Output>>,
-    animation: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
+    animation: Option<(mpsc::Sender<AnimationStop>, JoinHandle<()>)>,
+}
+
+enum AnimationStop {
+    Finish,
+    Pause,
 }
 
 impl StartupProgress {
@@ -59,17 +64,23 @@ impl StartupProgress {
         output.started = Some(started);
         output.redraw(0.0);
         drop(output);
+        self.spawn_animation(started);
+    }
+
+    fn spawn_animation(&mut self, started: Instant) {
         let output = self.output.clone();
         let (stop, receiver) = mpsc::channel();
         let worker = thread::spawn(move || {
-            for tick in 1.. {
-                let stopped = !matches!(
-                    receiver.recv_timeout(
-                        (started + (Duration::from_micros(62_500) * tick).min(banner::DURATION))
-                            .saturating_duration_since(Instant::now()),
-                    ),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                );
+            loop {
+                let stopped = match receiver.recv_timeout(
+                    banner::DURATION
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_micros(62_500)),
+                ) {
+                    Ok(AnimationStop::Pause) => return,
+                    Ok(AnimationStop::Finish) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                };
                 let mut output = output.lock().unwrap();
                 let progress = output.progress();
                 if stopped || progress >= 1.0 {
@@ -86,10 +97,25 @@ impl StartupProgress {
         self.animation = Some((stop, worker));
     }
 
+    /// Joins the banner worker for an operation, then resumes its original timeline.
+    /// Callers must finish any loading phases first to stop their progress workers.
+    pub fn with_animation_paused<T>(&mut self, operation: impl FnOnce() -> T) -> T {
+        if let Some((stop, worker)) = self.animation.take() {
+            let _ = stop.send(AnimationStop::Pause);
+            let _ = worker.join();
+        }
+        let result = operation();
+        let started = self.output.lock().unwrap().started;
+        if let Some(started) = started {
+            self.spawn_animation(started);
+        }
+        result
+    }
+
     /// Settles the header before another terminal UI takes ownership of stderr.
     pub fn finish_animation(&mut self) {
         if let Some((stop, worker)) = self.animation.take() {
-            let _ = stop.send(());
+            let _ = stop.send(AnimationStop::Finish);
             let _ = worker.join();
         }
     }
@@ -392,4 +418,45 @@ fn terminal_width() -> usize {
 
 fn terminal_size() -> (usize, usize) {
     crate::os::terminal_size()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pausing_banner_preserves_playback_and_loading_rows() {
+        let mut progress = StartupProgress::silent();
+        progress.enabled = true;
+        progress.terminal = true;
+        progress.animate_banner();
+        let started = progress.output.lock().unwrap().started.unwrap();
+        progress.phase("Verify package", None).finish("signatures");
+        let output = progress.output.clone();
+        let result = progress.with_animation_paused(|| {
+            let output = output.lock().unwrap();
+            assert_eq!(output.started, Some(started));
+            assert!(output.progress() < 1.0);
+            assert_eq!(output.completed.len(), 1);
+            Err::<(), _>("configuration failed")
+        });
+        assert_eq!(result, Err("configuration failed"));
+        assert_eq!(progress.output.lock().unwrap().started, Some(started));
+
+        let (stop, worker) = progress.animation.take().unwrap();
+        worker.join().unwrap();
+        drop(stop);
+        assert!(started.elapsed() >= banner::DURATION);
+        assert!(progress.output.lock().unwrap().started.is_none());
+        progress.with_animation_paused(|| ());
+        assert!(progress.animation.is_none());
+    }
+
+    #[test]
+    fn pausing_without_a_banner_does_not_start_animation() {
+        let mut progress = StartupProgress::silent();
+        assert_eq!(progress.with_animation_paused(|| 42), 42);
+        assert!(progress.animation.is_none());
+        assert!(progress.output.lock().unwrap().started.is_none());
+    }
 }

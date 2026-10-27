@@ -97,7 +97,11 @@ def _freeze_tuning_winners(bundle):
         kernel = entry.kernel
         if len(kernel.compile_results) != 1 or not kernel.is_statically_launchable():
             raise ValueError(f"compiled kernel {entry.kernel_name} has unresolved tuning candidates")
-        config = kernel.compile_results[0].config
+        result, = kernel.compile_results
+        config = result.config
+        if hasattr(result, '_flare_config_state'):
+            config.__dict__.clear()
+            config.__dict__.update(result._flare_config_state)
         metadata = kernel.inductor_meta
         if (metadata.get("coordinate_descent_tuning", False)
                 and kernel._should_coordesc_tune
@@ -106,15 +110,16 @@ def _freeze_tuning_winners(bundle):
         if (metadata.get("combo_tuning_groups")
                 and not getattr(config, "found_by_combo_autotune", False)):
             raise ValueError(f"compiled kernel {entry.kernel_name} has pending combo tuning")
-        kernel.inductor_meta = {**metadata, "dynamic_scale_rblock": False}
+        kernel.inductor_meta = {**metadata, "dynamic_scale_rblock": False,
+                                "coordinate_descent_tuning": False}
         kernel.__dict__.pop("_could_rblock_scale", None)
     bundle.static_autotuners[:] = entries.values()
 
 
-def relocate_inductor(entry, original):
+def relocate_inductor(entry, original, *, freeze_tuning=False):
     target = _DEVICE.get()
     relocate = target is not None and target != original
-    freeze_tuning = _FREEZE_TUNING.get()
+    freeze_tuning = freeze_tuning or _FREEZE_TUNING.get()
     if not relocate and not freeze_tuning:
         return
     from torch._inductor.codecache import code_hash

@@ -40,8 +40,7 @@ def test_result_broadcast_channel_uses_captured_payloads(
     proposals = PreparedDraftDistribution.broadcast_layout(batch)
     acceptance = SpeculativeAcceptance.broadcast_layout(batch, 6)
     actual = SpeculativeAcceptance.allocate(batch, 6, "meta")
-    assert acceptance == {name: (tuple(tensor.shape), tensor.dtype) for name, tensor in vars(actual).items()
-                          if name != "survival"}
+    assert acceptance == {name: (tuple(tensor.shape), tensor.dtype) for name, tensor in vars(actual).items()}
     assert packed_broadcast_layout(proposals.values()) == (offsets, payload_bytes)
     calls = []
     group, device, ipc, result = object(), object(), object(), object()

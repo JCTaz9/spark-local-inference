@@ -157,7 +157,14 @@ No tuning coordination runs after graph handoff.
   budgeted for their host's ranks. Ranks on one host share its cache directory;
   ranks on other hosts receive the artifacts they lack. Every rank loads the same
   artifacts, binds its tensors and native handles, and participates in ordered
-  warmup and local capture. Keep shard offsets and native handles in runtime
+  warmup and local capture. Inductor's first owner-process warmup may tune the
+  same generated kernel independently on several ranks. At each complete-forward
+  boundary, ranks adopt one measured selection and compiled kernel for each exact
+  generated source and candidate contract, with only the CUDA ordinal normalized.
+  The first canonical selection remains authoritative across the complete catalog.
+  A second warmup verifies the frozen selections before capture; cached artifacts
+  retain those selections on single-rank and tensor-parallel reloads. No selection
+  exchange occurs inside a forward or a native collective. Keep shard offsets and native handles in runtime
   bindings when they do not change the computation. For distinct rank behavior,
   select a variant key through `compilation_variant` on each rank. Every
   selected variant must compile before collective warmup; ranks must not retrace
