@@ -7,7 +7,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.components.markov_sampling import PreparedMarkovProposals, _proposal_random_bits
+from ignition.components.markov_sampling import (
+    PreparedMarkovProposals, _proposal_random_bits, fp8_markov_head,
+)
 from ignition.components.sampling import DeviceRequestState, RUNNING
 from ignition.components.speculation import DRAFT_RNG_DOMAIN
 
@@ -59,11 +61,13 @@ def test_philox_counter_coordinates():
     assert output.cpu().tolist() == expected
 
 
-def fixture(batch=1, depth=7, vocab=1024, rank=256, random=True):
+def fixture(batch=1, depth=7, vocab=1024, rank=256, random=True, fp8=False):
     gen = torch.Generator().manual_seed(714)
     embedding = torch.randn((vocab, rank), generator=gen) / 8 if random else torch.zeros((vocab, rank))
     head = torch.randn((vocab, rank), generator=gen) / 8 if random else torch.zeros((vocab, rank))
     embedding, head = (embedding.to("cuda", torch.bfloat16), head.to("cuda", torch.bfloat16))
+    if fp8:
+        head = fp8_markov_head(head)
     base = torch.randn((batch, depth, vocab), generator=gen).to("cuda", torch.bfloat16)
     pending = torch.arange(batch, device="cuda", dtype=torch.int64) % vocab
     tokens = torch.empty((batch, depth), device="cuda", dtype=torch.int64)
@@ -83,6 +87,56 @@ def fixture(batch=1, depth=7, vocab=1024, rank=256, random=True):
     )
     op.prepare()
     return op
+
+
+@pytest.mark.parametrize("batch,depth,vocab", [(1, 2, 1024), (8, 7, 1024), (1, 1, 129280)])
+def test_fp8_markov_transition_uses_reconstructed_weights_and_fp32_q(batch, depth, vocab):
+    op = fixture(batch, depth, vocab, fp8=True)
+    values = op.head.values.double()
+    scales = op.head.scale.double()
+    u = 2.0**-24
+    gamma = (values.shape[1] - 1) * u / (1 - (values.shape[1] - 1) * u)
+    for call in op.kernels[:-1]:
+        call()
+    raw = op.probabilities.clone().double()
+    op.kernels[-1]()
+    previous = op.pending
+    for step in range(depth):
+        embedding = op.embedding[previous].double()
+        dot = embedding @ values.T
+        exact = op.base[:, step].double() + dot * scales
+        absolute = (embedding.abs() @ values.abs().T) * scales.abs()
+        bound = gamma * absolute + 2 * u * (dot.abs() * scales.abs() + op.base[:, step].double().abs())
+        assert ((raw[:, step] - exact).abs() <= bound + 2.0**-149).all()
+        # The probability oracle uses the quantized values and FP32 row scales,
+        # rather than the checkpoint BF16 weights.
+        expected_q = raw[:, step].softmax(-1)
+        torch.testing.assert_close(op.probabilities[:, step].double(), expected_q, atol=1e-10, rtol=3e-6)
+        previous = op.tokens[:, step]
+    assert op.valid.all()
+    assert op.probabilities.dtype == torch.float32
+
+
+@pytest.mark.parametrize("kind", ["single_token", "inactive", "nan"])
+def test_fp8_markov_preserves_grammar_and_invalid_row_contract(kind):
+    op = fixture(batch=1, depth=2, random=False, fp8=True)
+    op.base.zero_()
+    if kind == "single_token":
+        op.state.grammar_enabled.fill_(True)
+        op.state.grammar_mask.zero_()
+        op.state.grammar_mask[0, 0] = 1 << 3
+    elif kind == "inactive":
+        op.state.status.zero_()
+    else:
+        op.base[:, :, 7] = float("nan")
+    op()
+    assert torch.isfinite(op.probabilities).all()
+    if kind == "single_token":
+        assert op.valid.all() and (op.tokens == 3).all()
+    else:
+        assert not op.valid.any() and (op.tokens == 0).all()
+        assert (op.probabilities[:, :, 0] == 1).all()
+        assert (op.probabilities[:, :, 1:] == 0).all()
 
 
 @pytest.mark.parametrize(
@@ -168,8 +222,9 @@ def test_masks_nonfinite_and_denominator_boundaries(kind):
         assert (op.probabilities == 1 / op.vocab).all()
 
 
-def test_counter_advance_rollback_and_batch_permutation():
-    op = fixture(batch=8)
+@pytest.mark.parametrize("fp8", [False, True])
+def test_counter_advance_rollback_and_batch_permutation(fp8):
+    op = fixture(batch=8, fp8=fp8)
     op()
     tokens = op.tokens.clone()
     q = op.probabilities.clone()
@@ -192,14 +247,15 @@ def test_counter_advance_rollback_and_batch_permutation():
 
 
 @torch.no_grad()
-def test_uniform_endpoint_keeps_single_token_grammar_support_under_native_replay():
+@pytest.mark.parametrize("fp8", [False, True])
+def test_uniform_endpoint_keeps_single_token_grammar_support_under_native_replay(fp8):
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.graphs import PreparedGraphBundle
 
     allowed = 106475
     seed = 213 ^ DRAFT_RNG_DOMAIN
     assert philox(seed, (allowed, 0, 0, 0x47554D42))[0] == 0xFFFFFFFF
-    operation = fixture(batch=1, depth=1, vocab=129280, random=False)
+    operation = fixture(batch=1, depth=1, vocab=129280, random=False, fp8=fp8)
     operation.base.zero_()
     operation.seeds.fill_(seed)
     operation.offsets.zero_()

@@ -23,7 +23,7 @@ class Pipeline:
         self.target_count.scatter_add_(0, self.verify.output.token_ids[:, 0], self.ones)
 
 
-def run(output):
+def run(output, *, fp8=False, policy_names=None):
     b, d, v, r = 32, 1, 8, 64
     torch.cuda.set_device(0)
     state = DeviceRequestState.allocate("cuda", vocab_size=v, capacity=b)
@@ -41,6 +41,10 @@ def run(output):
     )
     embedding = torch.zeros((v, r), device="cuda", dtype=torch.bfloat16)
     head = torch.zeros_like(embedding)
+    if fp8:
+        from ignition.components.markov_sampling import fp8_markov_head
+
+        head = fp8_markov_head(head)
     pending = torch.zeros(b, device="cuda", dtype=torch.int64)
     tokens = torch.empty((b, d), device="cuda", dtype=torch.int64)
     q = torch.empty((b, d, v), device="cuda")
@@ -92,6 +96,8 @@ def run(output):
             "temperature_penalties": penalized,
             "point_mass": torch.nn.functional.one_hot(torch.tensor(5), v).double(),
         }
+        if policy_names is not None:
+            policies = {name: policies[name] for name in policy_names}
         steps = 4096
         n = steps * b
         alpha = 1e-7

@@ -10,6 +10,7 @@ from .collectives import PreparedAllGather
 from .compressed_mla import PreparedCompressedCacheWriter
 from .embedding import PreparedEmbedding
 from .linear import QuantizedProjection, UnquantizedProjection
+from .markov_sampling import PreparedRowScaledFP8MarkovProjection, RowScaledFP8MarkovWeight
 from .rms_norm import PreparedRMSNorm
 from .rotary import CompressedRotary as Rotary
 
@@ -227,7 +228,8 @@ class PreparedMarkov:
 
     A replicated head runs independently on each rank without a collective.
     A sharded head uses the supplied runtime to gather its FP32 bits unchanged.
-    Quantized A16 projections produce BF16 logits, widened before bias addition.
+    NVFP4 A16 projections produce BF16 logits that are widened before addition;
+    row-scaled E4M3 projections write FP32 logits directly.
     """
 
     def __init__(self, weights, tokens, *, runtime, coordinator, session, name):
@@ -241,16 +243,20 @@ class PreparedMarkov:
         if columns != expected_columns:
             raise ValueError("Markov head vocabulary partition must match its gather runtime")
         self.local = torch.zeros((rows, columns), dtype=torch.float32, device=device)
-        self.projected = self.local if isinstance(head, torch.Tensor) else torch.empty(
+        self.projected = self.local if isinstance(head, (torch.Tensor, RowScaledFP8MarkovWeight)) else torch.empty(
             (rows, columns), dtype=torch.bfloat16, device=device)
         self.logits = self.local if runtime is None else torch.zeros((rows, 129280), dtype=torch.float32, device=device)
         self.embed = PreparedEmbedding(
             weights.draft.markov_embedding, tokens, self.embedding, session=session, name=name + ".embed"
         )
-        projection = UnquantizedProjection if isinstance(head, torch.Tensor) else QuantizedProjection
-        options = {} if isinstance(head, torch.Tensor) else {"activation_mode": "a16"}
-        self.projection = projection(self.embedding, head, self.projected,
-                                     session=session, name=name + ".head", **options)
+        if isinstance(head, RowScaledFP8MarkovWeight):
+            self.projection = PreparedRowScaledFP8MarkovProjection(self.embedding, head, self.projected,
+                session=session, name=name + ".head")
+        else:
+            projection = UnquantizedProjection if isinstance(head, torch.Tensor) else QuantizedProjection
+            options = {} if isinstance(head, torch.Tensor) else {"activation_mode": "a16"}
+            self.projection = projection(self.embedding, head, self.projected,
+                                         session=session, name=name + ".head", **options)
         self.gather = None if runtime is None else PreparedAllGather(
             self.local.view(torch.bfloat16),
             self.logits.view(torch.bfloat16),
@@ -261,7 +267,11 @@ class PreparedMarkov:
         )
 
     def __call__(self):
-        self.projection(self.embed())
+        embedded = self.embed()
+        if isinstance(self.projection, PreparedRowScaledFP8MarkovProjection):
+            self.projection()
+        else:
+            self.projection(embedded)
         if self.projected is not self.local:
             self.local.copy_(self.projected)
         if self.gather is not None:
