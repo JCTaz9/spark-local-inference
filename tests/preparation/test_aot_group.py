@@ -1,5 +1,6 @@
 """Grouped forwards retain ordinary guards and storage-alias checks."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -75,3 +76,57 @@ def test_group_rejects_different_rank_signatures(monkeypatch):
     with pytest.raises(BindingMismatch, match="different grouped forward owners or signatures"):
         object.__new__(ForwardCache).bind_group(template,
             {"first": first}, signature="same", coordinator=coordinator)
+
+
+def test_trial_inputs_are_restored_before_tuning_and_frozen_inductor_warmups(tmp_path):
+    events, state = [], {"ready": False}
+
+    class Compiled:
+        _flare_graph = object()
+
+    class TrialArtifact:
+        _artifacts = SimpleNamespace(compiled_fn=SimpleNamespace(artifact=Compiled()))
+
+        def save_compiled_function(self, path):
+            events.append("save")
+
+    class TrialForward:
+        artifact = TrialArtifact()
+        cache_hit = True
+
+        def __call__(self):
+            assert state["ready"]
+            state["ready"] = False
+            events.append("run")
+
+    class Selections:
+        def register(self, bound):
+            events.append("register")
+
+        def warm(self, bound, warmup):
+            for _ in range(2):
+                with warmup():
+                    bound()
+
+        def freeze(self, bound):
+            events.append("freeze")
+
+    @contextmanager
+    def transient():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def restore():
+        assert not state["ready"]
+        state["ready"] = True
+        events.append("restore")
+
+    bound = TrialForward()
+    cache = object.__new__(ForwardCache)
+    assert cache._warm(bound, tmp_path / "trial.bin", name="trial", selections=Selections(),
+                       warmup=transient, before_run=restore) is bound
+    assert events == ["register", "enter", "restore", "run", "exit",
+                      "enter", "restore", "run", "exit", "freeze", "save"]
