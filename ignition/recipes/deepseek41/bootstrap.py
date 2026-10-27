@@ -264,13 +264,13 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
     sample_rows = max(verification_samples, config.request_capacity * config.draft_tokens)
     layouts = ()
     if config.dspark:
-        from ignition.components.draft_sampling import PreparedDraftDistribution
+        from ignition.components.draft_sampling import PreparedDraftBlockBroadcast
         from ignition.components.speculation import SpeculativeAcceptance
 
         batch = max(config.batch_capacities)
         layouts = (SpeculativeAcceptance.broadcast_layout(batch, max(config.speculative_widths)),)
         if config.draft_tokens:
-            layouts += (PreparedDraftDistribution.broadcast_layout(batch),)
+            layouts += (PreparedDraftBlockBroadcast.broadcast_layout(batch, config.draft_tokens),)
     if coordinator.spans_hosts:
         from ignition.components.collectives import packed_broadcast_layout
 
@@ -418,6 +418,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 session=session, workspace=arena,
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 markov_runtime=None, coordinator=coordinator, result_runtime=result_collective,
+                block_proposal_broadcast=True,
                 buffers=activation_buffers.cursor(),
                 forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
                     draft_factory, PreparedMarkov))
