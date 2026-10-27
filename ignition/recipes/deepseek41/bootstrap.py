@@ -68,6 +68,17 @@ def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, visi
                     mla_compute_mode=mla_compute_mode))
 
 
+def _can_race_contextual_plans(config, signatures, device):
+    if (not config.dspark or config.autotune_effort == "off" or not any(
+            signature.kind == "speculative" and signature.batch_capacity == 1
+            and signature.token_capacity == 8 and signature.packed_token_capacity is not None
+            and signature.packed_token_capacity >= 8 for signature in signatures.values())):
+        return False
+    from b12x.quantization import mla_norm_mxfp8
+
+    return mla_norm_mxfp8.is_supported(device)
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     prompt_logprobs: bool = False
@@ -524,8 +535,26 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if feature_pool is not None:
         feature_pool.release_backing()
     try:
+        contextual = None
+        if _can_race_contextual_plans(config, signatures, device):
+            from .contextual_selection import CatalogContextualSelection
+
+            contextual = CatalogContextualSelection(forwards, signatures, arena=arena,
+                coordinator=coordinator, collective=collective, device=device,
+                graph_pool=package_storage.graph_pool.id, cache_root=config.kernel_cache,
+                compile_decoder=config.compile_decoder, warmup_storage=package_storage,
+                progress=progress)
         with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
-            tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+            tuning = session.tune(show_progress=progress is not None and rank == 0,
+                                  console=stage.console, contextual=contextual)
+        if contextual is not None and progress is not None:
+            from .contextual_selection import contextual_summary
+
+            summary = contextual_summary(tuning["contextual_tuning"])
+            if hasattr(progress, "console"):
+                progress.console.print(summary, markup=False)
+            else:
+                progress(summary)
         stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
         arena.allocation_pool = graph_buffers.allocation_pool = activation_buffers.allocation_pool = None
         scratch_pool.retire()

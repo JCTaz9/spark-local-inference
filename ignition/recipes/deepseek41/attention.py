@@ -4,14 +4,17 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
+from b12x.quantization import mla_norm_mxfp8, mxfp8
 import triton
 import triton.language as tl
 from b12x.attention import mla_compress
 from b12x.preparation import PreparedCall
 
+from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.mla_norm_quant import PreparedMLANormQuant
 from ignition.components.mxfp4_indexer import PreparedMXFP4Indexer
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.rms_norm import PreparedRMSNorm
@@ -291,15 +294,31 @@ class PreparedAttention:
         self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
         self.page_table = metadata.token_page_table
         self.projections = {}
+        use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
+        paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+                           for key in ("qkv_a", "q_b"))
+        self.norm_quant = (PreparedMLANormQuant(scratch.projected,
+            (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values,
+            eps=self.eps, session=session, name=name + ".qkv_norm", buffers=buffers,
+            release_dependents=tokens <= 8)
+            if paired_mxfp8 and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
         for key, values, out in (
             ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
         ):
+            packed_mxfp8 = use_b12x_mxfp8 and isinstance(
+                getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
             self.projections[key] = QuantizedProjection(values, weights[key], out,
-                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
-        self.query_norm = PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
-            eps=self.eps, session=session, name=name + ".q_norm")
-        self.window_norm = PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
-            eps=self.eps, session=session, name=name + ".kv_norm")
+                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
+                mxfp8_min_amax=(1e-4 if packed_mxfp8 and (key != "q_b" or self.norm_quant is None)
+                                else None),
+                encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
+                rhs_prefetch_ready=packed_mxfp8,
+                allow_bf16_atomic_reduction=not packed_mxfp8,
+                buffers=buffers)
+        self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
+            eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
+        self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
+            eps=self.eps, session=session, name=name + ".kv_norm") if self.norm_quant is None else None)
         self.output_projection = PreparedGroupedOutputProjection(scratch.attended.view(tokens, -1, 4096),
             weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
@@ -356,7 +375,9 @@ class PreparedAttention:
         self.concurrent_query = None
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap):
-            parallel_plans = [self.window_norm.plan, self.window_writer.plan]
+            parallel_plans = [self.window_writer.plan]
+            if self.window_norm is not None:
+                parallel_plans.append(self.window_norm.plan)
             if self.global_kv is not None:
                 global_kv = self.global_kv
                 compressor = global_kv.compressor
@@ -378,10 +399,14 @@ class PreparedAttention:
         if self.mode != "decode":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         self.projections["qkv_a"](source)
-        self.query_norm(s.projected[:, :1280])
+        if self.norm_quant is None:
+            self.query_norm(s.projected[:, :1280])
+        else:
+            self.norm_quant(s.projected)
         if self.concurrent_query is not None:
             self.concurrent_query.start(s.query_low)
-        self.window_norm(s.projected[:, 1280:])
+        if self.window_norm is not None:
+            self.window_norm(s.projected[:, 1280:])
         if self.concurrent_query is None:
             self.projections["q_b"](s.query_low)
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))

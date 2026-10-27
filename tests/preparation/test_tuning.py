@@ -154,6 +154,57 @@ class Request:
     collective: object = None
     retain_benchmark_call: bool = False
     dependencies: tuple[str, ...] = ()
+    finalist_policy: object = None
+
+
+def test_context_choice_rebinds_declared_plan_owner_and_parallel_scratch(backend):
+    session = make_session(device=0, checkpoint="context-bindings")
+    session.device.identity = "test-device"
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    session.register_scratch(arena)
+
+    class Plan:
+        def __init__(self, *, override=None, size=256):
+            self.override = override
+            self.prepared = SimpleNamespace(device=SimpleNamespace(identity="test-device"))
+            self.selection = SimpleNamespace(source="tuned" if override is None else "override",
+                                              config={"tile": 32 if override is None else override})
+            self.size = size
+
+        def same_declaration_except_override(self, other):
+            return isinstance(other, Plan)
+
+        def memory_requirements(self):
+            return SimpleNamespace(scratch_nbytes=self.size)
+
+    original, alternative, writer = Plan(), Plan(override=64, size=512), Plan(size=128)
+    request = Request("q_b", original, lambda state: None, finalist_policy="families")
+    session.declare((request,))
+    arena.register_parallel(original, writer)
+    owner = SimpleNamespace(plan=original)
+    session.register_context_plan("q_b", original, lambda plan: setattr(owner, "plan", plan))
+    session._context_original_requests = dict(session._recorded_requests)
+    session._tune_status = "contextual"
+
+    previous = session.bind_context_plans({"q_b": alternative})
+    assert previous == {"q_b": original}
+    assert owner.plan is alternative and session._recorded_requests["q_b"].plan is alternative
+    assert session._recorded_requests["q_b"].finalist_policy is None
+    assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 768
+    session.preview_context_bindings()
+    assert not arena.frozen and session._context_scratch_owner is arena.tensor
+    session.close()
+
+
+def test_finalist_policy_applies_to_every_equivalent_declaration(backend):
+    session = make_session(device=0, checkpoint="context-families")
+    session.declare((declaration("first"), declaration("second"), declaration("different", size=256)))
+    session._set_finalist_policies({"first": "candidate-families"})
+    assert session._recorded_requests["first"].finalist_policy == "candidate-families"
+    assert session._recorded_requests["second"].finalist_policy == "candidate-families"
+    assert session._recorded_requests["different"].finalist_policy is None
+    session.close()
 
 
 def declaration(name, *, component="sequence.gdn_prefill", size=128, selected_size=None, source="tuned",

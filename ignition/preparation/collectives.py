@@ -1,6 +1,7 @@
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -136,8 +137,9 @@ def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head
 
 def _winners(contributions):
     """Each sharded race's fastest complete contribution, ties going to the lower candidate index."""
-    races = {}
+    races, members = {}, {}
     for item in contributions:
+        members.setdefault(item.key, []).append(item)
         best = races.get(item.key)
         if item.assignment is not None and (
                 best is None or (item.latency_us, item.candidate_index) < (best.latency_us, best.candidate_index)):
@@ -145,7 +147,47 @@ def _winners(contributions):
         races[item.key] = best
     if missing := [key for key, item in races.items() if item is None]:
         raise RuntimeError(f"no rank completed a candidate of tuning race {missing[0]!r}")
-    return tuple(races[key] for key in sorted(races))
+    return tuple(_with_merged_finalists(races[key], members[key]) for key in sorted(races))
+
+
+def _with_merged_finalists(winner, contributions):
+    policy = getattr(winner, "finalist_policy", None)
+    if any(getattr(item, "finalist_policy", None) != policy for item in contributions):
+        raise ValueError("sharded finalist policies differ across ranks")
+    if policy is None:
+        return winner
+    by_index = {}
+    for item in contributions:
+        for finalist in item.finalists:
+            previous = by_index.get(finalist.candidate_index)
+            if previous is not None and previous.family != finalist.family:
+                raise ValueError("sharded finalist index has conflicting families")
+            if previous is None or finalist.latency_us < previous.latency_us:
+                by_index[finalist.candidate_index] = finalist
+    if winner.candidate_index not in by_index:
+        raise ValueError("sharded finalists omit the ordinary winner")
+    families = {}
+    for finalist in by_index.values():
+        family = json.dumps(finalist.family.to_dict(), sort_keys=True, separators=(",", ":"))
+        families.setdefault(family, []).append(finalist)
+    retained = []
+    for family in sorted(families):
+        ranked = sorted(families[family], key=lambda item: (item.latency_us, item.candidate_index))
+        chosen = ranked[:policy.per_family]
+        ordinary = next((item for item in ranked if item.candidate_index == winner.candidate_index), None)
+        if ordinary is not None and ordinary not in chosen:
+            chosen[-1] = ordinary
+        retained.extend(chosen)
+    retained.sort(key=lambda item: (item.latency_us, item.candidate_index))
+    if len(retained) > policy.max_total:
+        chosen = retained[:policy.max_total]
+        ordinary = by_index[winner.candidate_index]
+        if ordinary not in chosen:
+            chosen[-1] = ordinary
+        retained = chosen
+    retained.sort(key=lambda item: (json.dumps(item.family.to_dict(), sort_keys=True,
+        separators=(",", ":")), item.latency_us, item.candidate_index))
+    return replace(winner, finalists=tuple(retained))
 
 
 class CollectivePreparation:

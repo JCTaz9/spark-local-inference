@@ -537,6 +537,14 @@ def _share_artifacts(owned, group, ranks):
                 missing.discard(path)
 
 
+@contextmanager
+def _restored_warmup(warmup, before_run):
+    with warmup():
+        if before_run is not None:
+            before_run()
+        yield
+
+
 class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
@@ -572,6 +580,56 @@ class ForwardCache:
             result = self._warm(bound, path, name=name, progress=progress)
             release_unused()
             return result
+
+    def bind_group(self, template, forwards, *, signature, coordinator=None):
+        """Bind one compiled forward to owners with matching guards and storage aliases.
+
+        A grouped caller first prepares its representative through ``prepare_many``.
+        Every rank checks every owner before any grouped graph is captured; a
+        mismatch fails on all ranks and cannot trigger compilation on peers.
+        """
+        if (not forwards or not isinstance(template, BoundForward) or template.pending is not None
+                or not isinstance(template.artifact._artifacts.compiled_fn, StorageBackend)):
+            raise ValueError("group binding requires a completed storage-bound forward")
+        artifact = template.artifact
+        failures = {}
+        for name, owner in forwards.items():
+            try:
+                if type(owner) is not type(template.owner):
+                    raise BindingMismatch("grouped forward type differs from its compiled representative")
+                if not artifact.guard_check(owner):
+                    reason = artifact._artifacts.guard_manager.check_verbose(
+                        artifact.prepare_f_locals(owner))
+                    raise BindingMismatch(f"compiled forward guard differs: {reason}")
+                token = _CHECK_BINDINGS.set(True)
+                try:
+                    try:
+                        artifact(owner)
+                    except _BindingsChecked:
+                        pass
+                    else:
+                        raise RuntimeError("grouped forward did not validate storage bindings")
+                finally:
+                    _CHECK_BINDINGS.reset(token)
+            except Exception as error:
+                failures[name] = f"{type(error).__name__}: {error}"
+        if coordinator is None:
+            gathered = ((tuple(forwards), signature, failures),)
+            ranks = (0,)
+        else:
+            import torch.distributed as dist
+
+            ranks = coordinator.ranks
+            gathered = [None] * len(ranks)
+            dist.all_gather_object(gathered, (tuple(forwards), signature, failures), group=coordinator.group)
+        if any(names != tuple(forwards) or selected != signature for names, selected, _ in gathered):
+            raise BindingMismatch("tensor-parallel ranks declared different grouped forward owners or signatures")
+        if any(items for _, _, items in gathered):
+            detail = [(rank, name, reason) for rank, (_, _, items) in zip(ranks, gathered, strict=True)
+                      for name, reason in sorted(items.items())]
+            raise BindingMismatch(f"grouped forward bindings differ from compiled guards: {detail[:4]}")
+        return {name: BoundForward(artifact, owner, template.cache_hit)
+                for name, owner in forwards.items()}
 
     @contextmanager
     def _publication_lock(self, coordinator=None):
@@ -609,21 +667,27 @@ class ForwardCache:
                 lock.release()
 
     def prepare_many(self, functions, signatures, *, progress=None, coordinator=None, materialize=None,
-                     warmup=nullcontext):
-        """Trace and compile in workers, then bind and warm on the owning rank."""
+                     warmup=nullcontext, before_run=None):
+        """Trace and compile in workers, then bind and warm on the owning rank.
+
+        ``before_run`` restores mutable input state before every parent-rank
+        binding check and warmup; worker compilation uses tensor metadata.
+        """
         # Compiler workers own parallel compilation; artifact binding needs no second worker pool.
         with self._publication_lock(coordinator), torch._inductor.config.patch(compile_threads=1):
             return self._prepare_many(functions, signatures, progress=progress,
-                                      coordinator=coordinator, materialize=materialize, warmup=warmup)
+                                      coordinator=coordinator, materialize=materialize, warmup=warmup,
+                                      before_run=before_run)
 
-    def _prepare_many(self, functions, signatures, *, progress, coordinator, materialize, warmup):
+    def _prepare_many(self, functions, signatures, *, progress, coordinator, materialize, warmup,
+                      before_run):
         from ignition.progress import phase
         from .compile_pool import CompilePool
         from .inductor_tuning import InductorSelections
 
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
-                                       materialize=materialize, warmup=warmup)
+                                       materialize=materialize, warmup=warmup, before_run=before_run)
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
@@ -636,10 +700,13 @@ class ForwardCache:
                             bound.pending.result()
                         if materialize is None:
                             if not bound.cache_hit:
-                                bound = self._load(bound.owner, path, required=True)
+                                bound = self._load(bound.owner, path, required=True,
+                                                   before_run=None if before_run is None else lambda: before_run(name))
                                 bound.cache_hit = False
                             compiled[name] = self._warm(bound, path, name=name, progress=None,
-                                                       selections=selections, warmup=warmup)
+                                                       selections=selections, warmup=warmup,
+                                                       before_run=None if before_run is None
+                                                       else lambda name=name: before_run(name))
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -649,7 +716,8 @@ class ForwardCache:
             for name, forward in functions.items():
                 with _guard_code_cache(self.root / 'guards'):
                     bound, path = self._prepare(forward, name=name, signature=signatures[name], compiler=compiler,
-                                                deferred=materialize is not None)
+                                                deferred=materialize is not None,
+                                                before_run=None if before_run is None else lambda name=name: before_run(name))
                 pending.append((name, bound, path))
                 if len(pending) >= compiler.workers:
                     finish()
@@ -662,16 +730,20 @@ class ForwardCache:
                 for name, forward in functions.items():
                     with _guard_code_cache(self.root / 'guards'):
                         try:
-                            bound = self._load(forward, paths[name], required=True)
+                            bound = self._load(forward, paths[name], required=True,
+                                               before_run=None if before_run is None else lambda name=name: before_run(name))
                         except BindingMismatch:
                             bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
-                                                   selections=selections, warmup=warmup)
+                                                   selections=selections, warmup=warmup,
+                                                   before_run=None if before_run is None
+                                                   else lambda name=name: before_run(name))
                     stage.update(advance=1)
         release_unused()
         return compiled
 
-    def _prepare_ranks(self, functions, signatures, coordinator, *, progress, materialize, warmup):
+    def _prepare_ranks(self, functions, signatures, coordinator, *, progress, materialize, warmup,
+                       before_run):
         """Compile the catalog for a rank group, then bind and warm it on every rank.
 
         Compiled forwards serve every rank, so the catalog compiles once: each forward variant a
@@ -718,7 +790,8 @@ class ForwardCache:
                 for index, (name, variant, forward) in enumerate(work):
                     with _guard_code_cache(self.root / 'guards'):
                         bound, path = self._restore(forward, name=f"{name}.{variant}", signature=signatures[name],
-                                                    deferred=materialize is not None)
+                                                    deferred=materialize is not None,
+                                                    before_run=None if before_run is None else lambda name=name: before_run(name))
                     if bound is None:
                         missing.append(index)
                     else:
@@ -821,7 +894,8 @@ class ForwardCache:
                         continue
                     path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
                     with _guard_code_cache(self.root / 'guards'):
-                        selected[name] = self._load(forward, Path(path), required=True)
+                        selected[name] = self._load(forward, Path(path), required=True,
+                            before_run=None if before_run is None else lambda name=name: before_run(name))
                     selected[name].cache_hit = not compiled
                     stage.update(advance=1)
         except Exception as failure:
@@ -847,7 +921,8 @@ class ForwardCache:
             for name in functions:
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
-                    selections.warm(selected[name], warmup)
+                    selections.warm(selected[name], partial(_restored_warmup, warmup,
+                        None if before_run is None else lambda name=name: before_run(name)))
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
@@ -868,7 +943,7 @@ class ForwardCache:
             _share_artifacts(selections._gather(published), group, ranks)
         return selected
 
-    def _load(self, forward, path, *, required=False):
+    def _load(self, forward, path, *, required=False, before_run=None):
         with bind_device(self.device, freeze_tuning=self.options.get(
                 'triton.autotune_at_compile_time', False)), path.open('rb') as file:
             artifact = torch.compiler.load_compiled_function(file)
@@ -884,6 +959,8 @@ class ForwardCache:
         # Dynamo guards omit some offsets and aliases checked by the storage backend.
         token = _CHECK_BINDINGS.set(True)
         try:
+            if before_run is not None:
+                before_run()
             artifact(forward)
         except _BindingsChecked:
             return BoundForward(artifact, forward, True)
@@ -899,7 +976,8 @@ class ForwardCache:
         identity = (type(forward).__module__, type(forward).__qualname__, name, signature)
         return self.root / (hashlib.sha256(pickle.dumps(identity)).hexdigest() + '.bin')
 
-    def _restore(self, forward, *, name, signature, deferred=False, report=None):
+    def _restore(self, forward, *, name, signature, deferred=False, report=None,
+                 before_run=None):
         """The cached forward bound to `forward`, or None when it is missing or its guards reject it, and its path."""
         path = self._path(forward, name=name, signature=signature)
         if not path.is_file():
@@ -908,18 +986,20 @@ class ForwardCache:
             report("restoring compiled forward")
         token = _DEFERRED_BINDINGS.set(deferred)
         try:
-            bound = self._load(forward, path)
+            bound = self._load(forward, path, before_run=before_run)
         finally:
             _DEFERRED_BINDINGS.reset(token)
         if report is not None:
             report("checking compiled bindings")
         return bound, path
 
-    def _prepare(self, forward, *, name, signature, compiler=None, progress=None, deferred=False):
+    def _prepare(self, forward, *, name, signature, compiler=None, progress=None, deferred=False,
+                 before_run=None):
         def report(operation):
             if progress is not None:
                 progress.update(f"{name} · {operation}")
-        bound, path = self._restore(forward, name=name, signature=signature, deferred=deferred, report=report)
+        bound, path = self._restore(forward, name=name, signature=signature, deferred=deferred,
+                                    report=report, before_run=before_run)
         if bound is not None:
             return bound, path
         report("tracing and compiling forward")
@@ -927,7 +1007,8 @@ class ForwardCache:
             return BoundForward(None, forward, False, compiler.submit(forward, path)), path
         return BoundForward(aot_forward(forward, options=self.options), forward, False), path
 
-    def _warm(self, bound, path, *, name, progress=None, selections=None, warmup=nullcontext):
+    def _warm(self, bound, path, *, name, progress=None, selections=None, warmup=nullcontext,
+              before_run=None):
         def report(operation):
             if progress is not None:
                 progress.update(f"{name} · {operation}")
@@ -940,11 +1021,11 @@ class ForwardCache:
         if not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph'):
             bound.artifact.save_compiled_function(str(path))
             cached = bound.cache_hit
-            bound = self._load(bound.owner, path, required=True)
+            bound = self._load(bound.owner, path, required=True, before_run=before_run)
             bound.cache_hit = cached
         report("warming restored forward" if bound.cache_hit else "warming compiled forward")
         selections.register(bound)
-        selections.warm(bound, warmup)
+        selections.warm(bound, partial(_restored_warmup, warmup, before_run))
         selections.freeze(bound)
         report("saving compiled forward")
         bound.artifact.save_compiled_function(str(path))
