@@ -15,7 +15,7 @@ from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
 from ignition.preparation.fixtures.projection import input_factory
 from ignition.preparation.scratch import ScratchArena, prime_owners, scratch_storage
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
 
 def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
@@ -159,6 +159,11 @@ class QuantizedProjection:
         activation_mode: str = "quantized",
         bias: torch.Tensor | None = None,
         workspace: ScratchArena | torch.Tensor | None = None,
+        mxfp8_min_amax: float | None = None,
+        encoded=None,
+        rhs_prefetch_ready: bool = False,
+        allow_bf16_atomic_reduction: bool = True,
+        buffers=None,
     ) -> None:
         from b12x.gemm.blockscaled._a16 import NVFP4LinearWeight, _overlap, _weight_parts
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight, _validate_bias
@@ -181,7 +186,111 @@ class QuantizedProjection:
         self.activation_mode = activation_mode
         self.bias = bias
         self.workspace = workspace
+        self.encoded = self.quantizer_plan = None
         self.sm103 = sm103_projection.is_sm103(source.device)
+        if mxfp8_min_amax is not None or encoded is not None:
+            from b12x.quantization import mxfp8
+
+            if (self.sm103 or not isinstance(weight, MXFP8LinearWeight)
+                    or activation_mode not in ("auto", "quantized") or bias is not None
+                    or workspace is None or source.ndim != 2 or source.dtype != torch.bfloat16
+                    or not source.is_contiguous() or weight.padded_in_features != source.shape[1]
+                    or output.shape != (source.shape[0], weight.out_features)
+                    or output.dtype != torch.bfloat16 or not output.is_contiguous()
+                    or (encoded is not None and (mxfp8_min_amax is not None
+                                                 or not isinstance(encoded, mxfp8.MXFP8Rows)))):
+                raise ValueError("prepared MXFP8 activation projection requires BF16 rows, packed MXFP8 weights,"
+                                 " BF16 output, and caller-owned scratch")
+            self.activation_mode = "quantized"
+            rows, columns = source.shape
+            def allocate(shape, dtype):
+                return (torch.zeros(shape, dtype=dtype, device=source.device) if buffers is None
+                        else buffers.zeros(shape, dtype))
+
+            values_shape, row_shape, mma_shape = mxfp8.dense_rows_storage_shapes(rows, columns)
+            if encoded is None:
+                self.encoded_bases = (allocate(values_shape, torch.float8_e4m3fn),
+                                      allocate(row_shape, torch.uint8), allocate(mma_shape, torch.uint8))
+                self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
+                self.quantizer_plan = mxfp8.plan(mxfp8.query_from_call(
+                    source, self.encoded.values, self.encoded.scale_rows, self.encoded.scale_mma,
+                    min_amax=mxfp8_min_amax, release_dependents=rhs_prefetch_ready and rows <= 8))
+            else:
+                self.encoded_bases = (encoded.values, encoded.scale_rows.view(torch.uint8),
+                                      mxfp8.dense_scale_storage(encoded.scale_mma))
+                self.encoded = mxfp8.dense_rows_from_bases(*self.encoded_bases)
+                if self.encoded.values.shape != source.shape or self.encoded.values.device != source.device:
+                    raise ValueError("prepared MXFP8 activation rows must match their BF16 producer")
+            encoded = self.encoded
+            packed = weight.weight
+            self.parts = packed.values, mxfp8.dense_scale_storage(packed.scale_mma), None
+            for tensor in (packed.values, packed.scale_rows, packed.scale_mma):
+                record_numeric_tensor(tensor)
+            self.raw_source = encoded.values.view(rows, columns, 1), encoded.scale_mma
+            self.raw_weight = packed.values.view(weight.out_features, columns, 1), packed.scale_mma
+            self.raw_output = output.view(rows, weight.out_features, 1)
+            query = blockscaled.query_from_call(self.raw_source, self.raw_weight, out=self.raw_output,
+                ab_dtype="float8_e4m3fn", sf_dtype="float8_e8m0fnu", sf_vec_size=32,
+                rhs_prefetch_ready=rhs_prefetch_ready,
+                allow_bf16_atomic_reduction=allow_bf16_atomic_reduction)
+            if isinstance(workspace, ScratchArena):
+                query = replace(query, workspace_form="provided", workspace_nbytes=None)
+            self.plan = blockscaled.plan(query)
+
+            def selected_workspace(nbytes=None):
+                if nbytes is None:
+                    nbytes = self.plan.memory_requirements().scratch_nbytes
+                return scratch_storage(workspace, nbytes=nbytes, device=source.device)
+
+            def candidate_workspace():
+                # RecordedPreparationSession reserves the complete candidate
+                # envelope before tuning; the selected view is bound afterwards.
+                return workspace.tensor if isinstance(workspace, ScratchArena) else workspace
+
+            def prepare_quantizer(state):
+                return PreparedCall(run=lambda: state.run(source, encoded.values, encoded.scale_rows,
+                                                          encoded.scale_mma), owners=(encoded,))
+
+            def prepare_projection(state):
+                storage = candidate_workspace()
+                return PreparedCall(run=lambda: state.run(*self.raw_source, *self.raw_weight, None,
+                    self.raw_output, storage.view(torch.float32), torch.bfloat16, None),
+                    owners=prime_owners(workspace, storage, encoded))
+
+            def benchmark_projection(state):
+                def make_inputs():
+                    bases = (torch.empty(values_shape, dtype=torch.float8_e4m3fn, device=source.device),
+                             torch.empty(row_shape, dtype=torch.uint8, device=source.device),
+                             torch.empty(mma_shape, dtype=torch.uint8, device=source.device))
+                    trial = mxfp8.dense_rows_from_bases(*bases)
+                    seeds = (torch.ones_like(trial.values),
+                             torch.full_like(trial.scale_rows.view(torch.uint8), 127),
+                             torch.full_like(trial.scale_mma.view(torch.uint8), 127))
+                    return trial, torch.empty_like(output), seeds
+
+                trial, trial_output, seeds = benchmark_resource(session, ("mxfp8_projection", name), make_inputs)
+                lhs = trial.values.view(rows, columns, 1), trial.scale_mma
+                out = trial_output.view(rows, weight.out_features, 1)
+                storage = candidate_workspace()
+                def produce():
+                    trial.values.copy_(seeds[0])
+                    trial.scale_rows.view(torch.uint8).copy_(seeds[1])
+                    trial.scale_mma.view(torch.uint8).copy_(seeds[2])
+
+                return PreparedCall(run=lambda: state.run(*lhs, *self.raw_weight, None,
+                    out, storage.view(torch.float32), torch.bfloat16, None),
+                    produce=produce, output=trial_output,
+                    owners=(trial, trial_output, seeds, *prime_owners(workspace, storage)))
+
+            requests = []
+            if self.quantizer_plan is not None:
+                requests.append(self.quantizer_plan.request(name=name + ".activation",
+                    prepare_call=prepare_quantizer))
+            requests.append(self.plan.request(name=name,
+                prepare_call=prepare_projection, benchmark_call=benchmark_projection))
+            declare(session, tuple(requests))
+            register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
+            return
         if self.sm103:
             # b12x targets SM120/SM121; SM103 runs FlashInfer's native GEMMs under the same preparation.
             from b12x.gemm.blockscaled._a16 import _weight_parts as parts
@@ -235,6 +344,15 @@ class QuantizedProjection:
         register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
+        if self.encoded is not None:
+            from b12x import gemm
+            from b12x.quantization import mxfp8
+
+            if self.quantizer_plan is not None:
+                mxfp8.quantize_dense_rows(source, *self.encoded_bases, plan=self.quantizer_plan)
+            gemm.mxfp8_mm_bases(self.encoded_bases[0], self.encoded_bases[2],
+                self.parts[0], self.parts[1], self.output, self.workspace, plan=self.plan)
+            return self.output
         if self.sm103:
             values, scales, gain = self.parts
             torch.ops.flare.sm103_packed_out(source, values, scales, gain, self.output, self.workspace,
