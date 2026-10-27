@@ -216,7 +216,8 @@ def from_plan(model, plan, *, compiled_forwards):
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
-        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes)
+        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
+        persistent_decoder=plan.persistent_decoder)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
     if (s := plan.speculation) is not None:

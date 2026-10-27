@@ -2658,6 +2658,7 @@ fn rebuild_compatible(
         && a.online_mxfp8 == b.online_mxfp8
         && a.language_model_only == b.language_model_only
         && a.mla_compute_mode == b.mla_compute_mode
+        && a.persistent_decoder == b.persistent_decoder
         && speculation(&a.speculation) == speculation(&b.speculation)
 }
 
@@ -6911,7 +6912,7 @@ mod tests {
             second_identity
         );
 
-        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 8] = [
+        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 9] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),
             ("checkpoint-revision", |value| value.checkpoint_revision = "other".into()),
             ("local-checkpoint", |value| value.local_checkpoint = true),
@@ -6922,6 +6923,7 @@ mod tests {
             ("online-mxfp8", |value| value.online_mxfp8 = false),
             ("language-model-only", |value| value.language_model_only = true),
             ("mla-compute-mode", |value| value.mla_compute_mode = "sparse".into()),
+            ("persistent-decoder", |value| value.persistent_decoder = true),
         ];
         for (label, change) in semantic_cases {
             let first = rebuild("same-code");

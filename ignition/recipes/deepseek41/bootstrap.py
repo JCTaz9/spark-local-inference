@@ -85,6 +85,7 @@ class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
+    persistent_decoder: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
@@ -125,6 +126,9 @@ class PreparationConfig:
         from ignition.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
+        if self.persistent_decoder and (len(self.devices)!=4 or self.hosts is not None
+                or self.expert_scale_compression is not None):
+            raise ValueError("persistent decoder requires four local SM120 GPUs and native expert scales")
         from ignition.recipes.declaration import Speculation
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
                     markov_head_quantization=self.markov_head_quantization,
@@ -612,6 +616,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
         "mla_compute_mode": config.mla_compute_mode,
+        "persistent_decoder": config.persistent_decoder,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,

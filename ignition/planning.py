@@ -31,6 +31,10 @@ CACHE_STATES_PER_REQUEST = 8
 SUPPORTED_CAPABILITIES = ((10, 3), (12, 0), (12, 1))
 SUPPORTED_ARCHITECTURES = "SM103, SM120, or SM121"
 _GIB = 1 << 30
+# Forty target layers retain dense repacks beside prefill weights. The bound
+# includes prologue scale layouts; one resettable peer/scratch slab is shared.
+_PERSISTENT_DENSE_RANK_BYTES = 40 * (36 << 20)
+_PERSISTENT_CHANNEL_RANK_BYTES = 40 << 20
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,7 @@ class Plan:
     autotune_effort: str = "default"
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
+    persistent_decoder: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -299,6 +304,7 @@ class Plan:
             "autotune_effort": self.autotune_effort,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
+            "persistent_decoder": self.persistent_decoder,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
@@ -333,7 +339,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
-        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        language_model_only: bool = False, mla_compute_mode: str | None = None,
+        persistent_decoder: bool = False) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -345,6 +352,11 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression = recipe.expert_scale_compression
     if expert_scale_compression == "native":
         expert_scale_compression = None
+    if persistent_decoder:
+        if recipe.name != "deepseek41" or len(gpus) != 4 or any(gpu.capability != (12,0) for gpu in gpus):
+            raise UsageError("--persistent-decoder requires DeepSeek V4.1 and four SM120 GPUs")
+        if expert_scale_compression is not None:
+            raise UsageError("--persistent-decoder requires --expert-scale-compression native")
     if mla_compute_mode not in recipe.mla_compute_modes:
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
@@ -374,11 +386,13 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
-                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
+                recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression)
+                    + (_PERSISTENT_DENSE_RANK_BYTES if persistent_decoder else 0),
+                costs.graph_bytes + (_PERSISTENT_CHANNEL_RANK_BYTES if persistent_decoder else 0),
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                mla_compute_mode=mla_compute_mode,
+                mla_compute_mode=mla_compute_mode, persistent_decoder=persistent_decoder,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
@@ -436,7 +450,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+         language_model_only: bool = False, mla_compute_mode: str | None = None,
+        persistent_decoder: bool = False) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -463,23 +478,28 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if chunk % 64 or not 64 <= chunk <= recipe.context:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
-    sizes = " or ".join(map(str, recipe.tensor_parallel))
-    supported = [gpu for gpu in gpus if gpu.supported]
+    if persistent_decoder and recipe.name != "deepseek41":
+        raise UsageError("--persistent-decoder requires DeepSeek V4.1")
+    tensor_parallel = (4,) if persistent_decoder else recipe.tensor_parallel
+    sizes = " or ".join(map(str, tensor_parallel))
+    supported = [gpu for gpu in gpus if gpu.supported and (not persistent_decoder or gpu.capability == (12,0))]
     chosen = None
     if selected is not None:
         if any(index >= len(gpus) for index in selected):
             raise UsageError(f"--gpus {format_gpus(selected)} names a GPU this host does not have;"
                              f" it has {len(gpus)}")
         chosen = tuple(gpus[index] for index in selected)
-        if len(chosen) not in recipe.tensor_parallel:
-            size = min(recipe.tensor_parallel, key=lambda size: (size < len(chosen), size))
+        if persistent_decoder and (len(chosen)!=4 or any(gpu.capability!=(12,0) for gpu in chosen)):
+            raise UsageError("--persistent-decoder requires DeepSeek V4.1 and four SM120 GPUs")
+        if len(chosen) not in tensor_parallel:
+            size = min(tensor_parallel, key=lambda size: (size < len(chosen), size))
             first = max(0, min(selected[0], len(gpus) - size))
             example = format_gpus(range(first, first + size))
             raise CapacityError(f"{checkpoint.alias} needs {sizes} GPUs; {len(chosen)} selected; use --gpus {example}")
         for gpu in chosen:
             if not gpu.supported:
                 raise CapacityError(f"GPU {gpu.index} ({gpu.name}) is not an {SUPPORTED_ARCHITECTURES} device")
-    elif len(supported) < recipe.tensor_parallel[0]:
+    elif len(supported) < tensor_parallel[0]:
         raise CapacityError(f"{checkpoint.alias} needs {sizes} {SUPPORTED_ARCHITECTURES} GPUs; this host has {len(supported)}")
 
     def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
@@ -490,7 +510,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
-                   mla_compute_mode=mla_compute_mode)
+                   mla_compute_mode=mla_compute_mode, persistent_decoder=persistent_decoder)
 
     def automatic(world_size, **settings):
         """Plan the first GPUs that each fit, else the GPUs with the most free memory."""
@@ -503,7 +523,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     def candidates(**settings):
         if chosen is not None:
             return [fitted(chosen, **settings)]
-        return [automatic(size, **settings) for size in recipe.tensor_parallel if size <= len(supported)]
+        return [automatic(size, **settings) for size in tensor_parallel if size <= len(supported)]
 
     def attempt(**settings):
         return next((candidate for candidate in candidates(**settings) if candidate.fits), None)
