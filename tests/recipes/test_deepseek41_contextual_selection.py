@@ -186,3 +186,51 @@ def test_export_summary_identifies_tuple_configs_and_both_measured_layers():
     assert payload["layer_us"] == {"0": 90.0, "37": 105.0}
     assert payload["standalone_layer_us"] == {"0": 92.0, "37": 106.0}
     assert payload["sum_us"] == 195.0 and payload["standalone_sum_us"] == 198.0
+
+
+@pytest.mark.parametrize("compile_decoder", (False, True))
+def test_context_race_captures_every_tuple_with_optional_compilation(monkeypatch,
+                                                                     compile_decoder):
+    from ignition.preparation.execution import GraphSignature
+    from ignition.recipes.deepseek41 import contextual_selection as module
+
+    selector = object.__new__(CatalogContextualSelection)
+    selector.layers = (object(),)
+    selector.device = "cuda:0"
+    selector.coordinator = SimpleNamespace(ranks=(0, 1))
+    selector.progress = None
+    selector._race_stage = None
+    selector.compile_decoder = compile_decoder
+    selector._tuple_name = lambda index, configs, selection: f"tuple-{index}"
+    captured, restored, reset = [], [], []
+
+    def capture(session, functions, signatures, *, label, before_run, compile_group):
+        captured.append((tuple(functions), compile_group))
+        for name in functions:
+            before_run(name)
+        return ({name: SimpleNamespace(reset=lambda name=name: reset.append(name))
+                 for name in functions}, {})
+
+    selector._capture = capture
+    monkeypatch.setattr(module, "prepared_layer_variant", lambda layer, **plans: plans)
+    monkeypatch.setattr(module, "ContextCandidate", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2 << 30, 4 << 30))
+    fixture = SimpleNamespace(layer_index=0,
+        target_signature=GraphSignature("speculative", 1, 8),
+        trial_forward=lambda layer: lambda: None,
+        restore_tune=lambda layer: restored.append(layer),
+        prepared_call=lambda name, graph, compiled, layer: PreparedCall(
+            run=lambda: None, produce=lambda: None))
+    calls = []
+    session = SimpleNamespace(headroom_bytes=0, rounds=3,
+        race_contexts=lambda candidates, **kwargs: calls.append(
+            (len(candidates), kwargs["max_candidates"])) or SimpleNamespace(
+                winner=candidates[0].name, latencies_us={}))
+    plans = {(0, "qkv_a"): (object(), object()), (0, "norm"): (object(),),
+             (0, "q_b"): (object(),)}
+    selector._race_layer(session, fixture, 0, {}, plans, None,
+                         ((0, 0, 0), (1, 0, 0)))
+    assert captured == [(("tuple-0-layer0", "tuple-1-layer0"),
+                         "context-layer0-plan-family" if compile_decoder else None)]
+    assert len(restored) == 2 and len(reset) == 2
+    assert calls == [(2, 2)]

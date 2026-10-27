@@ -239,7 +239,8 @@ class CatalogContextualSelection:
 
         graphs, compiled = self._capture(session, functions, signatures,
             label=f"Capture contextual layer {fixture.layer_index}", before_run=before_run,
-            compile_group=f"context-layer{fixture.layer_index}-plan-family")
+            compile_group=(f"context-layer{fixture.layer_index}-plan-family"
+                           if self.compile_decoder else None))
         after_free = torch.cuda.mem_get_info(self.device)[0]
         if after_free < max(1 << 30, session.headroom_bytes):
             for graph in graphs.values():
