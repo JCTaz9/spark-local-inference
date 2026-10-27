@@ -1846,10 +1846,11 @@ pub(super) fn resolve_staged_weight_payload(
     request: &CaptureRequest,
     output: &mut RankOutput,
 ) -> ExportResult<Option<WeightPayloadSources>> {
-    resolve_weight_payload(request, output, None)
+    resolve_weight_payload(request, &output.allocations.clone(), output, None)
 }
 fn resolve_weight_payload(
     request: &CaptureRequest,
+    all_allocations: &[Allocation],
     output: &mut RankOutput,
     device: Option<(&mut Downloader<'_>, &[Allocation])>,
 ) -> ExportResult<Option<WeightPayloadSources>> {
@@ -1857,10 +1858,10 @@ fn resolve_weight_payload(
         return Ok(None);
     };
     let declaration: weight_payload::WeightPayloadDeclaration = serde_json::from_value(declaration)?;
-    let allocations = weight_allocations(&output.allocations);
+    let allocations = weight_allocations(all_allocations);
     if allocations.is_empty() {
         return Err(invalid(
-            "weight declarations require retained allocations with recorded addresses",
+            "weight declarations require capture allocations with recorded addresses",
         ));
     }
     let views: Vec<super::WeightPayloadView> = declaration
@@ -1876,8 +1877,11 @@ fn resolve_weight_payload(
             statistics_domain: view.statistics_domain.clone(),
         })
         .collect();
-    let catalog = weight_payload::extract(
+    let retained_allocations = weight_allocations(&output.allocations);
+    let retained = retained_allocations.iter().map(|a| a.name.as_str()).collect();
+    let catalog = weight_payload::extract_retained(
         &declaration.into_request(allocations, request.zero_ranges.clone()),
+        &retained,
     )?;
     let root = match request.options.cache.as_ref() {
         Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
@@ -3110,6 +3114,7 @@ pub(crate) fn capture_rank(
     if request.options.reuse_weights.is_none() {
         output.weight_payload = resolve_weight_payload(
             &request,
+            &allocations,
             &mut output,
             if cache_scan {
                 Some((&mut downloader, device_allocations.as_slice()))
@@ -3161,7 +3166,7 @@ pub(crate) fn capture_rank(
     }
     super::binding::finish_rank(request, &mut output)?;
     if request.options.reuse_weights.is_some() {
-        output.weight_payload = resolve_weight_payload(request, &mut output,
+        output.weight_payload = resolve_weight_payload(request, &allocations, &mut output,
             Some((&mut downloader, device_allocations.as_slice())))?;
     }
     weight_phase.finish("");
@@ -3357,6 +3362,29 @@ mod tests {
     }
 
     #[test]
+    fn payload_materialization_omits_unreachable_weight_storage() -> ExportResult<()> {
+        let directory = tempfile::tempdir()?;
+        let bytes = vec![0x37u8; 128];
+        let (mut request, mut output) = declared_capture_view(directory.path(), &bytes, 64, false)?;
+        let mut allocations = output.allocations.clone();
+        let expected = resolve_weight_payload(&request, &allocations, &mut output, None)?.unwrap();
+        allocations.push(allocation("discarded-scales", 0x2000, 256));
+        request.weight_payload.as_mut().unwrap()["views"].as_array_mut().unwrap().push(
+            serde_json::json!({
+                "name": "weights.source_scales", "group": "embedding", "storage": "stable",
+                "element_bytes": 1, "shape": [256], "stride": [1], "address": 0x2000
+            })
+        );
+        let actual = resolve_weight_payload(&request, &allocations, &mut output, None)?.unwrap();
+        assert_eq!(actual.groups.len(), 1);
+        assert_eq!(actual.groups[0].payload_id, expected.groups[0].payload_id);
+        assert_eq!(actual.groups[0].nbytes, 64);
+        assert_eq!(actual.initial_state.payload_id, expected.initial_state.payload_id);
+        assert_eq!(output.allocations.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn no_weights_reuses_weights_and_allows_new_initial_state() -> ExportResult<()> {
         let directory = std::env::temp_dir().join(format!(
             "flare-capture-state-{}",
@@ -3368,7 +3396,7 @@ mod tests {
         let view = 4096usize;
         let mut bytes = vec![0x11u8; total];
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let weight_id = catalog.groups[0].payload_id.clone();
         assert_eq!(catalog.groups.len(), 1);
         assert!(!catalog.initial_state.payload_id.is_empty());
@@ -3379,7 +3407,7 @@ mod tests {
             *byte = 0x22;
         }
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         assert_eq!(catalog.groups[0].payload_id, weight_id);
         assert_ne!(catalog.initial_state.payload_id, state_id);
         // Missing stable weight data still fails under no_weights.
@@ -3393,7 +3421,7 @@ mod tests {
         drop(object);
         fs::remove_file(&path)?;
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
-        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        let error = resolve_staged_weight_payload(&request, &mut output).unwrap_err();
         assert!(error.to_string().contains("missing cached payload"), "{error}");
         let _ = fs::remove_dir_all(&directory);
         Ok(())
@@ -3411,7 +3439,7 @@ mod tests {
         let mut bytes = vec![0u8; block + 8];
         bytes[0] = 3;
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?
             .ok_or_else(|| invalid("declared capture missing catalog"))?;
         let group = &catalog.groups[0];
         assert!(!group.payload_id.is_empty());
@@ -3446,13 +3474,13 @@ mod tests {
         fs::create_dir_all(&directory)?;
         let bytes = vec![5u8; 4096];
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let id: [u8; 32] = catalog.groups[0].payload_id.clone().try_into().unwrap();
         let payload = helios_core::package::PayloadId::from_bytes(id);
         drop(output);
         // Warm: an existing object validates.
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        assert!(resolve_weight_payload(&request, &mut output, None)?.is_some());
+        assert!(resolve_staged_weight_payload(&request, &mut output)?.is_some());
         drop(output);
         // Corrupted cached bytes are rejected even with the right length.
         let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
@@ -3463,12 +3491,12 @@ mod tests {
         fs::remove_file(&path)?;
         fs::write(&path, vec![0u8; length as usize])?;
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        assert!(resolve_weight_payload(&request, &mut output, None).is_err());
+        assert!(resolve_staged_weight_payload(&request, &mut output).is_err());
         drop(output);
         // Absent object fails rather than publishing fresh weights.
         fs::remove_file(&path)?;
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        let error = resolve_staged_weight_payload(&request, &mut output).unwrap_err();
         assert!(error.to_string().contains("missing cached payload"), "{error}");
         let _ = fs::remove_dir_all(&directory);
         Ok(())
@@ -3483,7 +3511,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory)?;
         let (request, mut output) = declared_capture(&directory, &vec![0u8; 4096], false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         assert!(catalog.groups.is_empty());
         assert!(catalog.initial_state.payload_id.is_empty());
         assert!(output.payload_leases.0.is_empty());
@@ -3627,7 +3655,7 @@ mod tests {
                 Ok((request, output))
             };
             let (reference_request, mut reference_output) = prepare(reference.path())?;
-            let expected = resolve_weight_payload(&reference_request, &mut reference_output, None)?.unwrap();
+            let expected = resolve_staged_weight_payload(&reference_request, &mut reference_output)?.unwrap();
             let (mut request, mut output) = prepare(device.path())?;
             let allocations = output.allocations.clone();
             let mut downloader = Downloader::new(&cuda)?;
@@ -3636,7 +3664,7 @@ mod tests {
                 let copies = downloader.copies;
                 let downloaded = downloader.downloaded;
                 let started = std::time::Instant::now();
-                let actual = resolve_weight_payload(&request, &mut output,
+                let actual = resolve_weight_payload(&request, &output.allocations.clone(), &mut output,
                     Some((&mut downloader, &allocations)))?.unwrap();
                 downloader.drain()?;
                 eprintln!("weight materialization: bytes={size}, cached={}, copies={}, elapsed={:?}",

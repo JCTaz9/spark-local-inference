@@ -537,14 +537,6 @@ def _share_artifacts(owned, group, ranks):
                 missing.discard(path)
 
 
-@contextmanager
-def _restored_warmup(warmup, before_run):
-    with warmup():
-        if before_run is not None:
-            before_run()
-        yield
-
-
 class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
@@ -705,8 +697,7 @@ class ForwardCache:
                                 bound.cache_hit = False
                             compiled[name] = self._warm(bound, path, name=name, progress=None,
                                                        selections=selections, warmup=warmup,
-                                                       before_run=None if before_run is None
-                                                       else lambda name=name: before_run(name))
+                                                       before_run=None if before_run is None else lambda name=name: before_run(name))
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -736,8 +727,7 @@ class ForwardCache:
                             bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
                         compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
                                                    selections=selections, warmup=warmup,
-                                                   before_run=None if before_run is None
-                                                   else lambda name=name: before_run(name))
+                                                   before_run=None if before_run is None else lambda name=name: before_run(name))
                     stage.update(advance=1)
         release_unused()
         return compiled
@@ -921,8 +911,8 @@ class ForwardCache:
             for name in functions:
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
-                    selections.warm(selected[name], partial(_restored_warmup, warmup,
-                        None if before_run is None else lambda name=name: before_run(name)))
+                    selections.warm(selected[name], warmup,
+                                    before_run=None if before_run is None else lambda name=name: before_run(name))
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
@@ -1025,7 +1015,7 @@ class ForwardCache:
             bound.cache_hit = cached
         report("warming restored forward" if bound.cache_hit else "warming compiled forward")
         selections.register(bound)
-        selections.warm(bound, partial(_restored_warmup, warmup, before_run))
+        selections.warm(bound, warmup, before_run=before_run)
         selections.freeze(bound)
         report("saving compiled forward")
         bound.artifact.save_compiled_function(str(path))

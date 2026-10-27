@@ -217,7 +217,7 @@ class InductorSelections:
                 else:
                     delattr(tuner, name)
 
-    def warm(self, bound, warmup):
+    def warm(self, bound, warmup, *, before_run=None):
         bindings = self.forwards[id(bound)][2]
         inventory = sorted({identity for identity, _, _ in bindings.values()})
         variants = {}
@@ -228,6 +228,8 @@ class InductorSelections:
         failure = None
         try:
             with warmup(), self._tuning(bindings, frozen=self.forwards[id(bound)][0]._tuning_frozen):
+                if before_run is not None:
+                    before_run()
                 bound()
             torch.cuda.current_stream(self.device).synchronize()
         except Exception as error:
@@ -237,6 +239,8 @@ class InductorSelections:
         failure = None
         try:
             with warmup(), self._tuning(bindings, frozen=True):
+                if before_run is not None:
+                    before_run()
                 bound()
             torch.cuda.current_stream(self.device).synchronize()
         except Exception as error:

@@ -152,7 +152,7 @@ def _lending_rank(rank, world, store, root, outcome):
     try:
         compile_pool.CompilePool = _Pool
         _replace_gpu_preparation()
-        aot.ForwardCache._load = lambda self, forward, path, required=False: aot.BoundForward(
+        aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
             _Artifact(lambda owner: None), forward, True)
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
@@ -164,7 +164,7 @@ def _lending_rank(rank, world, store, root, outcome):
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
         selected = cache._prepare_ranks(functions, {name: name for name in functions}, coordinator, progress=None,
-                                        materialize=lambda: None, warmup=nullcontext)
+                                        materialize=lambda: None, warmup=nullcontext, before_run=None)
         outcome.put((rank, sorted(selected)))
         dist.destroy_process_group()
     except Exception:  # noqa: BLE001 - The parent reports every rank's failure.
@@ -208,7 +208,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         _replace_gpu_preparation()
         restored, warmed = [], []
 
-        def load(self, forward, path, required=False):
+        def load(self, forward, path, required=False, before_run=None):
             bound = aot.BoundForward(_Artifact(warmed.append), forward, True)
             if not required:
                 restored.append(weakref.ref(bound))
@@ -232,7 +232,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
         selected = cache._prepare_ranks(functions, signatures, coordinator, progress=None,
-            materialize=materialize if deferred else None, warmup=nullcontext)
+            materialize=materialize if deferred else None, warmup=nullcontext, before_run=None)
         assert set(warmed) == set(functions.values())
         assert all(warmed.count(forward) == 2 for forward in functions.values())
         assert all(bound.cache_hit for bound in selected.values())

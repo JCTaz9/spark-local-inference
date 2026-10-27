@@ -115,8 +115,8 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
 
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', Probe)
     cache = ForwardCache(namespace={'model': 'cooperative-vision-validation'}, device=device,
-        root=root, compile_workers=1, lock_gpu_clocks=True, options=dict(_OPTIONS,
-        autotune_local_cache=False, autotune_remote_cache=False))
+        root=root, compile_workers=1 if coordinator is None else coordinator.local_ranks,
+        lock_gpu_clocks=True, options=dict(_OPTIONS, autotune_local_cache=False, autotune_remote_cache=False))
     signature = GraphSignature('vision', 1024, 1)
 
     def prepare(forward):
@@ -220,6 +220,47 @@ def _replay(bound, forward):
         torch.testing.assert_close(forward.output, forward.source.sin() * forward.source)
         expected_sum = 4096 * value + getattr(forward, 'role_bias', 0)
         torch.testing.assert_close(forward.sums, torch.full_like(forward.sums, expected_sum), rtol=0, atol=0)
+
+
+class MutatingForward:
+    def __init__(self):
+        self.state = torch.empty(4096, device='cuda')
+        self.output = torch.empty_like(self.state)
+
+    def __call__(self):
+        self.state.add_(1)
+        self.output.copy_(self.state * 3)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize('deferred', [False, True])
+@pytest.mark.parametrize('distributed', [False, True], ids=['single', 'tp2'])
+def test_input_reset_survives_tuning_and_frozen_warmup(tmp_path, request, deferred, distributed):
+    coordinator = None
+    root = tmp_path
+    if distributed:
+        import torch.distributed as dist
+        from ignition.preparation.collectives import CollectivePreparation
+
+        rank = request.getfixturevalue('distributed_group')
+        roots = [str(tmp_path) if rank == 0 else None]
+        dist.broadcast_object_list(roots, src=0)
+        root = Path(roots[0])
+        coordinator = CollectivePreparation(dist.group.WORLD)
+    cache = ForwardCache(namespace={'model': 'mutable-warmup-inputs'},
+        device=torch.device('cuda', torch.cuda.current_device()), root=root,
+        compile_workers=1 if coordinator is None else coordinator.local_ranks)
+    signatures = {'decode': GraphSignature('decode', 1, 1)}
+    for restored in (False, True):
+        forward = MutatingForward()
+        bound = cache.prepare_many({'decode': forward}, signatures, coordinator=coordinator,
+            materialize=(lambda: None) if deferred else None,
+            before_run=lambda name: forward.state.fill_(1))['decode']
+        if restored:
+            assert bound.cache_hit
+        assert bound.artifact._artifacts.compiled_fn._tuning_frozen
+        torch.testing.assert_close(forward.state, torch.full_like(forward.state, 2), rtol=0, atol=0)
+        torch.testing.assert_close(forward.output, torch.full_like(forward.output, 6), rtol=0, atol=0)
 
 
 @torch.no_grad()
@@ -497,7 +538,8 @@ def test_distributed_catalog_reconciles_real_conflicting_candidates(
 
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', Probe)
     cache = ForwardCache(namespace={'model': 'shared-owner-tuning'},
-        device=torch.device('cuda', torch.cuda.current_device()), root=Path(root[0]), compile_workers=1,
+        device=torch.device('cuda', torch.cuda.current_device()), root=Path(root[0]),
+        compile_workers=coordinator.local_ranks,
         options=dict(_OPTIONS, autotune_local_cache=False, autotune_remote_cache=False))
     signatures = {name: GraphSignature('decode', 1, 1) for name in ('decode', 'resume')}
     make_forward = (lambda: VariantArithmeticForward(rank)) if distinct_variants else ArithmeticForward

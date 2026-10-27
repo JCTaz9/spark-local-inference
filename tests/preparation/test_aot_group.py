@@ -103,9 +103,11 @@ def test_trial_inputs_are_restored_before_tuning_and_frozen_inductor_warmups(tmp
         def register(self, bound):
             events.append("register")
 
-        def warm(self, bound, warmup):
+        def warm(self, bound, warmup, *, before_run=None):
             for _ in range(2):
                 with warmup():
+                    if before_run is not None:
+                        before_run()
                     bound()
 
         def freeze(self, bound):
