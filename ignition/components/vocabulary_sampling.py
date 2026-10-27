@@ -28,21 +28,22 @@ _TARGET_DOMAIN = tl.constexpr(TARGET_RNG_DOMAIN)
 
 
 @triton.jit
-def _scores(Logits, Scores, Partials, Embedding, Head, HeadScale, Pending, Drafts,
+def _scores(VocabularyOffset, Logits, Scores, Partials, Embedding, Head, HeadScale, Pending, Drafts,
             Histogram, Slots, Generations, LiveRows, Generation, Status, Params,
             TopK, Grammar, GrammarEnabled, Seeds, Offsets,
             logit_row_stride, logit_step_stride, hist_stride, mask_stride,
-            LOCAL: tl.constexpr, VOCAB: tl.constexpr, START: tl.constexpr,
+            LOCAL: tl.constexpr, VOCAB: tl.constexpr,
             WIDTH: tl.constexpr, DRAFTS: tl.constexpr, PREFIX: tl.constexpr, BLOCKS: tl.constexpr,
             CAPACITY: tl.constexpr, BATCH: tl.constexpr, RUNNING: tl.constexpr,
             MARKOV: tl.constexpr, RANK: tl.constexpr, FP8: tl.constexpr,
             SAMPLE: tl.constexpr, STEP: tl.constexpr, BLOCK: tl.constexpr):
+    start = tl.load(VocabularyOffset)
     block, row = tl.program_id(0), tl.program_id(1)
     step = STEP
     if not SAMPLE:
         step = tl.program_id(2)
     col = block * BLOCK + tl.arange(0, BLOCK)
-    token, inside = START + col, (col < LOCAL) & (START + col < VOCAB)
+    token, inside = start + col, (col < LOCAL) & (start + col < VOCAB)
     score = tl.load(Logits + row * logit_row_stride + step * logit_step_stride + col,
                     inside, other=0.0).to(tl.float32)
     if MARKOV:
@@ -101,7 +102,7 @@ def _scores(Logits, Scores, Partials, Embedding, Head, HeadScale, Pending, Draft
     tl.store(p, maximum)
     tl.store(p + 1, total)
     tl.store(p + 2, tl.max(noised, 0))
-    tl.store(p + 3, (START + block * BLOCK + index).to(tl.float32))
+    tl.store(p + 3, (start + block * BLOCK + index).to(tl.float32))
     tl.store(p + 4, bad.to(tl.float32))
 
 
@@ -130,12 +131,13 @@ def _summarize(Partials, Summary, BLOCKS: tl.constexpr, PAD: tl.constexpr):
 
 
 @triton.jit
-def _normalize_shard(Scores, Gathered, Probabilities, Valid, Tokens,
+def _normalize_shard(VocabularyOffset, Scores, Gathered, Probabilities, Valid, Tokens,
                      Slots, Generations, LiveRows, Generation, Status, Params,
-                     LOCAL: tl.constexpr, VOCAB: tl.constexpr, START: tl.constexpr,
+                     LOCAL: tl.constexpr, VOCAB: tl.constexpr,
                      WIDTH: tl.constexpr, STEP: tl.constexpr, WORLD: tl.constexpr,
                      CAPACITY: tl.constexpr, BATCH: tl.constexpr, RUNNING: tl.constexpr,
                      SAMPLE: tl.constexpr, BLOCK: tl.constexpr, RANK_PAD: tl.constexpr):
+    start = tl.load(VocabularyOffset)
     block, row = tl.program_id(0), tl.program_id(1)
     summary_row, step = row, STEP
     if not SAMPLE:
@@ -159,9 +161,9 @@ def _normalize_shard(Scores, Gathered, Probabilities, Valid, Tokens,
     q = tl.exp(score - maximum) / total
     if not SAMPLE:
         safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
-        q = tl.where(tl.load(Params + safe * 6) > 0, q, (START + col == chosen).to(tl.float32))
+        q = tl.where(tl.load(Params + safe * 6) > 0, q, (start + col == chosen).to(tl.float32))
     tl.store(Probabilities + (row * WIDTH + step) * LOCAL + col,
-             tl.where(valid, q, (START + col == 0).to(tl.float32)), col < LOCAL)
+             tl.where(valid, q, (start + col == 0).to(tl.float32)), col < LOCAL)
     if block == 0:
         tl.store(Valid + row * WIDTH + step, valid)
         if SAMPLE:
@@ -218,6 +220,9 @@ class PreparedVocabularySoftmax:
         self.logits, self.probabilities, self.valid = logits, probabilities, valid
         self.state, self.slots, self.generations, self.live_rows = requests, slots, generations, live_rows
         self.candidates, self.start, self.world, self.batch, self.width, self.local = candidates, start, world, b, w, local
+        # Rank-local vocabulary placement is a binding, so TP peers reuse the
+        # same compiled computation while retaining their own global token IDs.
+        self.vocabulary_offset = torch.tensor([start], dtype=torch.int32, device=device)
         self.embedding, self.head, self.scale, self.pending = embedding, values, scale, pending
         self.seeds, self.offsets, self.tokens, self.sample = seeds, offsets, tokens, sample
         summary_rows = b if sample else b * w
@@ -235,22 +240,22 @@ class PreparedVocabularySoftmax:
         steps = []
         for step in range(w if self.sample else 1):
             summary_rows = b if self.sample else b * w
-            score = prepare_triton(_scores, (self.logits, s["scores"], s["partials"],
+            score = prepare_triton(_scores, (self.vocabulary_offset, self.logits, s["scores"], s["partials"],
                 self.embedding, self.head, self.scale, self.pending, self.candidates,
                 state.histogram, self.slots, self.generations, self.live_rows, state.generation, state.status,
                 state.parameters, state.top_k, state.grammar_mask, state.grammar_enabled, self.seeds, self.offsets,
                 self.logits.stride(0), self.logits.stride(1), state.histogram.stride(0), state.grammar_mask.stride(0)),
-                (triton.cdiv(local, 256), b, 1 if self.sample else w), LOCAL=local, VOCAB=state.vocab_size, START=self.start,
+                (triton.cdiv(local, 256), b, 1 if self.sample else w), LOCAL=local, VOCAB=state.vocab_size,
                 WIDTH=w, DRAFTS=self.candidates.shape[1], PREFIX=step if self.sample else w - 1, BLOCKS=triton.cdiv(local, 256),
                 CAPACITY=state.capacity, BATCH=b, RUNNING=RUNNING, MARKOV=self.markov,
                 RANK=64 if self.head is None else self.head.shape[1], FP8=self.scale is not None,
                 SAMPLE=self.sample, STEP=step, BLOCK=256, num_warps=4, enable_fp_fusion=False)
             summary = prepare_triton(_summarize, (s["partials"], s["summary"]), (summary_rows, 1, 1),
                 BLOCKS=triton.cdiv(local, 256), PAD=triton.next_power_of_2(triton.cdiv(local, 256)), num_warps=4)
-            normalize = prepare_triton(_normalize_shard, (s["scores"], s["gathered"], self.probabilities,
+            normalize = prepare_triton(_normalize_shard, (self.vocabulary_offset, s["scores"], s["gathered"], self.probabilities,
                 self.valid, self.tokens, self.slots, self.generations, self.live_rows, state.generation,
                 state.status, state.parameters), (triton.cdiv(local, 256), summary_rows, 1), LOCAL=local,
-                VOCAB=state.vocab_size, START=self.start, WIDTH=w, STEP=step, WORLD=self.world,
+                VOCAB=state.vocab_size, WIDTH=w, STEP=step, WORLD=self.world,
                 CAPACITY=state.capacity, BATCH=b, RUNNING=RUNNING, SAMPLE=self.sample, BLOCK=256,
                 RANK_PAD=triton.next_power_of_2(self.world), num_warps=4, enable_fp_fusion=False)
             steps.append((score, summary, normalize))
@@ -285,9 +290,10 @@ def _probability_partials(P, Q, Partials, LOCAL: tl.constexpr, WIDTH: tl.constex
 
 
 @triton.jit
-def _selected_probabilities(P, Q, Drafts, Partials, Summary, LOCAL: tl.constexpr,
-                            WIDTH: tl.constexpr, START: tl.constexpr,
+def _selected_probabilities(VocabularyOffset, P, Q, Drafts, Partials, Summary, LOCAL: tl.constexpr,
+                            WIDTH: tl.constexpr,
                             BLOCKS: tl.constexpr, PAD: tl.constexpr):
+    start = tl.load(VocabularyOffset)
     row = tl.program_id(0)
     word = tl.arange(0, _WORDS)
     tl.store(Summary + row * _WORDS + word, 0.0)
@@ -299,7 +305,7 @@ def _selected_probabilities(P, Q, Drafts, Partials, Summary, LOCAL: tl.constexpr
         tl.store(Summary + row * _WORDS + 16 + step, pmass)
         tl.store(Summary + row * _WORDS + 24 + step, qmass)
         if step < WIDTH - 1:
-            token = tl.load(Drafts + row * (WIDTH - 1) + step) - START
+            token = tl.load(Drafts + row * (WIDTH - 1) + step) - start
             owned = (token >= 0) & (token < LOCAL)
             p = tl.load(P + (row * WIDTH + step) * LOCAL + token, owned, other=0.0)
             q = tl.load(Q + (row * (WIDTH - 1) + step) * LOCAL + token, owned, other=0.0)
@@ -321,14 +327,15 @@ def _prefix(Selected, row, before, WIDTH: tl.constexpr, WORLD: tl.constexpr, RAN
 
 
 @triton.jit
-def _residual(P, Q, Selected, Partials, Limits, Seeds, RngGeneration, RngOffset,
+def _residual(VocabularyOffset, P, Q, Selected, Partials, Limits, Seeds, RngGeneration, RngOffset,
               Slots, Generations, CAPACITY: tl.constexpr, LOCAL: tl.constexpr,
-              VOCAB: tl.constexpr, START: tl.constexpr, WIDTH: tl.constexpr,
+              VOCAB: tl.constexpr, WIDTH: tl.constexpr,
               WORLD: tl.constexpr, RANK_PAD: tl.constexpr, BLOCKS: tl.constexpr,
               BLOCK: tl.constexpr, HAS_LIMITS: tl.constexpr):
+    start = tl.load(VocabularyOffset)
     block, row, step = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     col = block * BLOCK + tl.arange(0, BLOCK)
-    inside = (col < LOCAL) & (START + col < VOCAB)
+    inside = (col < LOCAL) & (start + col < VOCAB)
     p = tl.load(P + (row * WIDTH + step) * LOCAL + col, inside, other=0.0)
     prefix = _prefix(Selected, row, step, WIDTH, WORLD, RANK_PAD)
     residual = p
@@ -342,13 +349,13 @@ def _residual(P, Q, Selected, Partials, Limits, Seeds, RngGeneration, RngOffset,
     base = tl.where(tl.load(RngGeneration + safe) == tl.load(Generations + row), tl.load(RngOffset + safe), 0)
     # Token noise has a counter domain distinct from scalar acceptance draws.
     # Each conditional residual owns a separate logical offset in the reservation.
-    value = tl.log(residual) + _token_noise(seed, base + step, START + col)
+    value = tl.log(residual) + _token_noise(seed, base + step, start + col)
     value = tl.where(inside & (residual > 0) & (value == value), value, -float("inf"))
     selected = tl.argmax(value, 0, tie_break_left=True)
     part = Partials + ((row * WIDTH + step) * BLOCKS + block) * 3
     tl.store(part, tl.sum(residual, 0))
     tl.store(part + 1, tl.max(value, 0))
-    tl.store(part + 2, (START + block * BLOCK + selected).to(tl.float32))
+    tl.store(part + 2, (start + block * BLOCK + selected).to(tl.float32))
 
 
 @triton.jit
@@ -487,6 +494,9 @@ class PreparedVocabularyBlockVerification:
         self.state, self.slots, self.generations, self.live_rows, self.rng = requests, slots, generations, live_rows, rng
         self.draft_valid, self.target_valid, self.limits = draft_valid, target_valid, token_limits
         self.batch, self.width, self.local, self.start, self.world = b, w, local, start, world
+        # Rank-local vocabulary placement is a binding, so TP peers reuse the
+        # same compiled computation while retaining their own global token IDs.
+        self.vocabulary_offset = torch.tensor([start], dtype=torch.int32, device=device)
         self.output = SpeculativeAcceptance.allocate(b, w, device) if output is None else output
         self.output.validate(b, w, device)
         self.draw_reservation = 4 * ((w + 1 + 3) // 4)
@@ -509,12 +519,12 @@ class PreparedVocabularyBlockVerification:
         partials = prepare_triton(_probability_partials, (self.p, self.q, s["partials"]), (blocks, b, w),
             LOCAL=local, WIDTH=w, BLOCKS=blocks, BLOCK=256, num_warps=4)
         selected = prepare_triton(_selected_probabilities,
-            (self.p, self.q, self.drafts, s["partials"], s["selected_summary"]), (b, 1, 1),
-            LOCAL=local, WIDTH=w, START=self.start, BLOCKS=blocks,
+            (self.vocabulary_offset, self.p, self.q, self.drafts, s["partials"], s["selected_summary"]), (b, 1, 1),
+            LOCAL=local, WIDTH=w, BLOCKS=blocks,
             PAD=triton.next_power_of_2(blocks), num_warps=4)
-        residual = prepare_triton(_residual, (self.p, self.q, s["selected"], s["partials"], self.limits, state.seed,
+        residual = prepare_triton(_residual, (self.vocabulary_offset, self.p, self.q, s["selected"], s["partials"], self.limits, state.seed,
             self.rng.generation, self.rng.target_offset, self.slots, self.generations), (blocks, b, w),
-            CAPACITY=state.capacity, LOCAL=local, VOCAB=state.vocab_size, START=self.start,
+            CAPACITY=state.capacity, LOCAL=local, VOCAB=state.vocab_size,
             WIDTH=w, WORLD=self.world, RANK_PAD=triton.next_power_of_2(self.world),
             BLOCKS=blocks, BLOCK=256, HAS_LIMITS=self.limits is not None, num_warps=4, enable_fp_fusion=False)
         summary = prepare_triton(_summarize_residual, (s["partials"], s["residual_summary"]), (b, w, 1),
