@@ -2,6 +2,7 @@
 
 import threading
 import pickle
+import copy
 from collections import namedtuple
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -86,6 +87,22 @@ def test_prepared_winner_does_not_reopen_occupancy_search(monkeypatch):
     assert len(tuner.launchers) == len(tuner.compile_results) == 1
     assert tuner.compile_results[0].config is selected
     assert tuner.launchers[0].config.kwargs == {"XBLOCK": 8, "R0_BLOCK": 256}
+
+
+def test_frozen_config_restores_exact_state_after_torch_cache_recheck(monkeypatch):
+    tuner, selected = restored_reduction(monkeypatch)
+    state = copy.deepcopy(vars(selected))
+    tuner.compile_results[0]._flare_config_state = state
+    bundle = SimpleNamespace(static_autotuners=[
+        SimpleNamespace(cache_key='reduction-key', kernel=tuner, kernel_name='restored_reduction')])
+    _freeze_tuning_winners(bundle)
+    future = StaticAutotunerFuture(tuner)
+    future.reload_kernel_from_src = lambda: tuner
+    assert future.result() is tuner
+    assert 'found_by_coordesc' not in state
+    assert vars(selected)['found_by_coordesc'] is False
+    _freeze_tuning_winners(bundle)
+    assert vars(selected) == state
 
 
 @pytest.mark.parametrize("pending", ["multiple", "empty", "coordesc", "combo"])

@@ -35,7 +35,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     if compile_decoder:
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
-                             compile_workers=getattr(session, "requested_compile_workers", None))
+                             compile_workers=getattr(session, "requested_compile_workers", None),
+                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
         stream.wait_stream(torch.cuda.current_stream(device))

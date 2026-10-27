@@ -16,6 +16,7 @@ from b12x.preparation import (
     autotune_effort as b12x_autotune_effort,
 )
 from b12x.preparation.session import _declaration_key
+from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
 from .host_memory import cpu_workers, release_unused, tuning_limits
@@ -25,6 +26,18 @@ from .host_memory import cpu_workers, release_unused, tuning_limits
 # otherwise all requests. Each job's compiler processes then stay within about a gigabyte.
 _COLLECTIVES_PER_JOB = 96
 _REQUESTS_PER_JOB = 192
+
+
+def _local_tuning_catalog(requests):
+    def identity(plan):
+        if isinstance(plan, _CompositePlan):
+            return (plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
+                    tuple((count, identity(child)) for count, child in plan.variants.items()))
+        # Bound device ordinals differ across ranks but do not change the race.
+        return _declaration_key(plan)[:-1]
+
+    return tuple((request.name, identity(request.plan), request.dependencies)
+                 for request in requests if request.collective is None)
 
 
 def _prepare_compiler_toolchain():
@@ -322,9 +335,9 @@ class RecordedPreparationSession(PreparationSession):
             elif self.autotune and self._coordinator is not None:
                 import torch.distributed as dist
 
-                # Identical TP GPUs split candidate races regardless of host placement.
+                # Candidate shards must cover the same local races on every rank.
                 self._sharded = self._coordinator.same_on_every_rank(
-                    torch.cuda.get_device_properties(self.device.ordinal).name)
+                    (torch.cuda.get_device_properties(self.device.ordinal).name, _local_tuning_catalog(requests)))
                 if self._sharded:
                     self.configure_tuning_shard(dist.get_rank(), self._coordinator.ranks)
                 elif self._coordinator.spans_hosts:

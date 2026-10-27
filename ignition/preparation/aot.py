@@ -36,23 +36,36 @@ _DEFERRED_BINDINGS = ContextVar("flare_deferred_bindings", default=False)
 _CHECK_BINDINGS = ContextVar("flare_check_bindings", default=False)
 
 
-def _load_inductor(data, original):
+def _load_inductor(data, original, *, frozen=False):
     from torch._functorch._aot_autograd.aot_autograd_result import deserialize_bundled_cache_entry
     from torch._inductor.standalone_compile import AOTCompiledArtifact
 
     entry, kernels, constants = pickle.loads(data)
     if kernels or constants:
         raise ValueError("compiled native launches must use runtime kernel bindings")
-    relocate_inductor(entry, original)
+    relocate_inductor(entry, original, freeze_tuning=frozen)
+    if frozen and entry.compiled_fw.result._triton_bundle is not None:
+        from .inductor_tuning import _materialize_selected_cubin
+
+        for tuner in entry.compiled_fw.result._triton_bundle.static_autotuners:
+            for result in tuner.kernel.compile_results:
+                _materialize_selected_cubin(result)
     serialized = zlib.compress(pickle.dumps((entry, kernels, constants)), level=1)
     compiled = deserialize_bundled_cache_entry(entry)
+    if frozen and entry.compiled_fw.result._triton_bundle is not None:
+        from .device_binding import _freeze_tuning_winners
+
+        # Torch adds config defaults while rebuilding launchers from a static bundle.
+        _freeze_tuning_winners(entry.compiled_fw.result._triton_bundle)
     # Loading materializes bundled files in Triton's cache. Keep the portable copy compressed;
     # live kernel owners retain their binaries, launchers, and argument metadata independently.
     for result in (entry, compiled.serialize()):
         graph = result.compiled_fw.result
         if graph._triton_bundle is not None:
             graph._triton_bundle.kernel_artifacts.clear()
-    return AOTCompiledArtifact(compiled), serialized
+    artifact = AOTCompiledArtifact(compiled)
+    artifact._flare_graph = entry.compiled_fw.result
+    return artifact, serialized
 
 
 class _BindingsChecked(Exception):
@@ -292,6 +305,7 @@ class StorageBackend(SerializableCallable):
                 fake_mode=detect_fake_mode(examples), options={'config_patches': dict(_OPTIONS if options is None else options)},
                 aot=True, donate_graph_module=True)
         self._serialized_artifact = None
+        self._tuning_frozen = False
         self._bound = None
 
     def __call__(self, *args):
@@ -344,12 +358,12 @@ class StorageBackend(SerializableCallable):
             else:
                 raise TypeError(f'cannot serialize native operator: {target}')
             calls.append((name, leaves, treespec_dumps(call.tree), call.operands, call.integers))
-        return pickle.dumps((artifact, fn.inputs, calls, fn.signature))
+        return pickle.dumps((artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen))
 
     @classmethod
     def deserialize_compile_artifacts(cls, data):
         fn = cls.__new__(cls)
-        artifact, fn.inputs, calls, fn.signature = pickle.loads(data)
+        artifact, fn.inputs, calls, fn.signature, fn._tuning_frozen = pickle.loads(data)
         devices = {item[4] for item in fn.signature if isinstance(item, tuple) and item[4].type == "cuda"}
         if len(devices) != 1:
             raise ValueError("compiled forwards require exactly one CUDA device")
@@ -374,7 +388,8 @@ class StorageBackend(SerializableCallable):
                 target = getattr(getattr(getattr(torch.ops, namespace), opname), overload)
             fn.invocations.append(_Invocation(target, leaves, tree, operands, integers))
         with _artifact_kernel_table():
-            fn.artifact, fn._serialized_artifact = _load_inductor(artifact, original_device)
+            fn.artifact, fn._serialized_artifact = _load_inductor(artifact, original_device,
+                                                               frozen=fn._tuning_frozen)
         fn._bound = None
         return fn
 
@@ -525,13 +540,15 @@ def _share_artifacts(owned, group, ranks):
 class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
-    def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None):
+    def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
+                 lock_gpu_clocks=False):
         import flashinfer
         from torch._inductor.codecache import torch_key
 
         self.device = torch.device(device)
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
+        self.lock_gpu_clocks = lock_gpu_clocks
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
@@ -602,10 +619,12 @@ class ForwardCache:
     def _prepare_many(self, functions, signatures, *, progress, coordinator, materialize, warmup):
         from ignition.progress import phase
         from .compile_pool import CompilePool
+        from .inductor_tuning import InductorSelections
 
         if coordinator is not None:
             return self._prepare_ranks(functions, signatures, coordinator, progress=progress,
                                        materialize=materialize, warmup=warmup)
+        selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
                 headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
@@ -619,9 +638,8 @@ class ForwardCache:
                             if not bound.cache_hit:
                                 bound = self._load(bound.owner, path, required=True)
                                 bound.cache_hit = False
-                            with warmup():
-                                bound()
-                            compiled[name] = bound
+                            compiled[name] = self._warm(bound, path, name=name, progress=None,
+                                                       selections=selections, warmup=warmup)
                         else:
                             paths[name] = path
                 except Exception as error:
@@ -647,8 +665,8 @@ class ForwardCache:
                             bound = self._load(forward, paths[name], required=True)
                         except BindingMismatch:
                             bound = BoundForward(aot_forward(forward, options=self.options), forward, False)
-                        with warmup():
-                            compiled[name] = self._warm(bound, paths[name], name=name)
+                        compiled[name] = self._warm(bound, paths[name], name=name, progress=None,
+                                                   selections=selections, warmup=warmup)
                     stage.update(advance=1)
         release_unused()
         return compiled
@@ -667,6 +685,7 @@ class ForwardCache:
         import torch.distributed as dist
         from ignition.progress import phase
         from .compile_pool import CompilePool
+        from .inductor_tuning import InductorSelections
 
         group, ranks = coordinator.group, coordinator.ranks
         share = ranks.index(dist.get_rank())
@@ -815,16 +834,38 @@ class ForwardCache:
         if any(errors):
             raise RuntimeError(f"compiled forward binding failed: {errors}")
         release_unused()
+        selections = InductorSelections(self.device, coordinator=coordinator,
+                                        lock_gpu_clocks=self.lock_gpu_clocks)
+        failure = None
+        try:
+            for bound in selected.values():
+                selections.register(bound)
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
+        selections._check(failure)
         with phase(progress, "Warm compiled forwards", total=len(functions)) as stage:
             for name in functions:
                 coordinator.barrier(f"compiled warmup {name}", ranks)
                 try:
-                    with warmup():
-                        selected[name]()
+                    selections.warm(selected[name], warmup)
                 except Exception as error:
                     error.add_note(f"Warming compiled forward {name!r}")
                     raise
                 stage.update(advance=1)
+        published, failure = [], None
+        try:
+            for name, bound in selected.items():
+                selections.freeze(bound)
+                variant = getattr(functions[name], 'compilation_variant', 'shared')
+                if compilers[name, variant] == share:
+                    path, _ = paths[name, variant]
+                    bound.artifact.save_compiled_function(path)
+                    published.append(path)
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
+        selections._check(failure)
+        if coordinator.spans_hosts:
+            _share_artifacts(selections._gather(published), group, ranks)
         return selected
 
     def _load(self, forward, path, *, required=False):
@@ -886,23 +927,25 @@ class ForwardCache:
             return BoundForward(None, forward, False, compiler.submit(forward, path)), path
         return BoundForward(aot_forward(forward, options=self.options), forward, False), path
 
-    def _warm(self, bound, path, *, name, progress=None):
+    def _warm(self, bound, path, *, name, progress=None, selections=None, warmup=nullcontext):
         def report(operation):
             if progress is not None:
                 progress.update(f"{name} · {operation}")
 
-        if bound.cache_hit:
-            try:
-                report("warming restored forward")
-                bound()
-            except BindingMismatch:
-                report("tracing and compiling forward")
-                bound = BoundForward(aot_forward(bound.owner, options=self.options), bound.owner, False)
-            else:
-                return bound
-        report("warming compiled forward")
-        bound()
+        from .inductor_tuning import InductorSelections
+
+        if selections is None:
+            selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not hasattr(bound.artifact._artifacts.compiled_fn.artifact, '_flare_graph'):
+            bound.artifact.save_compiled_function(str(path))
+            cached = bound.cache_hit
+            bound = self._load(bound.owner, path, required=True)
+            bound.cache_hit = cached
+        report("warming restored forward" if bound.cache_hit else "warming compiled forward")
+        selections.register(bound)
+        selections.warm(bound, warmup)
+        selections.freeze(bound)
         report("saving compiled forward")
         bound.artifact.save_compiled_function(str(path))
         return bound

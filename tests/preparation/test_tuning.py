@@ -18,6 +18,7 @@ from ignition.preparation.tuning import (
     benchmark_resource,
     declare,
     register_finalizer,
+    _local_tuning_catalog,
 )
 
 
@@ -488,10 +489,11 @@ def test_explicit_cpu_budget_reaches_b12x_without_environment_switch(backend):
 
 
 
+@pytest.mark.parametrize("matching_catalog", [True, False])
 @pytest.mark.parametrize("identical", [True, False])
 @pytest.mark.parametrize("workers", [None, 4])
 @pytest.mark.parametrize("spans_hosts", [False, True])
-def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, identical, workers, spans_hosts):
+def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, identical, matching_catalog, workers, spans_hosts):
     import torch.distributed as dist
 
     monkeypatch.setattr(torch.cuda, "get_device_properties",
@@ -508,15 +510,18 @@ def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, ident
 
     coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda: None,
         local_ranks=1 if spans_hosts else 2, spans_hosts=spans_hosts,
-        same_on_every_rank=lambda value: identical and value == "NVIDIA GB10",
+        same_on_every_rank=lambda value: identical and matching_catalog and value ==
+            ("NVIDIA GB10", _local_tuning_catalog((declaration("op"),))),
         share_selections=shared.append, agree_selections=lambda selections: None, prepare=prepare)
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator, compile_workers=workers)
     session.declare((declaration("op"),))
     report = session.tune()
+    assert session.autotune
     assert report["compile_workers"] == (8 if workers is None else workers // coordinator.local_ranks)
     # Sharded races exchange results through the coordinator even in jobs without collectives.
-    assert (shards, shared, coordinated) == (([(1, (0, 1))], [], [("op",)]) if identical
-                                             else ([], ["rank cache"] if spans_hosts else [], []))
+    expected = ([(1, (0, 1))], [], [("op",)]) if identical and matching_catalog else (
+        [], ["rank cache"] if spans_hosts else [], [])
+    assert (shards, shared, coordinated) == expected
 
 
 def test_helpers_preserve_ordinary_session_behavior():
@@ -1440,3 +1445,15 @@ def test_clock_lock_released_on_tuning_failure(backend, monkeypatch):
         session.tune()
     assert events == ["lock", "unlock"]
     session.close()
+
+
+def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals():
+    first, peer = declaration("projection"), declaration("projection")
+    first.plan._device, peer.plan._device = 0, 1
+    assert _local_tuning_catalog((first,)) == _local_tuning_catalog((peer,))
+    assert _local_tuning_catalog((first,)) != _local_tuning_catalog(())
+    peer.plan.query = 256
+    assert _local_tuning_catalog((first,)) != _local_tuning_catalog((peer,))
+    collective = declaration("reduce")
+    collective.collective = object()
+    assert _local_tuning_catalog((first, collective)) == _local_tuning_catalog((first,))

@@ -74,6 +74,22 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
+The pinned PyTorch 2.14.1 and Triton 3.8 preparation environment requires two
+Inductor patches. `patches/torch-inductor-triton-cache-filenames.patch` matches
+Triton's 150-character physical cache filenames while retaining full CUDA symbol
+names. `patches/torch-inductor-cooperative-static-launch.patch` preserves
+cooperative vision reductions in portable static kernels through Triton's CUDA
+launcher, including their cooperative launch attributes and frozen selections.
+Apply both patches once after installing or reinstalling Torch in the dedicated
+Flare preparation environment, on every preparation host, before compiling forwards:
+
+```sh
+patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+  -p1 < patches/torch-inductor-triton-cache-filenames.patch
+patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+  -p1 < patches/torch-inductor-cooperative-static-launch.patch
+```
+
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
 
@@ -141,7 +157,9 @@ audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
-graphics frequency for the b12x tuning batch. It applies to serving ranks and
+graphics frequency for the b12x tuning batch and actual Inductor autotuning
+trials during compiled-forward preparation. Frozen warmup, capture, and serving
+run without these locks. It applies to serving ranks and
 extra tuning replicas, and does nothing with `--autotune-effort off`. The GPU's
 UUID selects the device under `CUDA_VISIBLE_DEVICES`. Run with permission to
 control clocks: Ignition uses `sudo -n nvidia-smi` when not root. Unsupported

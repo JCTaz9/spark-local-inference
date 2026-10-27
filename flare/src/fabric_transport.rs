@@ -229,6 +229,7 @@ fn relay(
     held: &Mutex<Connections>,
     slots: &Mutex<HashSet<(usize, usize)>>,
 ) -> Result<(), Failure> {
+    socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(Duration::from_secs(30)))?;
     let (destination, stream) = header(&mut socket, config)?;
     let path = topology.path(0, destination)?;
@@ -390,6 +391,56 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_relay_socket_disables_nagle_for_small_responses() {
+        let source = TcpListener::bind("127.0.0.1:0").unwrap();
+        let network = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+        let topology = Topology::plan(
+            &vec![b"a 127.0.0.1/8\n".to_vec(); 2],
+            &[
+                network.local_addr().unwrap().port(),
+                peer.local_addr().unwrap().port(),
+            ],
+            false,
+        )
+        .unwrap();
+        let config = Config {
+            rank: 0,
+            world: 2,
+            ring: false,
+            chain: false,
+            streams: 1,
+            source_port: source.local_addr().unwrap().port(),
+        };
+        let mut client = TcpStream::connect(network.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (accepted, _) = network.accept().unwrap();
+        let observed = accepted.try_clone().unwrap();
+        let held = Mutex::new(Connections::default());
+        let slots = Mutex::new(HashSet::new());
+        client.write_all(&1u32.to_le_bytes()).unwrap();
+        client.write_all(&0u32.to_le_bytes()).unwrap();
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| relay(accepted, &config, &topology, &held, &slots));
+            let (mut upstream, _) = source.accept().unwrap();
+            upstream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upstream.read_exact(&mut [0; 8]).unwrap();
+            let nodelay = observed.nodelay().unwrap();
+            upstream.write_all(&[7, 11, 13, 17]).unwrap();
+            let mut response = [0; 4];
+            client.read_exact(&mut response).unwrap();
+            client.shutdown(Shutdown::Both).unwrap();
+            worker.join().unwrap().unwrap();
+            assert_eq!(response, [7, 11, 13, 17]);
+            assert!(nodelay);
+        });
+    }
 
     #[test]
     fn concurrent_direct_and_relayed_channels_preserve_both_directions_and_drain() {

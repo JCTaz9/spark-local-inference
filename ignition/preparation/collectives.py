@@ -301,7 +301,16 @@ class CollectivePreparation:
                         raise ValueError("collective preparation requires the complete control group")
                     authorization = {"collective_key": key}
                 elif all(item[1] or item[3] is not None or item[4] or item[5] is not None for item in states):
-                    raise RuntimeError("ranks reached incompatible preparation exchanges")
+                    pending = {
+                        rank: {
+                            "collectives": item[1],
+                            "cache": None if item[3] is None else tuple(item[3].records),
+                            "tuning": tuple(contribution.key for contribution in item[4]),
+                            "collective_tuning": None if item[5] is None else (item[5].key, item[5].step),
+                        }
+                        for rank, item in zip(self.ranks, states, strict=True)
+                    }
+                    raise RuntimeError(f"ranks reached incompatible preparation exchanges: {pending}")
         except BaseException as failure:
             try:
                 if job is not None:

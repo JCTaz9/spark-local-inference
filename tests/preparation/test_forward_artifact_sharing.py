@@ -82,6 +82,33 @@ class _Forward:
         self.compilation_variant = variant
 
 
+class _Artifact:
+    def __init__(self, execute):
+        self.execute = execute
+
+    def __call__(self, owner):
+        self.execute(owner)
+
+    def save_compiled_function(self, path):
+        assert Path(path).exists()
+
+
+def _replace_gpu_preparation():
+    from types import SimpleNamespace
+    import torch
+    from ignition.preparation import inductor_tuning
+
+    class Selections(inductor_tuning.InductorSelections):
+        def register(self, bound):
+            self.forwards[id(bound)] = SimpleNamespace(_tuning_frozen=False), None, {}
+
+        def freeze(self, bound):
+            pass
+
+    inductor_tuning.InductorSelections = Selections
+    torch.cuda.current_stream = lambda device: SimpleNamespace(synchronize=lambda: None)
+
+
 class _Pool:
     """Compiles by writing the artifact path with the compiling rank, as a worker would."""
 
@@ -124,12 +151,14 @@ def _lending_rank(rank, world, store, root, outcome):
 
     try:
         compile_pool.CompilePool = _Pool
+        _replace_gpu_preparation()
         aot.ForwardCache._load = lambda self, forward, path, required=False: aot.BoundForward(
-            lambda owner: None, forward, True)
+            _Artifact(lambda owner: None), forward, True)
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
         cache.compile_workers = None
+        cache.lock_gpu_clocks = False
         variant = "sample" if rank == 0 else "consume"
         functions = {name: _Forward(variant) for name in "abcd"}
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
@@ -176,10 +205,11 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
 
     try:
         compile_pool.CompilePool = _Pool
+        _replace_gpu_preparation()
         restored, warmed = [], []
 
         def load(self, forward, path, required=False):
-            bound = aot.BoundForward(lambda owner: warmed.append(owner), forward, True)
+            bound = aot.BoundForward(_Artifact(warmed.append), forward, True)
             if not required:
                 restored.append(weakref.ref(bound))
             return bound
@@ -193,6 +223,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
         cache.compile_workers = None
+        cache.lock_gpu_clocks = False
         functions = {name: _Forward("shared") for name in "abcd"}
         signatures = {name: name for name in functions}
         for name, forward in functions.items():
@@ -203,6 +234,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         selected = cache._prepare_ranks(functions, signatures, coordinator, progress=None,
             materialize=materialize if deferred else None, warmup=nullcontext)
         assert set(warmed) == set(functions.values())
+        assert all(warmed.count(forward) == 2 for forward in functions.values())
         assert all(bound.cache_hit for bound in selected.values())
         outcome.put((rank, sorted(selected)))
         dist.destroy_process_group()
