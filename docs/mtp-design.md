@@ -146,6 +146,14 @@ with the checkpoint's noise token. Sequential Markov logits condition each
 proposal on the preceding sampled token. The target and draft share token
 embeddings and the sharded vocabulary projection.
 
+Batch-one graphs with replicated BF16 Markov weights fuse transition scoring
+and full-vocabulary Gumbel proposals, retaining normalized FP32 proposal
+probabilities. Wider graphs, quantized or sharded transition weights, and
+selector-dependent proposals use the bounded sampler. These proposal
+distributions can produce different seeded text. Target verification applies
+the request's target policy and uses the retained distribution that generated
+each proposal.
+
 Verification with draft tokens stages sliding-window writes and pending compression
 state. Width one uses ordinary decode attention and direct target-cache writes;
 it performs no draft forward or staged-cache commit. Both paths absorb committed
@@ -405,8 +413,10 @@ All chains use FlashInfer's rejection sampler: accept
 with `min(1, p(token)/q(token))`; on rejection, sample the normalized positive
 residual `max(p-q,0)`, or sample the target bonus distribution after full
 acceptance. `q` must be the distribution that actually generated the proposal.
-Temperature, penalties, grammar and top-k/top-p/min-p filtering must be reflected
-at each conditional prefix. A copied token has a point-mass proposal law:
+The target distribution reflects temperature, penalties, grammar and
+top-k/top-p/min-p filtering at each conditional prefix. The proposal may use a
+different filter when its retained `q` describes the actual draw. A copied token
+has a point-mass proposal law:
 `q(copy_token)=1`, with zero mass elsewhere. Copy substitutions use that law
 at every temperature, including when replacing a native MTP proposal.
 

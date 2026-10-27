@@ -31,7 +31,7 @@ class SamplingRound:
     def results(self):
         return (self.ids, self.probabilities, self.valid, self.sampled, self.offset, self.seed,
                 self.verify.seed_bits, self.verify.offset,
-                *(value for name, value in vars(self.verify.output).items() if name != 'survival'),
+                *vars(self.verify.output).values(),
                 self.verify.rng.generation, self.verify.rng.target_offset,
                 self.verify.state.seed.view(torch.int64), self.verify.state.rng_counter.view(torch.int64))
 
