@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
                                reason="requires two explicitly assigned CUDA devices")
 
 
-def _rank(rank, rendezvous):
+def _rank(rank, rendezvous, fp8):
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from ignition.components.speculation import DRAFT_RNG_DOMAIN, SpeculativeRngState
     from ignition.components.vocabulary_sampling import PreparedVocabularySoftmax, PreparedVocabularyBlockVerification
@@ -40,6 +40,12 @@ def _rank(rank, rendezvous):
     logits[:, :, :covered].copy_(full_target[:, :, start:start + covered])
     local_head = torch.zeros(local, features, device=device, dtype=torch.bfloat16)
     local_head[:covered].copy_(head[start:start + covered])
+    if fp8:
+        from ignition.components.markov_sampling import fp8_markov_head
+
+        local_head = fp8_markov_head(local_head)
+        full_fp8 = fp8_markov_head(head)
+        head = (full_fp8.values.float() * full_fp8.scale[:, None]).contiguous()
     state = DeviceRequestState.allocate(device, vocab_size=v, capacity=b)
     state.status.fill_(RUNNING)
     state.generation.fill_(7)
@@ -134,7 +140,8 @@ def _rank(rank, rendezvous):
         dist.destroy_process_group()
 
 
-def test_two_rank_vocabulary_sampling_native_replay(tmp_path):
+@pytest.mark.parametrize("fp8", [False, True])
+def test_two_rank_vocabulary_sampling_native_replay(tmp_path, fp8):
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two explicitly assigned CUDA devices")
-    mp.spawn(_rank, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)
+    mp.spawn(_rank, args=((tmp_path / "rendezvous").as_uri(), fp8), nprocs=2, join=True)
