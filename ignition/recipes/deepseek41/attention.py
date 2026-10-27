@@ -323,7 +323,10 @@ class PreparedAttention:
             weights["output"], scratch.output, session=session, name=name + ".output", workspace=workspace)
         self.window_writer = PreparedCompressedCacheWriter(scratch.window_values, self.window_cache,
             self.window_slots, page_size=self.window_page_size, kind="swa", session=session,
-            name=f"{name}.window_write")
+            name=f"{name}.window_write",
+            history=self.window if mode in ("verify", "draft") else None,
+            history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
+            snapshot_tokens=128 if mode in ("verify", "draft") else 0)
         self.global_kv = None
         self.selectors = []
         if "compressor" in weights:
@@ -396,7 +399,7 @@ class PreparedAttention:
         if self.owns_window_metadata:
             self.window_metadata()
         position = self.window_metadata.position
-        if self.mode != "decode":
+        if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         self.projections["qkv_a"](source)
         if self.norm_quant is None:
