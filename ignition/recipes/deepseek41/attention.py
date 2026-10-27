@@ -10,6 +10,7 @@ import triton.language as tl
 from b12x.attention import mla_compress
 from b12x.preparation import PreparedCall
 
+from ignition.components import sm103_projection
 from ignition.components.compressed_mla import PreparedCompressedCacheWriter, PreparedCompressedMLA
 from ignition.components.attention_output import PreparedGroupedOutputProjection
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
@@ -293,7 +294,8 @@ class PreparedAttention:
         self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
         self.page_table = metadata.token_page_table
         self.projections = {}
-        paired_mxfp8 = all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+        use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
+        paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
                            for key in ("qkv_a", "q_b"))
         self.norm_quant = (PreparedMLANormQuant(scratch.projected,
             (weights["q_norm"], weights["kv_norm"]), scratch.query_low, scratch.window_values,
@@ -303,7 +305,8 @@ class PreparedAttention:
         for key, values, out in (
             ("qkv_a", source, scratch.projected), ("q_b", scratch.query_low, scratch.query.view(tokens, -1)),
         ):
-            packed_mxfp8 = isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+            packed_mxfp8 = use_b12x_mxfp8 and isinstance(
+                getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
             self.projections[key] = QuantizedProjection(values, weights[key], out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
                 mxfp8_min_amax=(1e-4 if packed_mxfp8 and (key != "q_b" or self.norm_quant is None)
