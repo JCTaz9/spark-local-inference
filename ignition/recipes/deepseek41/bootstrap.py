@@ -68,6 +68,17 @@ def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, visi
                     mla_compute_mode=mla_compute_mode))
 
 
+def _can_race_contextual_plans(config, signatures, device):
+    if (not config.dspark or config.autotune_effort == "off" or not any(
+            signature.kind == "speculative" and signature.batch_capacity == 1
+            and signature.token_capacity == 8 and signature.packed_token_capacity is not None
+            and signature.packed_token_capacity >= 8 for signature in signatures.values())):
+        return False
+    from b12x.quantization import mla_norm_mxfp8
+
+    return mla_norm_mxfp8.is_supported(device)
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     prompt_logprobs: bool = False
@@ -525,12 +536,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         feature_pool.release_backing()
     try:
         contextual = None
-        if config.dspark and config.autotune_effort != "off" and any(
-                                 signature.kind == "speculative" and signature.batch_capacity == 1
-                                 and signature.token_capacity == 8
-                                 and signature.packed_token_capacity is not None
-                                 and signature.packed_token_capacity >= 8
-                                 for signature in signatures.values()):
+        if _can_race_contextual_plans(config, signatures, device):
             from .contextual_selection import CatalogContextualSelection
 
             contextual = CatalogContextualSelection(forwards, signatures, arena=arena,

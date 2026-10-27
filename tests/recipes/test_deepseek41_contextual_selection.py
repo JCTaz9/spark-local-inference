@@ -13,6 +13,32 @@ from ignition.recipes.deepseek41.contextual_selection import (
 )
 
 
+def test_contextual_admission_requires_fused_norm_device_support(monkeypatch):
+    from b12x.quantization import mla_norm_mxfp8
+    from ignition.preparation.execution import GraphSignature
+    from ignition.recipes.deepseek41.bootstrap import _can_race_contextual_plans
+
+    config = SimpleNamespace(dspark=True, autotune_effort="default")
+    signatures = {"packed": GraphSignature("speculative", 1, 8,
+        speculation_enabled=True, packed_token_capacity=8, draft_tokens=7)}
+    device = torch.device("cuda:0")
+    supported, probes = {"value": False}, []
+    monkeypatch.setattr(mla_norm_mxfp8, "is_supported",
+        lambda actual: probes.append(actual) or supported["value"])
+
+    assert not _can_race_contextual_plans(config, signatures, device)
+    supported["value"] = True
+    assert _can_race_contextual_plans(config, signatures, device)
+    assert probes == [device, device]
+    config.autotune_effort = "off"
+    assert not _can_race_contextual_plans(config, signatures, device)
+    assert not _can_race_contextual_plans(SimpleNamespace(dspark=False, autotune_effort="default"),
+                                           signatures, device)
+    assert not _can_race_contextual_plans(SimpleNamespace(dspark=True, autotune_effort="default"),
+                                           {}, device)
+    assert probes == [device, device]
+
+
 class Plan:
     def __init__(self, size=0):
         self.size = size
