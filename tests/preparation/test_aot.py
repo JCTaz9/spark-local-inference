@@ -160,6 +160,100 @@ class SharedResidualForward:
         self.output.copy_(hidden)
 
 
+class StorageOffsetForward:
+    def __init__(self, window, offset):
+        self.window = window
+        self.offset = offset
+        self.output = torch.empty_like(window)
+        self.selected = torch.empty(4, device=window.device, dtype=window.dtype)
+
+    def __call__(self):
+        view = self.window.as_strided((4,), (1,), self.offset)
+        _fill(view, 3)
+        self.output.copy_(self.window)
+        self.selected.copy_(view.square())
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("offset", [None, 82, 160])
+def test_restored_storage_views_preserve_storage_offsets(tmp_path, offset):
+    backing = torch.zeros(256, device="cuda")
+    template = StorageOffsetForward(backing[80:96], offset)
+    compiled = aot_forward(template)
+    compiled(template)
+    path = tmp_path / "storage-offset.bin"
+    compiled.save_compiled_function(str(path))
+    with path.open("rb") as file:
+        restored = torch.compiler.load_compiled_function(file)
+    backing = torch.zeros_like(backing)
+    bound = StorageOffsetForward(backing[80:96], offset)
+    restored(bound)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        restored(bound)
+    for value in (0., 7.):
+        backing.fill_(value)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        expected = torch.full_like(backing, value)
+        start = 80 if offset is None else offset
+        expected[start:start + 4] = 3.25
+        torch.testing.assert_close(backing, expected, rtol=0, atol=0)
+        torch.testing.assert_close(bound.output, expected[80:96], rtol=0, atol=0)
+        torch.testing.assert_close(bound.selected, torch.full_like(bound.selected, 3.25 ** 2), rtol=0, atol=0)
+    graph.reset()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("triton_write", [False, True])
+@pytest.mark.parametrize("separated", [False, True])
+def test_restored_view_mutation_avoids_cloning_unused_capacity(tmp_path, triton_write, separated):
+    def prepare():
+        forward = SharedResidualForward(triton_write)
+        backing = torch.empty(40 << 20, dtype=torch.bfloat16, device="cuda")
+        forward.attention = backing[1024:1024 + 128 * 256].view(128, 256)
+        if separated:
+            forward.feed_forward = backing[-128 * 256:].view(128, 256)
+        return forward, backing
+
+    original, _ = prepare()
+    compiled = aot_forward(original)
+    compiled(original)
+    path = tmp_path / "view-mutation.bin"
+    compiled.save_compiled_function(str(path))
+    with path.open("rb") as file:
+        restored = torch.compiler.load_compiled_function(file)
+    fresh, backing = prepare()
+    fresh()
+    expected, observed = fresh.output.clone(), fresh.observed.clone()
+    restored(fresh)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    restored(fresh)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - allocated < 8 << 20
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        restored(fresh)
+    for value in (0., 7.):
+        backing.fill_(value)
+        fresh.output.fill_(float("nan"))
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(fresh.output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(fresh.observed, observed, rtol=0, atol=0)
+        assert bool((backing[:1024] == value).all())
+        end = backing.numel() - 128 * 256 if separated else backing.numel()
+        assert bool((backing[1024 + 128 * 256:end] == value).all())
+    graph.reset()
+
+
 @triton.jit
 def _fill_shared(output, count: tl.constexpr, value: tl.constexpr):
     index = tl.program_id(0) * 256 + tl.arange(0, 256)

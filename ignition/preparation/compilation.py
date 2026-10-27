@@ -155,9 +155,48 @@ def _fake_native_rms_norm(source, shape, weight, eps):
     return torch.ops.aten._fused_rms_norm.default(source, shape, weight, eps)
 
 
-def _byte_storage(tensor):
+def _byte_storage(tensor, start=0, end=None):
     storage = tensor.untyped_storage()
-    return tensor.new_empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,))
+    if storage.device.type == 'meta' and end is not None:
+        # Compiler metadata has no address to slice; runtime binding supplies the view.
+        return tensor.new_empty(end - start, dtype=torch.uint8)
+    end = storage.nbytes() if end is None else end
+    if not 0 <= start <= end <= storage.nbytes():
+        raise ValueError('compiled storage region exceeds its allocation')
+    if start or end != storage.nbytes():
+        storage = storage[start:end]
+    return tensor.new_empty(0, dtype=torch.uint8).set_(storage, 0, (end - start,), (1,))
+
+
+def _storage_bounds(values):
+    """Cover declared strided views without including unused allocation capacity."""
+    nonempty = [value for value in values if value.numel()]
+    if not nonempty:
+        return None
+    alignment = math.lcm(*(value.element_size() for value in values))
+    start = min(int(value.storage_offset()) * value.element_size() for value in values)
+    end = max((int(value.storage_offset()) + 1
+               + sum((int(size) - 1) * int(stride) for size, stride in zip(value.shape, value.stride())))
+              * value.element_size() for value in nonempty)
+    # Bounded compiler inputs retain allocation alignment; typed views retain their offsets.
+    pointer_alignment = math.lcm(256, alignment)
+    return start // pointer_alignment * pointer_alignment, (end + alignment - 1) // alignment * alignment
+
+
+def _storage_groups(nodes):
+    """Preserve overlapping views and alignment padding in one storage operand."""
+    intervals = [(_storage_bounds([node.meta['val']]), node) for node in nodes]
+    if any(bounds is None for bounds, _ in intervals):
+        return [nodes]
+    intervals = sorted(((start, (end + 255) // 256 * 256, node)
+                        for (start, end), node in intervals), key=lambda item: item[0])
+    groups, stop = [], -1
+    for start, end, node in intervals:
+        if start >= stop:
+            groups.append([])
+        groups[-1].append(node)
+        stop = max(stop, end)
+    return groups
 
 
 @contextmanager
@@ -307,6 +346,8 @@ def compile_forward(fn, *, tracer=None):
 
     Tracing uses tensor metadata without executing kernels. Mutating native operators
     receive explicit storage operands for all captured tensor aliases.
+    Independent storage regions cover declared tensor views. Storage-relative
+    operations retain the allocation's original geometry.
     Their typed views are reconstructed inside each opaque invocation so
     Inductor can preserve mutations without cloning strided state regions.
     Pointwise tensor operations remain visible to ordinary Inductor compilation.
@@ -324,7 +365,7 @@ def compile_forward(fn, *, tracer=None):
         return tuple(leaves)
 
     module = (ForwardTracer() if tracer is None else tracer)(trace)
-    calls = _lower_storage(module)
+    calls, _ = _lower_storage(module)
     return _compile_module(module, calls, fn, output_tree)
 
 
@@ -407,6 +448,23 @@ def _lower_storage(module):
                                     *torch.fx.map_arg(node.args, lambda arg: arg.meta['val']),
                                     **torch.fx.map_arg(node.kwargs, lambda arg: arg.meta['val']))
                             break
+    allocations = {}
+    for node, key in keys.items():
+        allocations.setdefault(key, []).append(node)
+    allocation_keys = keys.copy()
+    whole_storages = set()
+    for node in originals:
+        schema = getattr(node.target, '_schema', None) if node.op == 'call_function' else None
+        if schema is not None and (
+                schema.name in ('aten::storage_offset', 'aten::sym_storage_offset')
+                or any(argument.name == 'storage_offset' for argument in schema.arguments)):
+            # Storage-relative operations observe the original allocation offsets.
+            whole_storages.update(keys[arg] for arg in node.all_input_nodes if arg in keys)
+    for key, nodes in allocations.items():
+        groups = [nodes] if key in whole_storages else _storage_groups(nodes)
+        for region, group in enumerate(groups):
+            for node in group:
+                keys[node] = key, region
     mutations = {node: _mutated_tensors(node) for node in originals if node.op == 'call_function'}
     materialize = _reads_across_mutations(originals, keys, mutations)
     dtypes, storage_references = {}, {}
@@ -414,19 +472,26 @@ def _lower_storage(module):
         dtypes.setdefault(key, set()).add(node.meta['val'].dtype)
         storage_references.setdefault(key, set()).add(node)
 
+    mutated_keys = {keys[arg] for operands in mutations.values() for arg in operands}
+    regions, starts = {}, {}
     for node in originals:
         if node.op != 'get_attr' or not isinstance(node.meta.get('val'), torch.Tensor):
             continue
         key = keys[node]
-        if len(dtypes[key]) <= 1 and len(storage_references[key]) <= 1:
+        if key not in mutated_keys and len(dtypes[key]) <= 1 and len(storage_references[key]) <= 1:
             continue
         if key not in bases:
             tensor = operator.attrgetter(node.target)(module)
             name = '_storage_' + str(len(bases))
-            storage = _byte_storage(tensor)
+            bounds = None if allocation_keys[node] in whole_storages else _storage_bounds(
+                [ref.meta['val'] for ref in storage_references[key]])
+            start, end = (0, None) if bounds is None else bounds
+            storage = _byte_storage(tensor, start, end)
             if len(dtypes[key]) == 1:
                 storage = storage.view(tensor.dtype)
             module.register_buffer(name, storage)
+            regions[name] = allocation_keys[node], start, end
+            starts[key] = start
             with graph.inserting_before(originals[0]):
                 bases[key] = graph.get_attr(name)
 
@@ -478,7 +543,7 @@ def _lower_storage(module):
                 indices[identity] = len(array)
                 array.append(base if base is not None else arg)
             descriptor = (value.dtype, tuple(map(int, value.shape)), tuple(map(int, value.stride())),
-                          int(value.storage_offset())) if base is not None else None
+                          int(value.storage_offset()) - starts[key] // value.element_size()) if base is not None else None
             operands.append((position, mutable, indices[identity], descriptor))
             leaves[position] = None
         invocation = _Invocation(target, leaves, tree, operands, integer_positions)
@@ -509,7 +574,7 @@ def _lower_storage(module):
         value = node.meta['val']
         shape = tuple(map(int, value.shape))
         stride = tuple(map(int, value.stride()))
-        offset = int(value.storage_offset())
+        offset = int(value.storage_offset()) - starts[key_for(node)] // value.element_size()
         with graph.inserting_before(node):
             typed = graph.call_function(torch.ops.aten.view.dtype, (bases[key_for(node)], value.dtype))
             if value.is_contiguous():
@@ -529,7 +594,7 @@ def _lower_storage(module):
         value.args = (node,)
     graph.eliminate_dead_code()
     graph.lint()
-    return calls
+    return calls, regions
 
 
 def _mutated_tensors(node):

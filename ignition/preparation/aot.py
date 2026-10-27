@@ -184,8 +184,8 @@ class _Input:
     def bind(self, args):
         value = args[self.index]
         if self.view is not None:
-            dtype, shape, stride, offset = self.view
-            value = _byte_storage(value).view(dtype).as_strided(shape, stride, offset)
+            dtype, shape, stride, offset, start, end = self.view
+            value = _byte_storage(value, start, end).view(dtype).as_strided(shape, stride, offset)
         return value
 
 
@@ -261,7 +261,7 @@ class StorageBackend(SerializableCallable):
             node.replace_all_uses_with(replacement)
             graph.erase_node(node)
 
-        self.invocations = _lower_storage(module)
+        self.invocations, regions = _lower_storage(module)
         bindings = dict(scalar_inputs)
         for node in list(graph.nodes):
             if node.op != 'get_attr':
@@ -269,12 +269,15 @@ class StorageBackend(SerializableCallable):
             value = operator.attrgetter(node.target)(module)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f'compiled constant must be a tensor: {node.target}')
-            index = storages[value.untyped_storage()._cdata]
+            key, start, end = regions.get(node.target,
+                (value.untyped_storage()._cdata, 0, None))
+            index = storages[key]
             with graph.inserting_before(next(iter(graph.nodes))):
                 argument = graph.placeholder(f'buffer_{len(bindings)}')
             argument.meta['val'] = value
             bindings[argument] = _Input(index, (value.dtype, tuple(map(int, value.shape)),
-                                              tuple(map(int, value.stride())), int(value.storage_offset())))
+                                              tuple(map(int, value.stride())), int(value.storage_offset()),
+                                              start, end))
             node.replace_all_uses_with(argument)
             graph.erase_node(node)
         graph.eliminate_dead_code()

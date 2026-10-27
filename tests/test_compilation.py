@@ -344,6 +344,130 @@ def _fake_fill_output(out, value):
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("rows", [1, 6])
+@pytest.mark.parametrize("strided", [False, True])
+@torch.no_grad()
+def test_compiled_view_mutation_memory_is_bounded_by_active_rows(rows, strided):
+    storage = torch.empty((4096, 10240), dtype=torch.bfloat16, device="cuda")
+    window = storage[17:17 + rows, 1::2 if strided else 1]
+    output = torch.empty_like(window)
+
+    def forward():
+        previous = window.float()
+        _fill_output(window, 3.)
+        output.copy_((previous.square() + 1).bfloat16())
+
+    storage.fill_(2.)
+    compiled = compile_forward(forward)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    compiled()
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - allocated < 8 << 20
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for value in (0., 2., -5.):
+        storage.fill_(value)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(output, torch.full_like(output, value * value + 1), rtol=0, atol=0)
+        torch.testing.assert_close(window, torch.full_like(window, 3), rtol=0, atol=0)
+        assert bool((storage[:17] == value).all())
+        assert bool((storage[17 + rows:] == value).all())
+        assert bool((storage[17:17 + rows, 0] == value).all())
+        if strided:
+            assert bool((storage[17:17 + rows, ::2] == value).all())
+    graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("separated", [False, True])
+@torch.no_grad()
+def test_compiled_storage_regions_preserve_overlaps_and_separate_unused_gaps(separated):
+    storage = torch.empty((4096, 10240), dtype=torch.bfloat16, device="cuda")
+    left = storage[17:23, 1::2]
+    right_start = 4090 if separated else 20
+    right = storage[right_start:right_start + 6, 1::2]
+    output = torch.empty_like(left)
+
+    def forward():
+        previous = left.float() + right.float()
+        _fill_output(left, 3.)
+        _fill_output(right, 5.)
+        output.copy_((previous.square() + 1).bfloat16())
+
+    storage.fill_(2.)
+    compiled = compile_forward(forward)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    compiled()
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - allocated < 8 << 20
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for value in (0., 2., -5.):
+        storage.fill_(value)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(output, torch.full_like(output, (2 * value) ** 2 + 1), rtol=0, atol=0)
+        torch.testing.assert_close(right, torch.full_like(right, 5), rtol=0, atol=0)
+        if separated:
+            torch.testing.assert_close(left, torch.full_like(left, 3), rtol=0, atol=0)
+            assert bool((storage[23:right_start] == value).all())
+        else:
+            torch.testing.assert_close(left[:3], torch.full_like(left[:3], 3), rtol=0, atol=0)
+            torch.testing.assert_close(left[3:], torch.full_like(left[3:], 5), rtol=0, atol=0)
+            assert bool((storage[26:] == value).all())
+        assert bool((storage[:17] == value).all())
+        assert bool((storage[:, ::2] == value).all())
+    graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("reverse", [False, True])
+@torch.no_grad()
+def test_compiled_adjacent_regions_preserve_alignment_padding(reverse):
+    storage = torch.empty(256, dtype=torch.float32, device="cuda")
+    left, right = storage[1:17], storage[17:33]
+    output = torch.empty_like(left)
+
+    def forward():
+        previous = left.square() + right.square()
+        operands = [(left, 3.), (right, 5.)]
+        for value, fill in reversed(operands) if reverse else operands:
+            _fill_output(value, fill)
+        output.copy_(previous)
+
+    storage.fill_(2.)
+    compiled = compile_forward(forward)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for value in (0., 2., -5.):
+        storage.fill_(value)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(output, torch.full_like(output, 2 * value * value), rtol=0, atol=0)
+        torch.testing.assert_close(left, torch.full_like(left, 3), rtol=0, atol=0)
+        torch.testing.assert_close(right, torch.full_like(right, 5), rtol=0, atol=0)
+        assert storage[0].item() == value
+        assert bool((storage[33:] == value).all())
+    graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
 @torch.no_grad()
 def test_cloned_value_survives_scratch_overwrite():
     storage = torch.empty((4, 64), dtype=torch.bfloat16, device="cuda")
