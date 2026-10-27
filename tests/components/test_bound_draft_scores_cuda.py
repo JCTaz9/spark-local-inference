@@ -170,6 +170,7 @@ def test_parallel_draft_preparation_preserves_bias_and_selector_contract(bias_dt
         live_rows=torch.tensor([batch], dtype=torch.int32, device='cuda'))
     operation = PreparedParallelDraftRound.__new__(PreparedParallelDraftRound)
     operation.owner = SimpleNamespace(requests=state, inputs=inputs, logit_offset=1, session=None,
+        weights=SimpleNamespace(draft=None),
         collectives=dict(vocabulary_runtime=None, coordinator=None))
     operation.batch, operation.width, operation.name = batch, width, 'bias-preparation'
     operation.proposal_only, operation.generate_proposals, operation.argmax = True, True, None
