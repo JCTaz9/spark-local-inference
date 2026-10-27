@@ -227,7 +227,7 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None):
+                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -311,7 +311,7 @@ class PreparedDecoder:
         self.head_hidden = scratch.hidden[:head_rows]
         self.head = PreparedVocabularyProjection(self.head_hidden, weights.head, scratch.local_logits[:head_rows],
             scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            row_indices=self.output_metadata.sample_indices if self.compact_head else None)
+            row_indices=self.output_metadata.sample_indices if self.compact_head else None, gather=not vocabulary_parallel)
 
     def __call__(self):
         s, m = self.scratch, self.metadata

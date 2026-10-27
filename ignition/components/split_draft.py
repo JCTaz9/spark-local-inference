@@ -86,7 +86,8 @@ class PreparedDraftConfidence:
         self.embeddings = allocate((b, w - 1, markov.shape[1]), markov.dtype)
         self.source = source
         self.canonical_embedding = None
-        if getattr(source, "proposal_block", None) is not None:
+        if (getattr(source, "proposal_block", None) is not None
+                or getattr(source, "full_proposal", None) is not None):
             from .embedding import PreparedEmbedding
 
             self.preceding = allocate((b, w - 1), torch.int64)

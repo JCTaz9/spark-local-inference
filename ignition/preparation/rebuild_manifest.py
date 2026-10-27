@@ -223,7 +223,8 @@ def from_plan(model, plan, *, compiled_forwards):
         result['speculation'] = dict(draft_tokens=s.draft_tokens,
             adaptive=s.adaptive,
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
-            draft_prefix_selection=s.draft_prefix_selection)
+            draft_prefix_selection=s.draft_prefix_selection,
+            vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
         if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:
