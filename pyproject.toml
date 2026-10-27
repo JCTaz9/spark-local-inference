@@ -49,6 +49,7 @@ flare-heliopause = { path = "heliopause" }
 include = ["ignition*"]
 
 [tool.setuptools.package-data]
+"ignition.patches" = ["*.patch"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
 "ignition.recipes.gemma4" = ["assets/*"]

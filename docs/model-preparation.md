@@ -74,21 +74,32 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-The pinned PyTorch 2.14.1 and Triton 3.8 preparation environment requires two
-Inductor patches. `patches/torch-inductor-triton-cache-filenames.patch` matches
+Ignition applies two bundled Inductor patches to the pinned PyTorch 2.14.1 and
+Triton 3.8 preparation environment before importing preparation libraries in
+`export`, `debug-serve`, and `join`, including commands launched through `uv run`.
+`ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
 Triton's 150-character physical cache filenames while retaining full CUDA symbol
-names. `patches/torch-inductor-cooperative-static-launch.patch` preserves
+names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
 cooperative vision reductions in portable static kernels through Triton's CUDA
 launcher, including their cooperative launch attributes and frozen selections.
-Apply both patches once after installing or reinstalling Torch in the dedicated
-Flare preparation environment, on every preparation host, before compiling forwards:
+Patch application checks dependency versions and exact source context, accepts
+already applied hunks, and replaces installation files atomically without
+modifying uv's shared wheel cache. Each preparation host needs a writable,
+dedicated Flare environment. Reinstalling Torch restores its distribution files;
+the preparation command reapplies the patches.
+
+`uv sync` installs dependencies without running the patches, and `uv build`
+includes the patch files in Ignition's wheel and source distribution without
+modifying its isolated build environment. For standalone Python tools and tests
+that import Inductor before invoking Ignition preparation, apply the bundled
+patches before starting their process:
 
 ```sh
-patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
-  -p1 < patches/torch-inductor-triton-cache-filenames.patch
-patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
-  -p1 < patches/torch-inductor-cooperative-static-launch.patch
+uv run --locked --extra prepare python -m ignition.patches
 ```
+
+`python scripts/setup_preparation.py` runs the locked preparation/test sync,
+rebuilds FlashInfer and Heliopause, and applies both patches before exiting.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
