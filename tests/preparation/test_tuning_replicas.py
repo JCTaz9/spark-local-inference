@@ -29,6 +29,21 @@ def test_caches_and_winners_are_exchanged_between_corresponding_tp_ranks():
     assert authorization(values, replica=1, rank=1, tensor_parallel=2, ranks=(0, 1))["tuning"] is winners[1]
 
 
+def test_finalist_tuning_replicas_forward_empty_shards_in_replica_order():
+    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
+
+    policy = FinalistPolicy(family_fields=("split_k_slices",), per_family=1, max_total=2)
+    winner = TuningRequirement("qkv", (0, 1), {"candidate": 0}, 5.0, 0,
+        finalists=(FinalistRecord(assignment=FrozenMapping({"candidate": 0}),
+            family=FrozenMapping({"split_k_slices": 1}), candidate_index=0, latency_us=5.0),),
+        finalist_policy=policy)
+    empty = TuningRequirement("qkv", (0, 1), None, None, None, rejected_count=1,
+        finalist_policy=policy)
+    values = [state(races=(winner,)), state(), state(races=(empty,)), state()]
+    assert authorization(values, replica=0, rank=0, tensor_parallel=2, ranks=(0, 1)) == {
+        "tuning": (winner, empty)}
+
+
 def test_collectives_only_wait_for_their_own_replica():
     ready = state(collective=(("sum", (0, 1)),))
     values = [ready, ready, state(), state()]

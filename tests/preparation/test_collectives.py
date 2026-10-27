@@ -267,36 +267,42 @@ def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
         _winners([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
-def test_sharded_finalists_merge_families_and_keep_ordinary_winner():
-    from dataclasses import dataclass
-    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping
+def test_sharded_finalists_relay_every_rank_including_an_empty_shard(monkeypatch):
+    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
     from ignition.preparation.collectives import _winners
 
-    @dataclass(frozen=True)
-    class Contribution:
-        key: str
-        latency_us: float
-        candidate_index: int
-        assignment: object
-        finalist_policy: FinalistPolicy
-        finalists: tuple[FinalistRecord, ...]
-
+    ranks = (4, 7)
     policy = FinalistPolicy(family_fields=("split_k_slices",), per_family=1, max_total=2)
-    def finalist(index, split, latency):
-        return FinalistRecord(assignment=FrozenMapping({"candidate": index}),
-            family=FrozenMapping({"split_k_slices": split}), candidate_index=index,
-            latency_us=latency)
+    first = TuningRequirement("qkv", ranks, {"candidate": 4}, 5.0, 4,
+        finalists=(FinalistRecord(assignment=FrozenMapping({"candidate": 4}),
+            family=FrozenMapping({"split_k_slices": 1}), candidate_index=4, latency_us=5.0),),
+        finalist_policy=policy)
+    empty = TuningRequirement("qkv", ranks, None, None, None, rejected_count=2,
+        finalist_policy=policy)
+    slower = TuningRequirement("gemm", ranks, {"candidate": 0}, 10.0, 0)
+    faster = TuningRequirement("gemm", ranks, {"candidate": 1}, 8.0, 1)
 
-    first = Contribution("qkv", 5.0, 4, {"candidate": 4}, policy,
-        (finalist(4, 1, 5.0), finalist(6, 2, 4.0)))
-    second = Contribution("qkv", 4.5, 8, {"candidate": 8}, policy,
-        (finalist(8, 2, 4.5), finalist(9, 1, 3.0)))
-    (winner,) = _winners((first, second))
-    assert winner.candidate_index == 8
-    assert {item.candidate_index for item in winner.finalists} == {8, 9}
+    assert _winners((first, slower, empty, faster)) == (faster, first, empty)
+    with pytest.raises(ValueError, match="every declared rank"):
+        _winners((first,))
     with pytest.raises(ValueError, match="policies differ"):
-        _winners((first, Contribution("qkv", 4.5, 8, {"candidate": 8},
-            FinalistPolicy(family_fields=("tile_n",)), second.finalists)))
+        _winners((first, TuningRequirement("qkv", ranks, None, None, None,
+            finalist_policy=FinalistPolicy(family_fields=("tile_n",)))))
+
+    owner = coordinator(monkeypatch)
+    blank = dict(done=False, ready_collectives=(), ready_cache=None,
+        ready_tuning=(), ready_collective_tuning=None)
+    states = [SimpleNamespace(**{**blank, "ready_tuning": (first, slower)}),
+              SimpleNamespace(**{**blank, "done": True})]
+    peers = [(False, (), None, None, (empty, faster), None),
+             (True, (), None, None, (), None)]
+    advances = []
+    job = SimpleNamespace(advance=lambda **kwargs: advances.append(kwargs) or states.pop(0),
+                          result=lambda: "prepared")
+    monkeypatch.setattr(dist, "all_gather_object",
+        lambda results, local, **kwargs: results.__setitem__(slice(None), [local, peers.pop(0)]))
+    assert owner.prepare(SimpleNamespace(begin=lambda *args, **kwargs: job), ()) == "prepared"
+    assert advances == [{"collective_key": None}, {"tuning": (faster, first, empty)}]
 
 
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
