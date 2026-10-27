@@ -1,6 +1,7 @@
 """Export small TP4 collective graphs for replay after all preparation ranks exit."""
 
 from datetime import timedelta
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -42,7 +43,42 @@ def _configuration(folder, signatures):
         "page_tokens": 64, "reserve_bytes": 0}
 
 
-def _rank(rank, directory):
+class _TaggedGather:
+    """Declare one concrete gather candidate for package replay qualification."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        from b12x.comm import pcie
+        from b12x.preparation import CollectiveRequirement, PreparedCall
+        from ignition.preparation.tuning import declare
+
+        self.runtime, self.output = runtime, output
+        call = dict(local_input=source.view(source.shape[0], 1, 64),
+                    out=output.view(output.shape[0], 4, 64))
+        query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
+        self.plan = pcie.plan(query, runtime=runtime,
+            override=pcie.CollectiveConfig(implementation="dcp_tagged", threads=256, blocks=1))
+        declare(session, (self.plan.request(name=name,
+            prepare_call=lambda state: PreparedCall(run=lambda: state.run(**call), output=output,
+                                                    owners=(runtime, source, output)),
+            collective=CollectiveRequirement(name, tuple(range(4)))),), coordinator=coordinator)
+
+    def __call__(self, source):
+        return self.runtime.all_gather_heads(source.view(source.shape[0], 1, 64),
+            self.output.view(self.output.shape[0], 4, 64), plan=self.plan)
+
+
+def _fixture_operands(rows, width, step, tagged):
+    if not tagged:
+        from tests.components.test_collective_transport_tp4_cuda import _operands
+        return _operands(rows, width, step)
+    generator = torch.Generator().manual_seed(7117 + step)
+    words = torch.randint(-(2**31), 2**31, (4, rows, width // 2),
+                          generator=generator, dtype=torch.int32)
+    words[:, 0, :4] = torch.tensor([0, -2147483648, 2143289345, -1], dtype=torch.int32)
+    return [peer.contiguous().view(torch.bfloat16) for peer in words]
+
+
+def _rank(rank, directory, tagged=False):
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature, PreparedExecution
@@ -50,7 +86,7 @@ def _rank(rank, directory):
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.runtime_package import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
-    from tests.components.test_collective_transport_tp4_cuda import _expected, _operands, _selected_query
+    from tests.components.test_collective_transport_tp4_cuda import _expected, _selected_query
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -63,18 +99,29 @@ def _rank(rank, directory):
     try:
         with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
-            runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=33,
-                hidden_size=5120, ipc=storage.peer_storage)
+            if tagged:
+                from b12x.comm import pcie
+                runtime = pcie.DcpAllToAll.from_exchange_group(exchange_group=dist.group.WORLD,
+                    device=device, max_batch_size=33, total_heads=4, head_dim=64,
+                    stream_affine=False, ipc=storage.peer_storage)
+            else:
+                runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=33,
+                    hidden_size=5120, ipc=storage.peer_storage)
             with RecordedPreparationSession(device=device, checkpoint="collective-package",
-                    workload_schema="tp4-bf16-peer-storage", numerical_policy="fp32-single-rounding",
-                    coordinator=coordinator) as session:
+                    workload_schema="tp4-tagged-word-gather" if tagged else "tp4-bf16-peer-storage",
+                    numerical_policy="exact-word-copy" if tagged else "fp32-single-rounding",
+                    coordinator=coordinator, autotune_effort="off" if tagged else "default") as session:
                 sources = {width: torch.empty((33, width), dtype=torch.bfloat16, device=device)
-                           for width in (2560, 4096, 5120)}
+                           for width in ((64,) if tagged else (2560, 4096, 5120))}
                 shapes = {"init": (2560, 12), "decode": (2560, 13),
                           "prefill64": (4096, 33), "prefill128": (5120, 33)}
-                outputs = {name: torch.empty((rows, width), dtype=torch.bfloat16, device=device)
+                if tagged:
+                    shapes = {"init": (64, 8), "decode": (64, 1),
+                              "prefill64": (64, 17), "prefill128": (64, 33)}
+                outputs = {name: torch.empty((rows, width * (4 if tagged else 1)), dtype=torch.bfloat16, device=device)
                            for name, (width, rows) in shapes.items()}
-                operations = {name: PreparedAllReduce(sources[width][:rows], outputs[name],
+                operation_type = _TaggedGather if tagged else PreparedAllReduce
+                operations = {name: operation_type(sources[width][:rows], outputs[name],
                     runtime=runtime, session=session, coordinator=coordinator, name=name)
                     for name, (width, rows) in shapes.items()}
                 session.tune(show_progress=False)
@@ -94,7 +141,7 @@ def _rank(rank, directory):
                     dist.barrier()
                     graph = torch.cuda.CUDAGraph(keep_graph=True)
                     stream.wait_stream(torch.cuda.current_stream(device))
-                    with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
+                    with (nullcontext() if tagged else runtime.capture(stream=stream)), session.capture(), torch.cuda.graph(
                             graph, stream=stream, pool=storage.graph_pool.id):
                         operation(sources[width][:rows])
                     graph.instantiate()
@@ -107,9 +154,10 @@ def _rank(rank, directory):
                 for name in ("restore", "snapshot", "resume"):
                     graph = torch.cuda.CUDAGraph(keep_graph=True)
                     stream.wait_stream(torch.cuda.current_stream(device))
-                    with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
+                    with (nullcontext() if tagged else runtime.capture(stream=stream)), session.capture(), torch.cuda.graph(
                             graph, stream=stream, pool=storage.graph_pool.id):
-                        operations["init"](sources[2560][:12])
+                        width, rows = shapes["init"]
+                        operations["init"](sources[width][:rows])
                     graph.instantiate()
                     captured.append(graph)
                     graphs[name] = graph
@@ -139,12 +187,12 @@ def _rank(rank, directory):
                 cases = []
                 for step in range(3):
                     for width in sources:
-                        values = _operands(33, width, step)
+                        values = _fixture_operands(33, width, step, tagged)
                         (folder / f"source-{width}-{step}.bin").write_bytes(
                             values[rank].view(torch.uint8).numpy().tobytes())
                     for name, (width, rows) in shapes.items():
-                        expected = _expected([value[:rows] for value in _operands(33, width, step)],
-                            rank, queries[name])
+                        values = [value[:rows] for value in _fixture_operands(33, width, step, tagged)]
+                        expected = torch.cat(values, dim=1) if tagged else _expected(values, rank, queries[name])
                         path = f"expected-{name}-{step}.bin"
                         (folder / path).write_bytes(expected.view(torch.uint8).numpy().tobytes())
                         cases.append(dict(graph=name, source=f"source-{width}", output=f"output-{name}",
@@ -172,11 +220,11 @@ def _rank(rank, directory):
         dist.destroy_process_group()
 
 
-def prepare(directory):
+def prepare(directory, *, tagged=False):
     from ignition.preparation.package_file import combine
 
     directory.mkdir(exist_ok=True)
-    mp.spawn(_rank, args=(directory,), nprocs=4, join=True)
+    mp.spawn(_rank, args=(directory, tagged), nprocs=4, join=True)
     ranks = [json.loads((directory / f"rank-{rank}" / "metadata.json").read_text()) for rank in range(4)]
     peers = [dict(owner=rank, address=address, nbytes=size, readers=list(range(4)))
              for rank, metadata in enumerate(ranks) for address, size in metadata["owned"]]
@@ -190,4 +238,4 @@ def prepare(directory):
 
 
 if __name__ == "__main__":
-    prepare(Path(sys.argv[1]).resolve())
+    prepare(Path(sys.argv[1]).resolve(), tagged="--tagged-gather" in sys.argv[2:])
