@@ -159,14 +159,15 @@ class CatalogContextualSelection:
             sort_keys=True, separators=(",", ":")).encode()
         return f"context-{index:02d}-{sha256(encoded).hexdigest()[:12]}"
 
-    def _capture(self, session, functions, signatures, *, label, before_run=None):
+    def _capture(self, session, functions, signatures, *, label, before_run=None,
+                 compile_group=None):
         stream = torch.cuda.Stream(device=self.device)
         return capture_forwards(functions, signatures, session=session, device=self.device,
             stream=stream, pool=self.graph_pool, collective=self.collective,
             coordinator=self.coordinator, compile_decoder=self.compile_decoder,
             progress=self.progress, label=label, cache_root=self.cache_root,
             warmup_storage=self.warmup_storage, capture_names=tuple(functions),
-            before_run=before_run)
+            before_run=before_run, compile_group=compile_group)
 
     def _initialize_fixtures(self, session):
         layer_zero, compressed = self.fixtures
@@ -237,7 +238,8 @@ class CatalogContextualSelection:
             fixture.restore_tune(members[name][1])
 
         graphs, compiled = self._capture(session, functions, signatures,
-            label=f"Capture contextual layer {fixture.layer_index}", before_run=before_run)
+            label=f"Capture contextual layer {fixture.layer_index}", before_run=before_run,
+            compile_group=f"context-layer{fixture.layer_index}-plan-family")
         after_free = torch.cuda.mem_get_info(self.device)[0]
         if after_free < max(1 << 30, session.headroom_bytes):
             for graph in graphs.values():
