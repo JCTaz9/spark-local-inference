@@ -85,6 +85,20 @@ def test_pages_take_all_remaining_supply():
     assert whole.supply_bytes - whole.page_bytes - whole.fixed_bytes < 2 * MIB
 
 
+def test_vocabulary_sampling_rejects_tp3_before_weight_loading():
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    speculation = replace(RECIPE.speculation, vocabulary_parallel_sampling=True)
+    with pytest.raises(UsageError, match="no TP3 gather"):
+        planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(gpu(i, 95) for i in range(3)),
+                     concurrency=1, reserve_bytes=0, speculation=speculation)
+
+
+def test_vocabulary_sampling_rejects_unsupported_transition_storage():
+    with pytest.raises(ValueError, match="BF16 or row-scaled FP8"):
+        replace(DRAFTING, vocabulary_parallel_sampling=True, markov_head_quantization="nvfp4")
+
+
 @pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"),
                                          ("nvfp4", "nvfp4"), ("mxfp8", None), ("nvfp4", "fp8")])
 def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypatch):
@@ -231,7 +245,8 @@ def test_speculation_settings_are_validated_and_described():
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
     assert record == {"draft_tokens": 5, "adaptive": True,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
-                      "draft_head_quantization": None, "markov_head_quantization": None}
+                      "draft_head_quantization": None, "markov_head_quantization": None,
+                      "vocabulary_parallel_sampling": False}
     assert derive(speculation=Speculation(5, packed_verification=True)).to_dict()["speculation"]["packed_verification"]
     assert display.speculation(None) == "off"
     assert display.speculation(DRAFTING) == "up to 3 draft tokens per round · MTP module"

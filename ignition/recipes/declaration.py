@@ -111,8 +111,13 @@ class Speculation:
     graph_budget: int | None = None
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
+    vocabulary_parallel_sampling: bool = False
 
     def __post_init__(self):
+        if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
+            raise ValueError("vocabulary-parallel sampling requires positive learned draft depth")
+        if self.vocabulary_parallel_sampling and self.markov_head_quantization == "nvfp4":
+            raise ValueError("vocabulary-parallel sampling requires BF16 or row-scaled FP8 Markov weights")
         for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4", "fp8"))):
             value = getattr(self, f"{head}_head_quantization")
             if value is not None and value not in choices:

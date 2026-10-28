@@ -124,3 +124,16 @@ def test_decode_page_tables_follow_packed_tokens_across_inactive_rows(world):
     assert batch.metadata.token_ids.tolist() == [20, 22, 0, 0]
     assert batch.metadata.positions.tolist() == [127, 200, -1, -1]
     assert torch.equal(batch.metadata.token_page_table[:2], inputs.page_tables[[3, 0]])
+
+
+
+def test_vocabulary_parallel_sampling_requires_exact_retained_proposal_formats():
+    from dataclasses import replace
+
+    base = PreparationConfig(vocabulary_parallel_sampling=True, markov_head_quantization="fp8")
+    assert base.draft_tokens > 0
+    assert replace(base, markov_head_quantization=None).vocabulary_parallel_sampling
+    with pytest.raises(ValueError, match="BF16 or row-scaled FP8"):
+        replace(base, markov_head_quantization="nvfp4")
+    with pytest.raises(ValueError, match="positive learned"):
+        replace(base, dspark=False)

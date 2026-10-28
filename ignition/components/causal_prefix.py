@@ -18,8 +18,8 @@ def _allocate(Confidence, Slots, Submitted, SourceValid, Limits, Lengths, Valid,
               CAPACITY: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.arange(0, BLOCK)
     inside = row < B
-    submitted = tl.load(Submitted + row, inside, other=False)
-    source_valid = tl.load(SourceValid + row, inside, other=False)
+    submitted = tl.load(Submitted + row, inside, other=False) != 0
+    source_valid = tl.load(SourceValid + row, inside, other=False) != 0
     slot = tl.load(Slots + row, inside, other=-1)
     limit = tl.load(Limits + row, inside, other=0)
     duplicates = tl.sum((submitted[:, None] & submitted[None, :]

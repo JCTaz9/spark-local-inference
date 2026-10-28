@@ -2646,6 +2646,7 @@ fn rebuild_compatible(
                 s.history_drafts,
                 s.draft_head_quantization.clone(),
                 s.markov_head_quantization.clone(),
+                s.vocabulary_parallel_sampling,
             )
         })
     };

@@ -79,6 +79,7 @@ class PreparedParallelDraftRound:
     def __init__(self, owner, batch, width, name, *, generate_proposals=True, buffers=None, proposal_only=False,
                  target_token_capacity=None):
         self.owner, self.batch, self.width = owner, batch, width
+        self.vocabulary_parallel = getattr(owner, "vocabulary_parallel_sampling", False)
         self.name, self.buffers = name, buffers
         tokens = batch * width if target_token_capacity is None else target_token_capacity
         if (type(tokens) is not int or not batch <= tokens <= batch * width
@@ -89,9 +90,10 @@ class PreparedParallelDraftRound:
         self.proposal_only = proposal_only
         o, b, w = owner, batch, width
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
-        self.sampling_scratch = prepare_sampling_scratch(b, w, o.requests.vocab_size, device, buffers=buffers,
+        self.sampling_scratch = {} if self.vocabulary_parallel else prepare_sampling_scratch(b, w, o.requests.vocab_size, device, buffers=buffers,
                                                         proposal=generate_proposals, verification=not proposal_only)
         self.rows = torch.arange(b, device=device)
+        self.draft_positions = torch.arange(w - 1, device=device) if self.vocabulary_parallel else None
         self.metadata = Metadata.allocate(tokens, b, blocks, device, samples=b * w, max_query_tokens=w)
         self.validator = PreparedBatch(
             o.inputs,
@@ -123,6 +125,7 @@ class PreparedParallelDraftRound:
             name=name + ".target",
             workspace=o.workspace,
             **o.collectives,
+            **({"vocabulary_parallel": True} if self.vocabulary_parallel else {}),
         )
         self.context = None if proposal_only else o.forwards.context(
             o.weights,
@@ -147,6 +150,7 @@ class PreparedParallelDraftRound:
                 name=name + ".draft",
                 workspace=o.workspace,
                 **o.collectives,
+                **({"vocabulary_parallel": True} if self.vocabulary_parallel else {}),
             )
         )
         self.selector = getattr(self.draft, "selector", None)
@@ -156,7 +160,7 @@ class PreparedParallelDraftRound:
         self.markov_token = torch.zeros(b, dtype=torch.int64, device=device)
         self.markov = (
             None
-            if self.draft is None or o.forwards.markov is None
+            if self.draft is None or o.forwards.markov is None or self.vocabulary_parallel
             else o.forwards.markov(
                 o.weights,
                 self.markov_token,
@@ -166,6 +170,11 @@ class PreparedParallelDraftRound:
                 name=name + ".markov",
             )
         )
+        if self.draft is not None and self.vocabulary_parallel:
+            from .dspark import PreparedMarkovEmbedding
+
+            self.markov = PreparedMarkovEmbedding(o.weights, self.markov_token,
+                                                  session=o.session, name=name + ".markov")
         self.before = torch.zeros(b, dtype=torch.int64, device=device)
         self.active = torch.zeros(b, dtype=torch.bool, device=device)
         self.candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
@@ -181,8 +190,9 @@ class PreparedParallelDraftRound:
                 coordinator=o.collectives["coordinator"], name=name + ".draft_argmax")
         from ignition.preparation.scratch import bind_scratch
 
-        layout = self.storage_layout(b, w, o.requests.vocab_size)
-        if not generate_proposals:
+        local_vocab = o.scratch.local_logits.shape[-1] if self.vocabulary_parallel else o.requests.vocab_size
+        layout = self.storage_layout(b, w, local_vocab)
+        if not generate_proposals or self.vocabulary_parallel:
             del layout["logits"]
         retained = bind_scratch(layout, device=device, workspace=buffers)
         self.logits, self.probabilities = retained.get("logits"), retained["probabilities"]
@@ -200,6 +210,9 @@ class PreparedParallelDraftRound:
         if self.operations is not None:
             return
         o, b, w = self.owner, self.batch, self.width
+        if self.vocabulary_parallel:
+            self._prepare_vocabulary_parallel()
+            return
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         target = None if self.proposal_only else PreparedSpeculativeDistributions(
             self.decoder.scratch.logits.view(b, w, -1), *args, self.drafts,
@@ -304,6 +317,50 @@ class PreparedParallelDraftRound:
         commit.prepare()
         self.operations = target, proposals, verify, commit
 
+    def _prepare_vocabulary_parallel(self):
+        from .vocabulary_sampling import PreparedVocabularySoftmax, PreparedVocabularyBlockVerification
+
+        o, b, w = self.owner, self.batch, self.width
+        args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
+        start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
+        options = dict(start=start, runtime=o.sampling_runtime, session=o.session,
+                       coordinator=o.collectives["coordinator"])
+        if self.draft is not None:
+            local = self.draft.scratch.local_logits.view(b, o.block_size, -1)
+            base = local[:, o.logit_offset:o.logit_offset + w - 1]
+            self.full_proposal = PreparedVocabularySoftmax(base, self.probabilities, self.valid, *args,
+                self.drafts, **options, name=self.name + ".proposal", workspace=self.buffers,
+                embedding=o.weights.draft.markov_embedding, head=o.weights.draft.markov_head,
+                pending=self.markov_token, seeds=self.seed, offsets=self.base_offset, tokens=self.drafts)
+            self.full_proposal.prepare()
+        if self.proposal_only:
+            self.operations = None, (), None, None
+            return
+        logits = self.decoder.local_logits.view(b, w, -1)
+        from ignition.preparation.scratch import bind_scratch
+
+        retained = bind_scratch(dict(probabilities=(tuple(logits.shape), torch.float32),
+            valid=((b, w), torch.bool)), device=logits.device, workspace=self.buffers)
+        target = PreparedVocabularySoftmax(logits, retained["probabilities"], retained["valid"], *args,
+            self.drafts, **options, name=self.name + ".target", workspace=self.buffers)
+        target.prepare()
+        verify = PreparedVocabularyBlockVerification(self.probabilities, self.drafts, target.probabilities, *args,
+            **options, name=self.name + ".verification", rng=o.rng, draft_valid=self.valid,
+            target_valid=target.valid, token_limits=o.inputs.query_lengths[:b], workspace=self.buffers)
+        verify.prepare()
+        from .vocabulary_logprobs import PreparedVocabularyParallelLogprobs
+
+        logprobs = PreparedVocabularyParallelLogprobs(logits, o.completion,
+            o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows, o.frame,
+            vocabulary=o.requests.vocab_size, offset=start, runtime=o.logprob_runtime, session=o.session,
+            coordinator=o.collectives["coordinator"], name=self.name + ".logprobs")
+        commit = PreparedSpeculativeCommit(o.requests, verify.output, self.candidates,
+            o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows,
+            o.completion, o.frame, o.sequence, rng=o.rng, draft_context_lag=0,
+            token_limits=o.inputs.query_lengths[:b], logprobs=logprobs)
+        commit.prepare()
+        self.operations = target, (), verify, commit
+
     def __call__(self):
         self.propose()
         self.verify()
@@ -352,6 +409,10 @@ class PreparedParallelDraftRound:
                 self.probabilities.scatter_(2, self.drafts[:, :, None], 1.0)
             if self.full_proposal is not None:
                 self.full_proposal()
+                if self.vocabulary_parallel:
+                    self.valid.logical_and_(self.active[:, None] & (self.draft_positions[None, :] < limits[:, None] - 1))
+                    self.sampled.copy_(self.drafts[:, -1])
+                    self.markov_token.copy_(self.sampled)
             for i, proposal in enumerate(proposals):
                 if proposal.source_logits is not None:
                     if self.markov is not None:

@@ -86,3 +86,22 @@ def test_signed_zero_frontier_order_and_fp64_underflow_survival():
         operation()
         assert (lengths.tolist(), valid.tolist()) == allocate(confidence.tolist(), slots.tolist(),
             submitted.tolist(), submitted.tolist(), limits.tolist(), budget, 3)
+
+
+def test_compiler_access_analysis_preserves_read_only_prefix_inputs():
+    from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
+    from ignition.components.causal_prefix import _allocate
+
+    confidence = torch.full((4, 2), .75, device="cuda")
+    slots = torch.arange(4, device="cuda", dtype=torch.int64)
+    submitted = torch.ones(4, device="cuda", dtype=torch.bool)
+    source_valid = torch.ones_like(submitted)
+    limits = torch.full((4,), 3, device="cuda", dtype=torch.int32)
+    lengths = torch.empty_like(limits)
+    valid = torch.empty_like(submitted)
+    operation = PreparedCausalPrefixAllocation(confidence, slots, submitted, source_valid, limits,
+        lengths, valid, token_capacity=6, request_capacity=4)
+    arguments = dict(zip(_allocate.arg_names, operation.args, strict=True))
+    arguments.update(num_warps=4, enable_fp_fusion=False)
+    accesses = identify_accessed_tensors(_allocate, arguments, {})
+    assert {dependency.name for dependency in accesses.read_writes.writes} == {"Lengths", "Valid"}
