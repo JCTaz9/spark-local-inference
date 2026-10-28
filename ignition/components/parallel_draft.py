@@ -336,7 +336,7 @@ class PreparedParallelDraftRound:
         if self.proposal_only:
             self.operations = None, (), None, None
             return
-        logits = self.decoder.scratch.local_logits.view(b, w, -1)
+        logits = self.decoder.local_logits.view(b, w, -1)
         from ignition.preparation.scratch import bind_scratch
 
         retained = bind_scratch(dict(probabilities=(tuple(logits.shape), torch.float32),

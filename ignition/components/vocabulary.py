@@ -17,7 +17,8 @@ class PreparedVocabularyProjection:
     Optional row indices expand gathered physical rows into caller-owned sample
     slots after communication, avoiding repeated projection and transfer. With
     ``gather=False``, consumers receive the local projection directly and own
-    any distributed normalization or sampling.
+    any distributed normalization or sampling. Indexed local projections require
+    a disjoint caller-owned local output with one row per logical sample.
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
@@ -38,9 +39,15 @@ class PreparedVocabularyProjection:
                 session=session, name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
         self.local_only = not gather
         if self.local_only:
+            self.output = local_output if row_indices is None else output
             if row_indices is not None:
-                raise ValueError("local vocabulary projections require unexpanded physical rows")
-            self.output = local_output
+                if (output.shape != (row_indices.numel(), local_output.shape[1])
+                        or output.dtype != local_output.dtype or output.device != local_output.device
+                        or not output.is_contiguous() or not local_output.is_contiguous()):
+                    raise ValueError("local vocabulary row expansion requires contiguous matching local-column outputs")
+                if (output.data_ptr() < local_output.data_ptr() + local_output.nbytes
+                        and local_output.data_ptr() < output.data_ptr() + output.nbytes):
+                    raise ValueError("local vocabulary row expansion requires disjoint physical and logical storage")
             return
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
@@ -56,7 +63,10 @@ class PreparedVocabularyProjection:
 
     def __call__(self, source):
         if self.local_only:
-            return self.projection(source)
+            projected = self.projection(source)
+            if self.row_indices is not None:
+                self.output.copy_(projected[self.row_indices])
+            return self.output
         gathered = self.gather(self.projection(source))
         if self.row_indices is not None:
             # Indexed reads materialize before the overlapping destination write.

@@ -321,12 +321,26 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True,
             logits_dtype=torch.float32)
+        self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
+            coordinator=coordinator, session=session, name=name)
+
+    def _prepare_head(self, *, vocabulary_parallel, vocabulary_runtime, coordinator, session, name):
+        scratch, weights = self.scratch, self.weights
         self.compact_head = scratch.hidden.shape[0] > self.output_metadata.token_ids.numel()
         head_rows = self.output_metadata.token_ids.numel() if self.compact_head else scratch.hidden.shape[0]
         self.head_hidden = scratch.hidden[:head_rows]
+        head_output = scratch.logits
+        if vocabulary_parallel and self.compact_head:
+            # Physical projection rows must remain intact while their logical
+            # sample rows are expanded. Local sampling does not use gathered
+            # logits; the captured round consumes this arena prefix through
+            # verification and logprobs before another decoder reuses it.
+            head_output = scratch.logits.view(-1)[:scratch.local_logits.numel()].view_as(scratch.local_logits)
         self.head = PreparedVocabularyProjection(self.head_hidden, weights.head, scratch.local_logits[:head_rows],
-            scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
+            head_output, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
             row_indices=self.output_metadata.sample_indices if self.compact_head else None, gather=not vocabulary_parallel)
+
+        self.local_logits = self.head.output if vocabulary_parallel else scratch.local_logits
 
     def __call__(self):
         s, m = self.scratch, self.metadata
