@@ -89,3 +89,34 @@ def test_fixed_or_non_cuda_plans_declare_no_benchmark():
     assert races_candidates(session.requests[0].plan, "cpu") is False
 
 
+def swiglu_candidates(gate_up, intermediate):
+    source = torch.zeros(4096, 256, dtype=torch.bfloat16)
+    weights = MLPWeights(gate_up=torch.zeros(4096, 256, dtype=torch.bfloat16),
+                         down=torch.zeros(256, 2048, dtype=torch.bfloat16))
+    scratch = MLPScratch.allocate(4096, 256, 2048, "cpu")
+    session = RecordingSession()
+    PreparedMLP(source, weights, gate_up if gate_up is not None else scratch.gate_up,
+                intermediate if intermediate is not None else scratch.intermediate,
+                scratch.output, session=session, name="mlp", workspace=None)
+    (request,) = [r for r in session.requests if r.name == "mlp.swiglu"]
+    plan = request.plan
+    return plan.contract.eligible_plan(plan.query, SM120).candidates
+
+
+def misaligned(like):
+    """A contiguous BF16 view of the given shape starting two bytes past a 16-byte boundary."""
+    flat = torch.zeros(like.numel() + 16, dtype=torch.bfloat16)
+    start = (-flat.data_ptr() % 16) // 2 + 1
+    view = flat[start:start + like.numel()].view(like.shape)
+    assert view.data_ptr() % 16 == 2
+    return view
+
+
+@pytest.mark.parametrize("operand", ["gate_up", "intermediate"])
+def test_misaligned_swiglu_operand_plans_without_the_vector_candidate(operand):
+    scratch = MLPScratch.allocate(4096, 256, 2048, "cpu")
+    aligned = swiglu_candidates(None, None)
+    assert len(aligned) > 1
+    views = {"gate_up": None, "intermediate": None}
+    views[operand] = misaligned(getattr(scratch, operand))
+    assert len(swiglu_candidates(views["gate_up"], views["intermediate"])) == 1

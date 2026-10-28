@@ -12,6 +12,11 @@ from ignition.preparation.fixtures.hyperconnection import swiglu_benchmark_call
 from ignition.preparation.tuning import declare, races_candidates
 
 
+def byte_alignment(tensor):
+    """Largest power of two up to 16 that divides the tensor's data address."""
+    return min(16, tensor.data_ptr() & -tensor.data_ptr() or 16)
+
+
 @dataclass(frozen=True)
 class MLPScratch:
     gate_up: torch.Tensor
@@ -75,7 +80,9 @@ class PreparedMLP:
             hyperconnection.Caps(device=source.device, max_tokens=tokens, hidden_size=width),
             invocation={"operation": "swiglu", "limit": swiglu_limit, "round_silu": round_silu,
                         "clamp_after_silu": clamp_after_silu,
-                        "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta},
+                        "swiglu_alpha": swiglu_alpha, "swiglu_beta": swiglu_beta,
+                        "left_alignment": byte_alignment(gate_up),
+                        "output_alignment": byte_alignment(intermediate)},
         )
         declare(session, (self.activation_plan.request(
             name=f"{name}.swiglu", prepare_call=lambda state: PreparedCall(
