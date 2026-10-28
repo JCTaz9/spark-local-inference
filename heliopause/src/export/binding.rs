@@ -646,10 +646,17 @@ mod stage_tests {
     }
 }
 
-#[pyfunction]
-fn export_source_identity(py: Python<'_>, roots: Vec<std::path::PathBuf>) -> PyResult<String> {
-    py.detach(|| super::source_identity::source_identity(&roots))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+#[pyfunction(signature = (roots, *, excluded_directories = None))]
+fn export_source_identity(
+    py: Python<'_>,
+    roots: Vec<std::path::PathBuf>,
+    excluded_directories: Option<Vec<std::path::PathBuf>>,
+) -> PyResult<String> {
+    py.detach(|| match excluded_directories {
+        Some(excluded) => super::source_identity::source_identity_excluding(&roots, &excluded),
+        None => super::source_identity::source_identity(&roots),
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 fn validate_sampling(value: &serde_json::Value) -> super::Result<()> {
