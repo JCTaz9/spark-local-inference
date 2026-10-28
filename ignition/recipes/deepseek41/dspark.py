@@ -11,7 +11,7 @@ from .decoder import PreparedLayer
 
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
-                 coordinator, session, name, workspace, mla_compute_mode="auto"):
+                 coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False):
         if scratch.local_logits.dtype != torch.bfloat16 or scratch.logits.dtype != torch.bfloat16:
             raise ValueError("DSpark proposal vocabulary logits require BF16 storage")
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
@@ -31,7 +31,7 @@ class PreparedDraft:
         self.head_hidden = scratch.buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype)
         head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head
         self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace, gather=not vocabulary_parallel)
 
     def __call__(self):
         s = self.scratch

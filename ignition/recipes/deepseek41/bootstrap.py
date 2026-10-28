@@ -113,6 +113,7 @@ class PreparationConfig:
     dspark: bool = True
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
+    vocabulary_parallel_sampling: bool = False
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
@@ -132,7 +133,10 @@ class PreparationConfig:
         validate_mla_compute_mode(self.mla_compute_mode)
         from ignition.recipes.declaration import Speculation
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
-                    markov_head_quantization=self.markov_head_quantization)
+                    markov_head_quantization=self.markov_head_quantization,
+                    vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
+        if self.vocabulary_parallel_sampling and self.markov_head_quantization not in (None, "fp8"):
+            raise ValueError("vocabulary-parallel sampling requires BF16 or row-scaled FP8 Markov weights")
         self.speculative_shapes
         self.packed_speculative_shapes
         drafting = self.dspark and self.draft_tokens > 0
@@ -330,7 +334,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                     confidence=config.draft_tokens > 0,
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
-                                    markov_head_quantization=config.markov_head_quantization)
+                                    markov_head_quantization=config.markov_head_quantization,
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -370,6 +375,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, package_storage=package_storage,
             verification_samples=verification_samples)
+        sampling_collective = logprob_collective = None
+        if config.vocabulary_parallel_sampling and shard.world_size > 1:
+            sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
+                group, device, max_rows=verification_samples, columns=64 * shard.world_size,
+                ipc=package_storage.peer_storage))
+            logprob_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
+                group, device, max_rows=verification_samples, columns=512 * shard.world_size,
+                ipc=package_storage.peer_storage))
         tables = replace(tables, readiness_runtime=collective)
         identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
@@ -436,6 +449,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 markov_runtime=None, coordinator=coordinator, result_runtime=result_collective,
                 block_proposal_broadcast=True,
+                vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
                 buffers=activation_buffers.cursor(),
                 forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
                     draft_factory, PreparedMarkov))
@@ -605,6 +620,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "mla_compute_mode": config.mla_compute_mode,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
+        "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
         "target_logits_dtype": "float32",
         "draft_logits_dtype": "bfloat16" if config.dspark else None,
         "offloaded_bytes": sum(source.nbytes for pair in tables.sources.values() for source in pair),
@@ -648,11 +664,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         package_data=tables if rank == 0 else None,
         resources=(scoring, scored_storage, weights, tables, pool, requests, inputs, admission, commands, arena, forwards,
             prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
             vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
             scratch_pool, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

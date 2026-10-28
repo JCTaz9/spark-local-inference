@@ -231,7 +231,8 @@ def test_speculation_settings_are_validated_and_described():
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
     assert record == {"draft_tokens": 5, "adaptive": True,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
-                      "draft_head_quantization": None, "markov_head_quantization": None}
+                      "draft_head_quantization": None, "markov_head_quantization": None,
+                      "vocabulary_parallel_sampling": False}
     assert derive(speculation=Speculation(5, packed_verification=True)).to_dict()["speculation"]["packed_verification"]
     assert display.speculation(None) == "off"
     assert display.speculation(DRAFTING) == "up to 3 draft tokens per round · MTP module"

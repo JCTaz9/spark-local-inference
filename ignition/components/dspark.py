@@ -48,6 +48,9 @@ class SpeculativePreparation:
         page_tokens=128,
         result_runtime=None,
         block_proposal_broadcast=False,
+        vocabulary_parallel_sampling=False,
+        sampling_runtime=None,
+        logprob_runtime=None,
         buffers=None,
     ):
         self.forwards = forwards
@@ -59,6 +62,8 @@ class SpeculativePreparation:
         self.collectives = {
             "runtime": runtime, "vocabulary_runtime": vocabulary_runtime, "coordinator": coordinator
         }
+        self.vocabulary_parallel_sampling = vocabulary_parallel_sampling
+        self.sampling_runtime, self.logprob_runtime = sampling_runtime, logprob_runtime
         self.markov_runtime = markov_runtime
         # Only sampling uses the result channel; model forwards receive the collectives above.
         self.result_runtime = result_runtime
@@ -221,6 +226,16 @@ class PreparedContext:
             norm(part)
             self.rotary.apply(self.normalized, positions.clamp_min(0), compressed=False)
             writer(self.normalized)
+
+
+class PreparedMarkovEmbedding:
+    """Retain replicated predecessor embeddings for fused transition proposals."""
+
+    def __init__(self, weights, tokens, *, session, name):
+        self.embedding = torch.zeros((tokens.numel(), weights.config.draft.markov_rank),
+                                     dtype=torch.bfloat16, device=tokens.device)
+        self.embed = PreparedEmbedding(weights.draft.markov_embedding, tokens, self.embedding,
+                                       session=session, name=name + ".embed")
 
 
 class PreparedMarkov:

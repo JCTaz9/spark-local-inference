@@ -10,6 +10,7 @@ fn main() {
         runtime
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
             .file_descriptor_set_path(out.join("runtime_package_descriptor.bin"))
+            .field_attribute(".flare.runtime.RebuildSpeculation.vocabulary_parallel_sampling", "#[serde(default)]")
             .field_attribute(
                 ".flare.runtime.ExecutionGraph.packed_token_capacity",
                 "#[serde(default)]",
