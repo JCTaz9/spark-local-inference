@@ -55,6 +55,8 @@ def _recipe_metadata(recipe, *, all_variants=True):
         options = dict(max_active=32, prefill_chunk_size=4096,
             speculative_widths=tuple(range(1, 9)), speculative_token_capacity=128)
     fields = bootstrap.PreparationConfig.__dataclass_fields__
+    if recipe == "qwen38_dense":
+        options.update(draft_snapshot=Path("metadata-draft"), max_active=32)
     if recipe == "qwen38":
         options.update(mtp=True, mixed_prefill=True)
     if "draft_checkpoint" in fields:
@@ -226,3 +228,19 @@ def test_generated_admission_pending_token_rejects_an_undeclared_read():
     producer["pending_token"] = consumer["pending_token"]
     with pytest.raises(ValueError, match="pending token requires a declared device-state read"):
         flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_qwen_dense_packed_catalog_and_zero_lag_cursor_pass_native_contract_validation():
+    import flare_heliopause
+    from ignition.preparation import runtime_package_pb2 as p
+
+    config, contract, manifest = _recipe_metadata("qwen38_dense")
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    speculative = [graph for graph in manifest["graphs"] if graph["kind"] == "speculative"]
+    assert (32, 7, 8, 128) in {
+        (graph["batch_capacity"], graph["draft_tokens"], graph["token_capacity"], graph.get("packed_token_capacity", 0))
+        for graph in speculative
+    }
+    assert config.speculative_token_capacity == 128
+    assert all(graph["draft_cursor"]["lag_tokens"] == 0
+        for graph in contract["graphs"] if graph["kind"] == p.SPECULATIVE)

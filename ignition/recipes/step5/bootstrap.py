@@ -72,6 +72,7 @@ from .weights import ModelWeights
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
@@ -179,7 +180,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "quantization": weights.config.quantization, "headers": headers, "world_size": shard.world_size,
             "contract": "step5.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="step5",
             numerical_policy="default", coordinator=coordinator, headroom_bytes=config.headroom_bytes,

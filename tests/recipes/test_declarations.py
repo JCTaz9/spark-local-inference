@@ -17,7 +17,6 @@ GLM = resolve("glm-5.3-flash")
 
 @pytest.mark.parametrize("alias,drafts,graphs,options", [
     ("qwen3.8-flash", 5, 34, {"mtp": True}),
-    ("qwen3.8-27b", 5, 34, {"mtp": True}),
     ("glm-5.3-flash", 5, 34, {"mtp": True}),
     ("step5-preview-nvfp4", 3, 24, {}),
 ])
@@ -92,7 +91,7 @@ def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
         if not (DRAFT / "config.json").is_file():
             pytest.skip("Red Hat DSpark checkpoint metadata is not installed")
         config = replace(config, draft=DSparkConfig.load(DRAFT, config))
-    if drafting and model.recipe.name == "nemotron_h":
+    if drafting and model.recipe.name in ("nemotron_h", "qwen38_dense"):
         draft = import_module(prefix + ".draft_config")
         draft_snapshot = HUB / f"models--{draft.REPOSITORY.replace('/', '--')}" / "snapshots" / draft.REVISION
         if not (draft_snapshot / "config.json").is_file():
@@ -111,7 +110,7 @@ def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
     elif model.recipe.name == "qwen38_dense":
         pool = module.ContinuationPool.for_model(config, 2, 3, "meta", mtp=drafting)
         layers = [i for i, kind in enumerate(config.layers) if kind == "full_attention"]
-        caches = [cache for layer in (*layers, *(("draft",) if drafting else ()))
+        caches = [cache for layer in layers
                   for cache in pool.attention(layer, config)]
     else:
         pool = module.ContinuationPool.for_model(config, 2, 3, "meta")
@@ -122,7 +121,7 @@ def test_fp8_cache_views_and_planned_bytes(alias, world_size, drafting):
     if model.recipe.name == "kimi3":
         assert len(draft_caches) == (2 * config.draft.layers if drafting else 0)
         assert all(cache.dtype == torch.bfloat16 for cache in draft_caches)
-    elif model.recipe.name != "qwen38_dense":
+    else:
         caches.extend(draft_caches)
     assert caches and all(cache.dtype == torch.float8_e4m3fn for cache in caches)
     costs = model.recipe.costs(world_size, model.recipe.speculation if drafting else None)

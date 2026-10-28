@@ -55,7 +55,7 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
 
 @pytest.mark.parametrize("mode", ["static", "runtime"])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort, mode):
+def test_runtime_geometry_is_pinned_for_every_tuning_effort(monkeypatch, effort, mode):
     from b12x.comm import pcie
     from b12x.preparation import AutotuneEffort
     from ignition.components import collectives
@@ -63,25 +63,31 @@ def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort, mode):
 
     calls, requests, registered = [], [], []
     plan = SimpleNamespace(request=lambda **kwargs: requests.append(kwargs) or object())
-    runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True,
+    runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
         exchange_group=object(), for_stream=lambda: SimpleNamespace(_joint_workspace=object()),
         plan=lambda *args, **kwargs: calls.append(kwargs) or plan)
-    policy = object()
-    monkeypatch.setattr(pcie, "joint_finalist_policy", lambda: policy, raising=False)
+    from ignition.preparation.collective_ladder import load, select
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
     monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1])
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
     monkeypatch.setattr(startup_tuning, "register_collective", lambda owner, session: registered.append(owner))
-    source = torch.ones(32, dtype=torch.bfloat16)
+    source = torch.ones(2048, dtype=torch.bfloat16)
     output = torch.empty_like(source)
     operation = collectives.PreparedAllReduce(source, output, runtime=runtime,
-        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort), collective_tuning=mode), coordinator=object(), name="reduce")
-    assert calls == [dict(out=output, **({"joint_only": True} if mode == "runtime" else {}))]
-    if effort == "off" or mode == "static":
-        assert "finalist_policy" not in requests[0]
+        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort), collective_tuning=mode, collective_ladder=ladder), coordinator=object(), name="reduce")
+    assert "finalist_policy" not in requests[0]
+    if mode == "static":
+        assert calls == [dict(out=output)]
         assert registered == []
     else:
-        assert requests[0]["finalist_policy"] is policy
+        row = select(ladder, 4096, world_size=4, capability=(12, 0), inplace=False)
+        assert calls == [dict(out=output, joint_only=True, override=pcie.CollectiveConfig(
+            implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
+            submode=next(iter(row["profiles"])), active_blocks=1))]
+        assert operation.runtime_profiles == tuple((mode, count) for mode, counts in row["profiles"].items() for count in counts)
+        assert operation.runtime_cache_policy == "cold"
         assert registered == [operation]
 
 
@@ -91,14 +97,14 @@ def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypat
 
     pcie = import_module("b12x.comm.pcie")
     api = import_module("b12x.comm.pcie.api")
-    monkeypatch.delattr(pcie, "joint_finalist_policy", raising=False)
-    monkeypatch.delattr(api, "joint_finalist_policy", raising=False)
+    monkeypatch.delattr(pcie, "CollectiveConfig", raising=False)
+    monkeypatch.delattr(api, "CollectiveConfig", raising=False)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
     def channel():
         raise AssertionError("capability lookup must follow the required API import")
     runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True, for_stream=channel)
-    source = torch.ones(32, dtype=torch.bfloat16)
-    with pytest.raises(ImportError, match="joint_finalist_policy"):
+    source = torch.ones(2048, dtype=torch.bfloat16)
+    with pytest.raises(ImportError, match="CollectiveConfig"):
         collectives.PreparedAllReduce(source, torch.empty_like(source), runtime=runtime,
             session=object(), coordinator=object(), name="reduce")
 

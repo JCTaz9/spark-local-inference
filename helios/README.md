@@ -436,6 +436,11 @@ nonnegative segment count, translated through the segment text lengths after
 rendering. Marks are forbidden inside macros, captured assignments, and filter
 blocks; a root call site marks output after a macro returns. Generation headers
 remain outside completed messages. Annotations follow Jinja whitespace controls.
+Hugging Face `{% generation %}` blocks emit their bodies without adding prompt bytes; training token masks do
+not participate in native rendering. Boolean `sameas` tests and `strftime_now`
+follow the checkpoint template's identity tests and local-calendar formatting.
+Literal replacement filters carry advisory block endpoints through mapped
+substitutions and omit endpoints inside replaced spans.
 
 The exact deployed Qwen3.8, inference-transformed Step, and segmented Kimi K3
 templates are replaced in memory with their annotated recipe assets. Kimi K3

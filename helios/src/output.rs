@@ -10,6 +10,8 @@ mod minimax_xml;
 pub mod chatml;
 #[cfg(feature = "server")]
 mod pipeline;
+#[cfg(feature = "server")]
+mod recipient;
 pub mod tagged;
 #[cfg(feature = "server")]
 mod xtml;

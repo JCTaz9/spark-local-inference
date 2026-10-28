@@ -295,8 +295,8 @@ enum Identity {
 pub(crate) struct ResolvedIdentity {
     pub claim: PackageClaim,
     pub profiles: Vec<Publisher>,
-    pub identity: Identity,
-    pub remembered: Option<Entry>,
+    identity: Identity,
+    remembered: Option<Entry>,
     /// Trust store this resolution read, where acceptance is recorded.
     pub store_path: PathBuf,
 }

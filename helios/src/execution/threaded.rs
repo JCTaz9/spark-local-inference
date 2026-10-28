@@ -251,6 +251,7 @@ impl ThreadedExecutor {
         result.local.report_startup(tuning_started);
         Ok(result)
     }
+    #[cfg(feature = "server")]
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }

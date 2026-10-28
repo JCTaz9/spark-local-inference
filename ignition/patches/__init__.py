@@ -1,4 +1,4 @@
-"""Apply the pinned PyTorch Inductor fixes before importing preparation libraries."""
+"""Apply the pinned PyTorch Inductor and Triton fixes before preparation imports."""
 
 import os
 import stat
@@ -14,6 +14,7 @@ _VERSIONS = {"torch": "2.14.1+cu132", "triton": "3.8.0"}
 _PATCHES = (
     "torch-inductor-triton-cache-filenames.patch",
     "torch-inductor-cooperative-static-launch.patch",
+    "triton-platform-key-pointer-width.patch",
 )
 
 
@@ -28,8 +29,10 @@ def _hunks(patch):
             before = after = None
             if line.startswith("diff --git "):
                 _, _, source, target = line.split()
-                if source[2:] != target[2:] or not target.startswith("b/torch/_inductor/"):
-                    raise PreparationError("Inductor patches must modify existing torch/_inductor files")
+                allowed = target.startswith("b/torch/_inductor/") or target == "b/triton/runtime/build.py"
+                if source[2:] != target[2:] or not allowed:
+                    raise PreparationError(
+                        "Preparation patches must modify existing torch/_inductor files or triton/runtime/build.py")
                 path = target[2:]
             else:
                 before, after = [], []
@@ -43,7 +46,7 @@ def _hunks(patch):
 
 
 def apply() -> tuple[Path, ...]:
-    """Validate both patches, then atomically replace each changed installation file.
+    """Validate bundled patches, then atomically replace changed installation files.
 
     Matching uses complete hunk context without fuzz. Already applied
     hunks are accepted, including installations with only one patch applied.
@@ -54,13 +57,15 @@ def apply() -> tuple[Path, ...]:
         for name, expected in _VERSIONS.items():
             if packages[name].version != expected:
                 raise PreparationError(
-                    f"Inductor patches require {name}=={expected}; found {packages[name].version}. "
+                    f"Preparation patches require {name}=={expected}; found {packages[name].version}. "
                     "Install the locked preparation dependencies with uv sync --locked --extra prepare.")
 
-        sources, patched = {}, {}
+        sources, patched, modules = {}, {}, {}
         for name in _PATCHES:
             for relative, before, after in _hunks(files(__package__).joinpath(name).read_text(encoding="utf-8")):
-                path = Path(packages["torch"].locate_file(relative))
+                package = relative.split("/", 1)[0]
+                path = Path(packages[package].locate_file(relative))
+                modules[path] = relative.removesuffix(".py").replace("/", ".")
                 if path not in sources:
                     sources[path] = path.read_text(encoding="utf-8")
                     patched[path] = sources[path]
@@ -71,11 +76,11 @@ def apply() -> tuple[Path, ...]:
                 elif counts != (0, 1):
                     raise PreparationError(
                         f"Cannot apply {name} to {path}: patch context is missing or ambiguous. "
-                        "Reinstall Torch with uv sync --locked --extra prepare --reinstall-package torch.")
+                        f"Reinstall {package} with uv sync --locked --extra prepare --reinstall-package {package}.")
 
         changed = tuple(path for path in sources if patched[path] != sources[path])
         for path in changed:
-            module = "torch._inductor.runtime." + path.stem
+            module = modules[path]
             if module in sys.modules:
                 raise PreparationError(f"Cannot patch imported module {module}; restart Python before preparation.")
         for path in changed:
@@ -92,7 +97,7 @@ def apply() -> tuple[Path, ...]:
         return changed
     except PackageNotFoundError as error:
         raise PreparationError(
-            "Inductor patches require the preparation dependencies; "
+            "Preparation patches require the preparation dependencies; "
             "install them with uv sync --locked --extra prepare.") from error
     except OSError as error:
-        raise PreparationError(f"Cannot apply Inductor patches in the preparation environment: {error}") from error
+        raise PreparationError(f"Cannot apply preparation patches in the preparation environment: {error}") from error

@@ -77,7 +77,7 @@ def test_unknown_commands_flags_and_abbreviations_are_usage_errors(host, capsys)
                       ["export", "qwen3.8-flash", "--max", "2"], ["join", "10.0.0.1:29600"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "17"], ["debug-serve", "--ranks", "17"],
                       ["serve", "qwen3.8-flash"], ["run", "qwen3.8-flash"], ["plan", "qwen3.8-flash"],
-                      ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["bench"], ["config"], ["skill"]):
+                      ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["config"], ["skill"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
         assert exit.value.code == 2

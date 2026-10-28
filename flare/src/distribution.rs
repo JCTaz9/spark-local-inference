@@ -11,7 +11,7 @@ use crate::{
 use flare_helios::package::cache::{self as model_cache, Entry, Root};
 use flare_helios::{
     runtime_package::{
-        self, AuthorizedPackage, NativeResources, PackageFormat, Publisher, VerifiedPackage,
+        self, AuthorizedPackage, NativeResources, PackageFormat, Publisher,
     },
     startup::{Phase, StartupProgress},
 };
@@ -727,7 +727,7 @@ fn receiver_candidate(platform: &str, tensor_parallel: u32) -> Result<String, Fa
 /// A miss stages an owned tree, receives the sparse ranges, flattens them to the canonical entry
 /// root, verifies the selected rank, commits the entry, records the source reference, and selects
 /// the entry only after publication. The returned `Entry` lease must be retained through serving.
-pub(crate) fn receive_rank(
+fn receive_rank(
     model_root: &Path,
     plan: &Plan,
     relay: &Relay,
@@ -738,7 +738,7 @@ pub(crate) fn receive_rank(
     // Warm reuse keys on the distributed source identity and this rank, never on a claim of full
     // package readiness: a sparse rank slice is not a complete package.
     let selector = format!("{}-rank{rank}", plan.export);
-    let (entry, path) = match root
+    let (entry, _path) = match root
         .resolve_source_ref(&selector)
         .map_err(|e| e.to_string())?
     {

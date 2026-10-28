@@ -238,6 +238,7 @@ impl Incoming {
         self.metrics.failed.fetch_add(1, Ordering::Relaxed);
         let _ = self.events.try_send(event(error));
     }
+    #[cfg(test)]
     fn emit_token(&self, token: u32) {
         self.emit(GenerationEvent::Token(token));
     }

@@ -746,14 +746,6 @@ impl VerifiedPackage {
             }),
         }
     }
-    /// The compatibility package when this copy uses the legacy format.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn legacy(&self) -> Option<&LegacyVerified> {
-        match self {
-            Self::Legacy(package) => Some(package),
-            Self::Payload(_) => None,
-        }
-    }
     pub fn describe(
         &self,
         options: crate::runtime_package::InspectionOptions,
@@ -1320,7 +1312,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn serialized_primary_spans_and_stored_ranges_keep_their_legacy_meaning() {
         let span = wire::Span::decode(&b"\x08\x09\x10\x07"[..]).unwrap();
         assert_eq!(
@@ -1778,7 +1769,6 @@ fn push_peer(
 
 fn build_descriptor<F: Fn(&crate::package::schema::wire::PayloadUse) -> Result<wire::Span>>(
     verified: &payload_auth::VerifiedPackage,
-    packages: &[super::format::Package],
     token_span: F,
 ) -> Result<wire::ModelIndex> {
     let package = verified.package();
@@ -2055,7 +2045,7 @@ impl PayloadVerifiedPackage {
     /// Metadata-only descriptor for the shared loader and inspection. No acceptance or payload
     /// opening is required: every referenced payload has a placement from the selected closure.
     fn descriptor(&self) -> Result<wire::ModelIndex> {
-        build_descriptor(&self.verified, &self.packages, |use_| self.token_span(use_))
+        build_descriptor(&self.verified, |use_| self.token_span(use_))
     }
 
     pub fn open(
@@ -2534,7 +2524,7 @@ impl PayloadAuthorizedPackage {
         )
     }
     pub(super) fn descriptor(&self) -> Result<wire::ModelIndex> {
-        build_descriptor(self.source.authorized.verified(), &self.packages, |use_| {
+        build_descriptor(self.source.authorized.verified(), |use_| {
             self.source.token_span(use_)
         })
     }

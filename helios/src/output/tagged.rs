@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputStart {
+    RecipientHeader,
+    RecipientFrame,
     Content,
     Reasoning,
     ToolBody,
@@ -332,7 +334,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             reasoning_enabled: true,
             initial_close: false,
             mode: match config.start {
-                OutputStart::Content => Mode::Content,
+                OutputStart::Content | OutputStart::RecipientHeader | OutputStart::RecipientFrame => Mode::Content,
                 OutputStart::Reasoning => Mode::Reasoning,
                 OutputStart::ToolBody => Mode::Tool,
             },
@@ -372,6 +374,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
     #[cfg(feature = "server")]
     fn grammar_envelope(config: &Self::Config) -> Option<crate::grammar::OutputEnvelope> {
         Some(crate::grammar::OutputEnvelope {
+            recipient: None,
             reasoning_end: (config.start == OutputStart::Reasoning).then_some("</think>"),
             tool: (!config.tools.is_empty()).then_some((D::OPEN, D::CLOSE)),
             function: D::FUNCTION,

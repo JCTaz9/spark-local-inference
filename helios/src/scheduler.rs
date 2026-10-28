@@ -205,6 +205,7 @@ struct BoundaryCapture {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(any(feature = "server", test))]
 pub(crate) struct ConditionedInput {
     pub token_span: std::ops::Range<usize>,
     pub feature_range: std::ops::Range<usize>,
@@ -213,9 +214,12 @@ pub(crate) struct ConditionedInput {
 
 #[derive(Clone, Debug)]
 struct ConditionedWindow {
+    #[cfg(any(feature = "server", test))]
     inputs: std::ops::Range<usize>,
+    #[cfg(any(feature = "server", test))]
     token_start: usize,
     prefill_end: usize,
+    #[cfg(any(feature = "server", test))]
     features: Vec<std::ops::Range<usize>>,
     patches: VecDeque<usize>,
 }
@@ -313,11 +317,13 @@ impl LiveRequest {
             self.prefix_snapshot
         }
     }
+    #[cfg(feature = "server")]
     pub(crate) fn conditioned_input_end(&self) -> usize {
         self.conditioned_windows
             .front()
             .map_or(usize::MAX, |window| window.inputs.end)
     }
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn conditioned_window_ready(&self) -> bool {
         self.window_snapshot_ready
     }
@@ -962,6 +968,7 @@ impl RequestScheduler {
         self.decoded_history.as_ref().map_or(([-1; 7], 0), |history| history.lookup(context, maximum))
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn resume_decoded_sequence(
         &mut self,
         handle: RequestHandle,
@@ -1798,6 +1805,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn conditioned_inputs_ready(
         &mut self,
         handle: RequestHandle,
@@ -1828,6 +1836,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn set_conditioned_inputs(
         &mut self,
         handle: RequestHandle,
@@ -1960,6 +1969,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn resume_conditioned_window(
         &mut self,
         handle: RequestHandle,

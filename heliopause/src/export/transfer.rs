@@ -1648,7 +1648,7 @@ mod tests {
         assert!(store.payload(id).unwrap().is_none());
 
         // Corrupting the sender object is detected before it can be adopted.
-        let sender_cache = object_path.parent().unwrap().parent().unwrap().to_path_buf();
+        let _sender_cache = object_path.parent().unwrap().parent().unwrap().to_path_buf();
         let mut permissions = fs::metadata(&object_path).unwrap().permissions();
         {
             use std::os::unix::fs::PermissionsExt;

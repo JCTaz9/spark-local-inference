@@ -192,6 +192,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
 
     fn grammar_envelope(config: &Self::Config) -> Option<crate::grammar::OutputEnvelope> {
         Some(crate::grammar::OutputEnvelope {
+            recipient: None,
             reasoning_end: (config.start == OutputStart::Reasoning).then_some("</think>"),
             tool: (!config.tools.is_empty()).then_some(if SPACED {
                 ("<｜DSML｜ calls>", "</｜DSML｜ calls>")

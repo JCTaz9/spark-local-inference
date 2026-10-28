@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ignition.errors import CapacityError, UsageError
 from ignition.preparation.tuning_replicas import TuningReplica
+from ignition.preparation.selection import BenchmarkSelection
 from ignition.recipes.declaration import Checkpoint, Recipe, Speculation
 
 # Free memory kept after the final KV allocation during preparation. Headroom
@@ -181,6 +182,7 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    collective_ladder: dict | None = None
     collective_tuning: str | None = None
     joint_tuning: bool = False
     shard_hyperconnections: bool = False
@@ -194,12 +196,38 @@ class Plan:
     online_mxfp8: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+    benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.benchmark_selection is not None:
+            selection = self.benchmark_selection
+            if not isinstance(selection, BenchmarkSelection):
+                raise UsageError("benchmark selection requires explicit complete-round geometry")
+            if self.recipe.name != "qwen38_dense" or self.world_size != 1:
+                raise UsageError("benchmark graph preparation is implemented for single-GPU Qwen3.8-27B only")
+            if self.speculation is None or selection.width not in self.speculation.widths:
+                raise UsageError("benchmark rounds require the selected speculative width")
+            if selection.max_batch > self.concurrency:
+                raise UsageError("benchmark batches exceed --max-concurrency")
+            if selection.max_batch * selection.width > self.speculative_token_capacity:
+                raise UsageError("benchmark rounds exceed the speculative token capacity")
+            if selection.max_context + selection.width > self.context:
+                raise UsageError("benchmark context plus verification width exceeds the prepared context")
+            if self.prompt_logprobs or self.mixed_prefill:
+                raise UsageError("benchmark graph preparation does not implement scored or mixed prefill")
         if self.collective_tuning is None:
             object.__setattr__(self, "collective_tuning", self.recipe.collective_tuning)
         if self.collective_tuning not in ("static", "runtime"):
             raise UsageError("--collective-tuning must be static or runtime")
+        if self.collective_ladder is not None:
+            from ignition.preparation.collective_ladder import validate
+
+            ladder = validate(self.collective_ladder)
+            if self.collective_tuning != "runtime":
+                raise UsageError("--collective-ladder requires --collective-tuning runtime")
+            if self.world_size != ladder["world_size"] or any(
+                    tuple(gpu.capability) != tuple(ladder["compute_capability"]) for gpu in self.gpus):
+                raise UsageError("collective ladder does not match selected TP size or GPU compute capability")
         if self.shard_hyperconnections:
             if self.recipe.name != "qwen38":
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
@@ -317,6 +345,7 @@ class Plan:
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
             "collective_tuning": self.collective_tuning,
+            "collective_ladder": self.collective_ladder,
             "joint_tuning": self.joint_tuning,
             "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,
@@ -333,6 +362,7 @@ class Plan:
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
                 **({"graph_budget": self.speculation.graph_budget}
                    if self.speculation.graph_budget is not None else {})},
+            "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
             "context": self.context, "checkpoint_context": self.recipe.context,
             "weights_bytes": self.weights_bytes, "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,

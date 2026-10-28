@@ -69,20 +69,24 @@ def test_registry_reuses_producer_until_its_consumers_change(monkeypatch):
     from ignition.preparation.startup_tuning import CollectiveStartupTuning
 
     prepared = []
-    def prepare(specs):
+    def prepare(specs, *, cache_policy):
+        assert cache_policy == "cold"
         producer = SimpleNamespace(specs=tuple(specs))
         prepared.append(producer)
         return producer
-    monkeypatch.setattr(pcie, "joint_startup_spec", lambda plan: plan, raising=False)
+    def spec(plan, *, profiles):
+        assert profiles == (("full", 1),)
+        return plan
+    monkeypatch.setattr(pcie, "joint_startup_spec", spec, raising=False)
     monkeypatch.setattr(pcie, "prepare_joint_startup_tuner", prepare, raising=False)
     registry = CollectiveStartupTuning(object())
     first = SimpleNamespace(key=("latency", 256), selector=torch.zeros(1))
-    registry.owners.append(SimpleNamespace(plan=first))
+    registry.owners.append(SimpleNamespace(plan=first, runtime_profiles=(("full", 1),), runtime_cache_policy="cold"))
     registry.prepare()
     registry.prepare()
     assert len(prepared) == 1
     second = SimpleNamespace(key=first.key, selector=torch.zeros(1))
-    registry.owners.append(SimpleNamespace(plan=second))
+    registry.owners.append(SimpleNamespace(plan=second, runtime_profiles=(("full", 1),), runtime_cache_policy="cold"))
     registry.prepare()
     assert len(prepared) == 2
     assert registry.groups[first.key].specs == (first, second)

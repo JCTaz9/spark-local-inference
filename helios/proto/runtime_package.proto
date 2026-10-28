@@ -104,6 +104,8 @@ message RebuildManifest {
   bool shard_hyperconnections = 24;
   // Preparation-time collective selection policy: static or runtime.
   string collective_tuning = 25;
+  // Preparation-only offline geometry and runtime profile recommendations.
+  string collective_ladder_json = 26;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
@@ -328,6 +330,7 @@ enum ToolParserKind {
   XTML = 4;
   MINIMAX_XML = 5;
   GEMMA_CALL = 6;
+  ATEM = 7;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
@@ -335,6 +338,7 @@ enum ReasoningParserKind {
   XTML_THINK = 2;
   MM_THINK = 3;
   CHANNEL_THOUGHT = 4;
+  RECIPIENT_HEADERS = 5;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;

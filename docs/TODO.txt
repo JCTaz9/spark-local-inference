@@ -151,3 +151,7 @@
     tests/server/test_nemotron.py::test_image_cache_identity: native serving of
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
+
+[ ] Validate native debug-serve asset descriptors for Step-5, MiniMax M3,
+    MiMo V2, Qwen3.8 dense, and DeepSeek V4.1. Their tokenizer descriptors omit
+    sha256 before PreparedModel.start_server; launches remain untested.

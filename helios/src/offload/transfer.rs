@@ -650,9 +650,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    #[cfg(feature = "runtime-package")]
+    use flare_selene::testing::pattern as fill;
     use flare_selene::{
         PageId, StateSlotId,
-        testing::{geometry, pattern as fill, rank_part},
+        testing::{geometry, rank_part},
     };
 
     fn job(direction: Direction) -> Job {

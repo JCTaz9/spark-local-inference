@@ -846,7 +846,7 @@ fn put(
         return Err("PUT length does not match its ranges".into());
     }
     let entry = cache::entry(&agent.cache, cache::kind_directory(kind)?, name)?;
-    let lease = cache::Lease::write(&cache::unit(&agent.cache, &entry))?;
+    let _lease = cache::Lease::write(&cache::unit(&agent.cache, &entry))?;
     let path = cache::store(&agent.cache, kind, name, size, &ranges, &mut body)?;
     let unit = cache::unit(&agent.cache, &path);
     if kind == "package" {
@@ -878,7 +878,7 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
         "packages",
         &format!("{directory}/{}", grant.primary()),
     )?;
-    let lease = cache::Lease::write(primary.parent().unwrap())?;
+    let _lease = cache::Lease::write(primary.parent().unwrap())?;
     let marker = primary.with_file_name(VERIFIED);
     let fabric_source = if grant.transfer_fabric.is_some() {
         super::fabric::topology(&grant)?;
@@ -2828,7 +2828,7 @@ pub mod tests {
                 );
             }
         });
-        let script = "#!/bin/sh\ntrap 'exit 0' TERM\nwhile true; do sleep 0.1; done\n";
+        let script = "#!/bin/sh\ntrap 'exit 0' TERM\necho ready\nwhile true; do sleep 0.1; done\n";
         let name = cache::binary_name(script.as_bytes());
         put(&mut session, "binary", &name, script.as_bytes(), None);
         put(
@@ -2882,6 +2882,14 @@ pub mod tests {
         running
             .request(frame::RUN, &run_request(&grant, 0, &name))
             .unwrap();
+        loop {
+            let (tag, body) = running.read_frame().unwrap();
+            assert_eq!(tag, frame::LOG);
+            if body == b"ready" {
+                break;
+            }
+            assert!(body.is_empty(), "unexpected child output: {body:?}");
+        }
         harness.agent.sample();
         let mut session = connect(&harness, &harness.controller);
         let metrics: Value =

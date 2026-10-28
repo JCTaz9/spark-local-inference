@@ -320,7 +320,10 @@ Exports through `ignition export` record an optional
 It identifies the recipe, preparation source identity, qualified checkpoint
 repository and revision, tensor-parallel size, concurrency, chunk size,
 speculation, and selected preparation settings. A local checkpoint override
-is marked explicitly and carries no asserted upstream revision.
+is marked explicitly and carries no asserted upstream revision. Runtime
+collective preparation records the complete offline ladder as
+`RebuildManifest.collective_ladder_json`; rebuilding does not depend on the
+original ladder file path. Helios does not interpret that preparation input.
 
 Each recipe also supplies its named weight owners. After reachability pruning,
 the exporter records retained tensor views in `BundleIndex.rebuild_weights`:

@@ -6,8 +6,10 @@ use std::time::Instant;
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde_json::{Value as Json, json};
 
+#[cfg_attr(test, allow(dead_code, unused_imports))]
 #[path = "../src/frontend/jinja/mod.rs"]
 mod jinja;
+#[cfg_attr(test, allow(unused_imports))]
 #[path = "../src/frontend/json.rs"]
 mod json;
 

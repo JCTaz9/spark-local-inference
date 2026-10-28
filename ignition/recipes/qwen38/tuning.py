@@ -4,11 +4,11 @@ from ignition.preparation.tuning import RecordedPreparationSession
 
 
 def preparation_session(*, device, checkpoint, namespace=None, coordinator=None, headroom_bytes=0,
-                        benchmark_storage=None, compile_workers=None, tuning_replica=None, autotune_effort="default", collective_tuning="static",
+                        benchmark_storage=None, compile_workers=None, tuning_replica=None, autotune_effort="default", collective_tuning="static", collective_ladder=None,
                         native_dense_activations=False, lock_gpu_clocks=False):
     return RecordedPreparationSession(
         device=device, checkpoint=checkpoint, compile_workers=compile_workers, tuning_replica=tuning_replica,
-        collective_tuning=collective_tuning, autotune_effort=autotune_effort, lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations,
+        collective_tuning=collective_tuning, collective_ladder=collective_ladder, autotune_effort=autotune_effort, lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations,
         namespace=namespace, coordinator=coordinator,
         headroom_bytes=headroom_bytes, benchmark_storage=benchmark_storage,
         workload_schema="qwen38-active-operators-v1",

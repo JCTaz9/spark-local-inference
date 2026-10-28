@@ -172,6 +172,7 @@ impl IoBudget {
             pool = ready.wait(pool).unwrap();
         }
     }
+    #[cfg(test)]
     pub(crate) fn read_at(&self, source: &Source, offset: u64, output: &mut [u8]) -> Result<()> {
         if output.len() < ALIGNMENT
             || source.direct_compatible(offset, output)
@@ -451,12 +452,6 @@ impl IoBudget {
         )?;
         Ok(digest)
     }
-    pub(crate) fn copy(&self, source: &Source, output: &File, offset: u64) -> Result<()> {
-        self.write(output, offset, source.length, |position, bytes| {
-            self.read_at(source, position, bytes)
-        })?;
-        source.check_unchanged()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -556,6 +551,7 @@ impl Source {
     pub(crate) fn identity(&self) -> Identity {
         self.identity.clone()
     }
+    #[cfg(test)]
     pub(crate) fn open_checked(
         path: &Path,
         offset: u64,
@@ -567,39 +563,6 @@ impl Source {
             return Err("export source changed before reading".into());
         }
         Ok(source)
-    }
-    pub(crate) fn pinned_path(&self) -> Result<std::path::PathBuf> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            Ok(std::path::PathBuf::from(format!(
-                "/proc/self/fd/{}",
-                self.file.as_raw_fd()
-            )))
-        }
-        #[cfg(windows)]
-        {
-            use std::{
-                ffi::OsString,
-                os::windows::{ffi::OsStringExt, io::AsRawHandle},
-            };
-            use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-            let mut buffer = vec![0u16; 32768];
-            let count = unsafe {
-                GetFinalPathNameByHandleW(
-                    self.file.as_raw_handle(),
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    0,
-                )
-            };
-            if count == 0 || count as usize >= buffer.len() {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(std::path::PathBuf::from(OsString::from_wide(
-                &buffer[..count as usize],
-            )))
-        }
     }
     pub(crate) fn open(path: &Path, offset: u64, length: u64) -> Result<Self> {
         let mut options = OpenOptions::new();

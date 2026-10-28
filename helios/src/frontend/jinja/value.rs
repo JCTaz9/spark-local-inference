@@ -24,6 +24,7 @@ pub(super) enum Value<'a> {
     Namespace(Rc<RefCell<Vec<(String, Value<'a>)>>>),
     Loop(Rc<LoopValue<'a>>),
     Macro(u32),
+    Builtin,
 }
 
 #[derive(Debug)]
@@ -126,7 +127,7 @@ impl<'a> Value<'a> {
             Self::Int(v) => *v != 0,
             Self::UInt(v) => *v != 0,
             Self::Float(v) => *v != 0.0,
-            Self::Loop(_) | Self::Macro(_) | Self::Namespace(_) => true,
+            Self::Loop(_) | Self::Macro(_) | Self::Builtin | Self::Namespace(_) => true,
             _ => self.len() != 0,
         }
     }

@@ -67,6 +67,7 @@ from .vision import PreparedVision, VisionScratch
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
@@ -294,7 +295,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=sample_rows, columns=248320, ipc=ipc)
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
-        compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,

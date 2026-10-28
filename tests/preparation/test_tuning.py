@@ -1512,7 +1512,9 @@ def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals(
 
 @pytest.mark.parametrize("mode", ["static", "runtime"])
 def test_collective_selection_is_reported_without_partitioning_operator_cache(backend, tmp_path, mode):
-    session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode)
+    from ignition.preparation.collective_ladder import load
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") if mode == "runtime" else None
+    session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode, collective_ladder=ladder)
     assert session.collective_tuning == mode
     from b12x.preparation._cache import SelectionCache
 

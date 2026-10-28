@@ -78,13 +78,20 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", collective_tuning="static", native_dense_activations=False, lock_gpu_clocks=False):
+                 tuning_replica=None, autotune_effort="default", collective_tuning="static", collective_ladder=None, native_dense_activations=False, lock_gpu_clocks=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
             raise ValueError("tuning requires a workload schema and numerical policy")
         if collective_tuning not in ("static", "runtime"):
             raise ValueError("collective_tuning must be static or runtime")
+        from .collective_ladder import validate
+
+        if collective_tuning == "runtime" and collective_ladder is None:
+            raise ValueError("runtime collective tuning requires a collective ladder")
+        if collective_ladder is not None and collective_tuning != "runtime":
+            raise ValueError("collective ladder requires runtime collective tuning")
+        self.collective_ladder = None if collective_ladder is None else validate(collective_ladder)
         self.collective_tuning = collective_tuning
         identity = dict(namespace or {})
         reserved = {"checkpoint", "workload_schema", "numerical_policy"}
@@ -545,6 +552,7 @@ class RecordedPreparationSession(PreparationSession):
                 "workload_schema": self._workload_schema, "namespace": self.namespace.to_dict(),
                 "autotune_effort": self.autotune_effort,
                 "collective_tuning": self.collective_tuning,
+                "collective_ladder": self.collective_ladder,
                 "native_dense_activations": self.native_dense_activations,
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,

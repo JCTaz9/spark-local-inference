@@ -833,6 +833,7 @@ impl IncrementalDecoder<'_> {
         })
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn pending_text(&self) -> Result<String> {
         let text = self.tokenizer.decode(&self.ids, self.skip_special_tokens).map_err(|e| e.to_string())?;
         Ok(text.strip_prefix(&self.prefix).ok_or("decoder changed its emitted prefix")?.to_owned())

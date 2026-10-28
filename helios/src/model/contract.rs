@@ -54,8 +54,8 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
@@ -617,12 +617,18 @@ impl FrontendContract {
                 return Err("unsupported tool parser syntax parameters".into());
             }
         }
+        if self.tools.as_ref().is_some_and(|t| t.kind == ToolParserKind::Atem)
+            != self.reasoning.as_ref().is_some_and(|r| r.kind == ReasoningParserKind::RecipientHeaders)
+        {
+            return Err("ATEM recipient framing requires recipient-header reasoning syntax".into());
+        }
         if let Some(reasoning) = &self.reasoning {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
                 ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
+                ReasoningParserKind::RecipientHeaders => ("<|start|>assistant to=self<|message|>", "<|eom|>"),
             };
             let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
                 ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
@@ -638,6 +644,8 @@ impl FrontendContract {
                             .tools
                             .as_ref()
                             .is_none_or(|tool| tool.kind != ToolParserKind::Xtml)))
+                || (reasoning.kind == ReasoningParserKind::RecipientHeaders
+                    && (reasoning.wrapping_newlines != 0 || !reasoning.terminal_markers.is_empty()))
                 || reasoning.wrapping_newlines > 1
                 || reasoning
                     .terminal_markers
@@ -661,6 +669,26 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
+        assert_eq!(ToolParserKind::try_from(7).unwrap(), ToolParserKind::Atem);
+        assert_eq!(ReasoningParserKind::try_from(5).unwrap(), ReasoningParserKind::RecipientHeaders);
+        for value in [0, 8, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
+        for value in [0, 6, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {kind: ToolParserKind::Atem, wrapping_newlines: 0, tag_separator: String::new()});
+        assert!(syntax.validate().is_err());
+        syntax.reasoning = Some(ReasoningParser {kind: ReasoningParserKind::ThinkTags, open: "<think>".into(), close: "</think>".into(), wrapping_newlines: 0, terminal_markers: vec![]});
+        let reasoning = syntax.reasoning.as_mut().unwrap();
+        reasoning.kind = ReasoningParserKind::RecipientHeaders;
+        reasoning.open = "<|start|>assistant to=self<|message|>".into();
+        reasoning.close = "<|eom|>".into();
+        reasoning.wrapping_newlines = 0;
+        reasoning.terminal_markers.clear();
+        syntax.tools.as_mut().unwrap().wrapping_newlines = 0;
+        assert!(syntax.validate().is_ok());
+    }
 
     #[test]
     fn startup_tuning_bindings_match_transport_and_exclude_request_state() {

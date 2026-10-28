@@ -923,3 +923,7 @@ fn describe_images(
     }
     Ok(images)
 }
+
+#[cfg(test)]
+#[path = "request/recipient_tests.rs"]
+mod recipient_tests;

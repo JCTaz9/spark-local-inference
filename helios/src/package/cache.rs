@@ -475,7 +475,7 @@ pub struct AcquisitionPlan<'a> {
 impl AcquisitionPlan<'_> {
     /// Minimal non-primary files that must be fetched before installation.
     pub fn remote_files(&self) -> Vec<String> {
-        let mut files: BTreeSet<String> = self
+        let files: BTreeSet<String> = self
             .remote
             .values()
             .filter(|(file, _)| !file.is_empty())
@@ -1655,26 +1655,6 @@ impl Root {
         })
     }
 
-    /// Validate derivation hints against the merged selected catalogue.
-    ///
-    /// A union acquisition may need recipes whose dependencies live in different
-    /// selected deployments, so hints are validated against the merged identities of
-    /// the selected catalogues rather than any single deployment's catalogue.
-    fn derivation_plans(
-        source: &PackageSource<'_>,
-        set: &wire::DerivationSet,
-        targets: &BTreeSet<Vec<u8>>,
-        limits: &derivation::Limits,
-    ) -> Result<Vec<derivation::Derivation>> {
-        let located = located_payload_ids(&source.metadata);
-        let selected = selected_derivation_set(set, targets, &located, limits)?;
-        if selected.derivations.is_empty() {
-            return Ok(Vec::new());
-        }
-        let catalog = Self::merged_catalog(&source.verified, selected_derivation_ids(&selected))?;
-        derivation::from_wire(&selected, &catalog, limits)
-    }
-
     /// Merge payload identities authenticated by the selected deployments only.
     fn merged_catalog(
         verified: &[protection::VerifiedPackage],
@@ -2114,7 +2094,7 @@ impl Root {
         for payload in &package.payloads {
             add(&payload.id, payload.nbytes);
         }
-        let mut ready_ids: BTreeSet<&str> = metadata
+        let ready_ids: BTreeSet<&str> = metadata
             .locations
             .available_deployments
             .iter()
@@ -5726,7 +5706,7 @@ mod tests {
         let publisher = publish_two_deployment_fixture(&directory, &canonical, &derived);
         root.insert_payload(derived_id, derived.len() as u64, derived.as_slice())
             .unwrap();
-        let copy = |source: PayloadId, target: PayloadId, source_offset: u64, destination_offset: u64| {
+        let copy = |source: PayloadId, _target: PayloadId, source_offset: u64, destination_offset: u64| {
             wire::DerivationOperation {
                 operation: Some(wire::derivation_operation::Operation::Copy(
                     wire::DerivationCopy {

@@ -77,7 +77,7 @@ def prepare(
                 allow_patterns=("config.json", "model.safetensors"),
             )
     config = PreparationConfig(
-        collective_tuning=plan.collective_tuning,
+        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder,
         prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",

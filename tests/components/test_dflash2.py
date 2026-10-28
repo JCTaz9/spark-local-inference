@@ -1,0 +1,34 @@
+"""DFlash2 proposal scratch for attention widths distinct from model hidden widths."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from ignition.components.dflash2 import DraftScratch
+from ignition.components.dflash2_geometry import DraftAttentionGeometry
+from ignition.components.parallel import TensorParallelShard
+from ignition.preparation.scratch import GraphBufferPool
+
+
+@pytest.mark.parametrize('world', [1, 2, 4, 8])
+def test_non_square_attention_scratch_and_proposal_views(world):
+    config = SimpleNamespace(block_size=8,
+        text=dict(hidden_size=5120, intermediate_size=12288, vocab_size=128),
+        attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
+    buffers = GraphBufferPool('meta').cursor()
+    scratch = DraftScratch.allocate(config, TensorParallelShard(0, world), 32, 'meta', buffers=buffers)
+    assert scratch.embedding.shape == (32, 5120)
+    assert scratch.local_embedding.shape == (32, 5120 // world)
+    assert scratch.query.shape == scratch.attended.shape == (32, 32 // world, 128)
+    assert scratch.key.shape == scratch.value.shape == (32, 8 // world, 128)
+    assert scratch.qkv.shape == (32, 6144 // world)
+    assert scratch.partial.shape == scratch.output.shape == (32, 5120)
+    view = scratch.rows(8, 8)
+    assert view.query.shape == (8, 32 // world, 128)
+    assert view.embedding.shape == (8, 5120)
+    assert view.window_key is scratch.window_key
+    assert view.convolution is scratch.convolution
+    assert view.selectors is scratch.selectors
+    with pytest.raises(ValueError, match='complete eight-token'):
+        scratch.rows(7, 7)

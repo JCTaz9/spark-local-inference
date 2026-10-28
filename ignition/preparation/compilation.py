@@ -66,7 +66,8 @@ class _Invocation:
             tensor = writes[index] if mutable else reads[index]
             if view is not None:
                 dtype, shape, stride, offset = view
-                tensor = tensor.view(dtype).as_strided(shape, stride, offset)
+                tensor = tensor.view(dtype)
+                tensor = tensor.as_strided(shape, stride, tensor.storage_offset() + offset)
             leaves[position] = tensor
         args, kwargs = tree_unflatten(leaves, self.tree)
         self.target(*args, **kwargs)
@@ -499,8 +500,10 @@ def _lower_storage(module):
                     and value.numel() * value.element_size() == end - begin)
 
         mutable_keys = {key_for(arg) for arg in mutated}
-        # Inductor can recompute the source when writing inputs back after the graph.
+        # Opaque operands retain their prepared alignment and contiguous layout.
+        source = node.args[1].meta['val'] if target is torch.ops.aten.copy_.default else None
         if (target is torch.ops.aten.copy_.default
+                and source.is_contiguous() and source.storage_offset() == 0
                 and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
                 and all(complete_write(arg) for arg in mutated)):
             continue

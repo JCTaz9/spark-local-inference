@@ -422,3 +422,37 @@ fn qwen_content_macro_keeps_hints_only_when_its_result_is_emitted() {
         .collect();
     assert_eq!(hints, [Mark::Hint(plain.text.find("Newest action.").unwrap())]);
 }
+
+#[test]
+fn huggingface_generation_annotations_preserve_text_and_message_marks() {
+    let rendered = CompiledTemplate::compile("A{% generation %}{{ text }}{% endgeneration %}{% mark %}B")
+        .unwrap().render(json!({"text":"café 世界"}).as_object().unwrap(), &[]).unwrap();
+    assert_eq!(rendered.text, "Acafé 世界B");
+    assert_eq!(rendered.marks, vec![super::Mark::Byte("Acafé 世界".len())]);
+}
+
+#[test]
+fn boolean_identity_tests_accept_bare_and_parenthesized_arguments() {
+    compare("{{ a is sameas false }} {{ b is not sameas false }} {{ a is sameas(false) }}",
+        json!({"a":false,"b":true}));
+}
+
+#[test]
+fn strftime_now_is_defined_and_uses_local_calendar_time() {
+    let source = "{% if strftime_now is defined %}{{ strftime_now('%Y-%m-%d') }}{% endif %}";
+    let rendered = CompiledTemplate::compile(source).unwrap().render(&serde_json::Map::new(), &[]).unwrap();
+    assert_eq!(rendered.text.len(), 10);
+    assert_eq!(&rendered.text[4..5], "-");
+    assert_eq!(&rendered.text[7..8], "-");
+}
+
+#[test]
+fn literal_replacement_maps_hints_and_drops_cuts_inside_replaced_spans() {
+    for (first, second, expected) in [("a", "bc", None), ("abc", "tail", Some(1)), ("café", "abc", Some(5))] {
+        let context=json!({"messages":[{"content":[{"type":"text","text":first},{"type":"text","text":second}]}]});
+        let template=CompiledTemplate::compile("{% set body %}{{ messages[0].content[0].text }}{{ messages[0].content[1].text }}{% endset %}{{ body|replace('abc','X') }}").unwrap();
+        let rendered=template.render(context.as_object().unwrap(), &[(0,1)]).unwrap();
+        assert_eq!(rendered.text,format!("{first}{second}").replace("abc","X"));
+        assert_eq!(rendered.marks,expected.map(super::Mark::Hint).into_iter().collect::<Vec<_>>());
+    }
+}

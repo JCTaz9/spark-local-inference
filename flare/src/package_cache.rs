@@ -22,34 +22,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub(crate) use crate::cache_support::model_root_from;
-pub use crate::cache_support::{model_root, requested_tensor_parallel, select_deployments};
-
-/// Streams one verified payload slice into the model cache object store.
-struct SliceReader {
-    slice: flare_helios::package::container::Slice,
-    offset: u64,
-}
-
-impl Read for SliceReader {
-    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = self.slice.len().saturating_sub(self.offset);
-        let count = (output.len() as u64).min(remaining) as usize;
-        if count == 0 {
-            return Ok(0);
-        }
-        self.slice
-            .read_at(self.offset, &mut output[..count])
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        self.offset += count as u64;
-        Ok(count)
-    }
-}
+pub use crate::cache_support::model_root;
+#[cfg(test)]
+pub(crate) use crate::cache_support::{model_root_from, requested_tensor_parallel, select_deployments};
 
 /// Install the selected deployment's ready closure into the configured model cache.
 ///
 /// Verification, payload hashing, primary rewriting, publication, and the
 /// eviction-safety lease all live in `flare_helios::package::cache`.
+#[cfg(test)]
 pub fn install_selected(
     verified: flare_helios::package::protection::VerifiedPackage,
     metadata: flare_helios::package::reader::Metadata,
@@ -81,6 +62,7 @@ impl Drop for Lease {
 }
 
 impl Lease {
+    #[cfg(test)]
     pub fn shared(directory: &Path) -> Result<Self, Failure> {
         let file = Self::open(directory)?;
         let lease = Self(file);
@@ -119,13 +101,6 @@ impl Lease {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
-    }
-
-    pub fn exclusive(&self) -> Result<(), Failure> {
-        self.lock(libc::LOCK_EX)
-    }
-    pub fn downgrade(&self) -> Result<(), Failure> {
-        self.lock(libc::LOCK_SH)
     }
 
     fn evict(directory: &Path) -> Result<Option<Self>, Failure> {
@@ -1156,7 +1131,7 @@ mod tests {
     #[test]
     fn packed_import_installs_semantic_companions_and_ignores_stray_frontend_tensors() {
         use flare_helios::package::{
-            PayloadId, cache as model_cache, container, conversion, export, protection, reader,
+            PayloadId, container, conversion, export, protection, reader,
             schema::wire,
         };
         use flare_helios::runtime_package::Publisher;
@@ -1816,7 +1791,7 @@ mod tests {
             crate::package_cache::select_deployments(&metadata, &[publisher.clone()], &sizes)
                 .is_err()
         );
-        let selections = crate::package_cache::select_deployments(
+        let _selections = crate::package_cache::select_deployments(
             &metadata,
             &[publisher.clone()],
             &[1, 2].iter().copied().collect::<Vec<_>>(),

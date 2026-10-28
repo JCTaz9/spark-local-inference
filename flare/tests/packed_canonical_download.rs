@@ -463,7 +463,7 @@ fn signed_cache_install_materializes_a_transitive_chain_and_ignores_unselected_h
         deployment: 0,
         rank: None,
     };
-    let verified = protection::verify(
+    let _verified = protection::verify(
         &metadata.envelope,
         std::slice::from_ref(&publisher),
         selection,

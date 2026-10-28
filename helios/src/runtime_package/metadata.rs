@@ -393,7 +393,6 @@ fn unverified_payload(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
 
     #[test]

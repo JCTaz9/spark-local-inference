@@ -1,9 +1,12 @@
 """Installation-file patching, dependency checks, and automatic preparation startup."""
 
+import functools
 import os
+import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -21,11 +24,12 @@ from ignition.patches.__main__ import main
 
 @pytest.fixture
 def installation(monkeypatch, tmp_path):
-    """Install distribution metadata and the exact source contexts from both diffs."""
-    for name in ("triton_heuristics", "static_triton_launcher"):
-        monkeypatch.delitem(sys.modules, f"torch._inductor.runtime.{name}", raising=False)
+    """Install distribution metadata and exact source contexts from bundled diffs."""
+    for name in ("torch._inductor.runtime.triton_heuristics", "torch._inductor.runtime.static_triton_launcher",
+                 "triton.runtime.build"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
     sources, expected, diffs = {}, {}, []
-    for name in ("torch-inductor-triton-cache-filenames.patch", "torch-inductor-cooperative-static-launch.patch"):
+    for name in patches._PATCHES:
         diff = files(patches).joinpath(name).read_text(encoding="utf-8")
         diffs.append(diff)
         relative = None
@@ -69,7 +73,7 @@ def test_preparation_startup_applies_patches_without_importing_torch(installatio
 
 
 def test_repeated_startup_keeps_files_and_reinstall_reapplies_patches(installation):
-    assert len(patches.apply()) == 2
+    assert len(patches.apply()) == 3
     installed = {relative: (installation.root / relative).stat() for relative in installation.sources}
     assert patches.apply() == ()
     for relative, before in installed.items():
@@ -77,11 +81,11 @@ def test_repeated_startup_keeps_files_and_reinstall_reapplies_patches(installati
         assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
     for relative, source in installation.sources.items():
         (installation.root / relative).write_bytes(source)
-    assert len(patches.apply()) == 2
+    assert len(patches.apply()) == 3
     assert_patched(installation)
 
 
-@pytest.mark.parametrize("patch_index", [0, 1])
+@pytest.mark.parametrize("patch_index", [0, 1, 2])
 @pytest.mark.parametrize("partial", [False, True])
 def test_existing_manual_patch_is_accepted(installation, patch_index, partial):
     for relative, before, after in patches._hunks(installation.diffs[patch_index]):
@@ -120,11 +124,14 @@ def test_incompatible_dependency_versions_fail_before_writes(installation, name,
 
 
 @pytest.mark.parametrize("ambiguous", [False, True])
-def test_incompatible_context_fails_before_any_file_is_written(installation, ambiguous):
-    relative = "torch/_inductor/runtime/static_triton_launcher.py"
+@pytest.mark.parametrize("relative, marker", [
+    ("torch/_inductor/runtime/static_triton_launcher.py", "self.full_constexprs = constants"),
+    ("triton/runtime/build.py", "from platform import machine, system, architecture"),
+])
+def test_incompatible_context_fails_before_any_file_is_written(installation, ambiguous, relative, marker):
     path = installation.root / relative
     source = path.read_text()
-    path.write_text(source + source if ambiguous else source.replace("self.full_constexprs = constants", "pass"))
+    path.write_text(source + source if ambiguous else source.replace(marker, "pass"))
     before = {relative: (installation.root / relative).read_bytes() for relative in installation.sources}
     with pytest.raises(PreparationError, match="context is missing or ambiguous"):
         patches.apply()
@@ -132,12 +139,61 @@ def test_incompatible_context_fails_before_any_file_is_written(installation, amb
         assert (installation.root / relative).read_bytes() == source
 
 
-def test_imported_inductor_module_requires_process_restart(installation, monkeypatch):
-    monkeypatch.setitem(sys.modules, "torch._inductor.runtime.static_triton_launcher", SimpleNamespace())
+@pytest.mark.parametrize("module", ["torch._inductor.runtime.static_triton_launcher", "triton.runtime.build"])
+def test_imported_patch_target_requires_process_restart(installation, monkeypatch, module):
+    monkeypatch.setitem(sys.modules, module, SimpleNamespace())
     with pytest.raises(PreparationError, match="restart Python"):
         patches.apply()
     for relative, source in installation.sources.items():
         assert (installation.root / relative).read_bytes() == source
+
+
+def test_triton_target_uses_its_own_distribution(installation, monkeypatch, tmp_path):
+    root = tmp_path / "triton-installation"
+    target = root / "triton/runtime/build.py"
+    target.parent.mkdir(parents=True)
+    shutil.move(installation.root / "triton/runtime/build.py", target)
+    metadata = next(installation.root.glob("triton-*.dist-info"))
+    shutil.move(metadata, root / metadata.name)
+    monkeypatch.syspath_prepend(str(root))
+    changed = patches.apply()
+    assert target in changed
+    assert target.read_text() == installation.expected["triton/runtime/build.py"]
+    assert not (installation.root / "triton/runtime/build.py").exists()
+
+
+def test_already_patched_imported_triton_module_is_accepted(installation, monkeypatch):
+    target = installation.root / "triton/runtime/build.py"
+    target.write_text(installation.expected["triton/runtime/build.py"])
+    monkeypatch.setitem(sys.modules, "triton.runtime.build", SimpleNamespace())
+    assert len(patches.apply()) == 2
+    assert_patched(installation)
+
+
+@pytest.mark.parametrize("target", ["triton/runtime/cache.py", "triton/build.py", "numpy/runtime/build.py"])
+def test_patch_targets_remain_restricted(target):
+    diff = f"diff --git a/{target} b/{target}\n@@ -1 +1 @@\n-before\n+after\n"
+    with pytest.raises(PreparationError, match="must modify existing"):
+        list(patches._hunks(diff))
+
+
+def test_patched_platform_key_does_not_launch_a_subprocess(installation, monkeypatch):
+    def reject_subprocess(*args, **kwargs):
+        raise AssertionError("platform_key launched a subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", reject_subprocess)
+    target = installation.root / "triton/runtime/build.py"
+    if sys.platform == "linux":
+        original = {"functools": functools}
+        exec(compile(target.read_text(), str(target), "exec"), original)
+        with pytest.raises(AssertionError, match="launched a subprocess"):
+            original["platform_key"]()
+    patches.apply()
+    patched = {"functools": functools}
+    exec(compile(target.read_text(), str(target), "exec"), patched)
+    assert patched["platform_key"]() == f"{platform.machine()},{platform.system()},{struct.calcsize('P') * 8}bit"
+    assert patched["platform_key"]() == patched["platform_key"]()
+    assert patched["platform_key"].cache_info().hits == 2
 
 
 def test_simultaneous_startup_produces_the_same_patched_files(installation):
@@ -149,7 +205,7 @@ def test_simultaneous_startup_produces_the_same_patched_files(installation):
 
 def test_explicit_entry_point_reports_errors_and_repeated_application(installation, capsys):
     assert main() == 0
-    assert capsys.readouterr().out.count("Patched ") == 2
+    assert capsys.readouterr().out.count("Patched ") == 3
     assert main() == 0
     assert capsys.readouterr().out == ""
     next(installation.root.glob("triton-*.dist-info/METADATA")).write_text("Name: triton\nVersion: 3.7.0\n")

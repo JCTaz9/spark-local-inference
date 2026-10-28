@@ -1,4 +1,4 @@
-"""Apply Inductor fixes in the Python environment selected by uv run."""
+"""Apply bundled Inductor and Triton fixes in the selected Python environment."""
 
 import sys
 

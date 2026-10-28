@@ -24,6 +24,7 @@ pub enum OutputPipeline {
     Dsml(super::dsml::DsmlOutput<false>),
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
+    Recipient(super::recipient::RecipientOutput),
     MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
     GemmaCall(TaggedOutput<super::gemma_call::GemmaCall>),
     Text(TaggedOutput<PlainText>),
@@ -49,6 +50,7 @@ macro_rules! dispatch {
             OutputPipeline::Dsml($parser) => $body,
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
+            OutputPipeline::Recipient($parser) => $body,
             OutputPipeline::MiniMaxXml($parser) => $body,
             OutputPipeline::GemmaCall($parser) => $body,
             OutputPipeline::Text($parser) => $body,
@@ -65,6 +67,7 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
+            Some((ToolParserKind::Atem, _, _)) => Self::Recipient(super::recipient::RecipientOutput::new(config.content, config.control_tokens)),
             Some((ToolParserKind::QwenCoder, 0, _)) => Self::CompactFunctionTags(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
@@ -98,10 +101,10 @@ impl OutputPipeline {
 
     /// Whether the parser `new` selects gates reasoning delimiters by token identity.
     /// DSML recognizes its markup in the recipe crate's text state machine, and XTML
-    /// carries its own control tokens.
+    /// and recipient-header framing carry their own control tokens.
     pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
         match syntax.tools.as_ref().map(|t| t.kind) {
-            Some(ToolParserKind::Dsml | ToolParserKind::Xtml) => false,
+            Some(ToolParserKind::Dsml | ToolParserKind::Xtml | ToolParserKind::Atem) => false,
             Some(
                 ToolParserKind::QwenCoder
                 | ToolParserKind::GlmArgumentTags
@@ -119,6 +122,13 @@ impl OutputPipeline {
             .as_ref()
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
+            Some((ToolParserKind::Atem, _, _)) => Some(crate::grammar::OutputEnvelope {
+                recipient: Some(crate::grammar::RecipientEnvelope {
+                    start: config.content.start,
+                    tools: config.content.tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect(),
+                }), reasoning_end: None, tool: None, function: None,
+                tool_ends_reasoning: false, response: None, tool_body_start: false,
+            }),
             Some((ToolParserKind::QwenCoder, 0, _)) => {
                 TaggedOutput::<super::chatml::FunctionTags<false>>::grammar_envelope(
                     &config.content,
@@ -139,6 +149,7 @@ impl OutputPipeline {
                 super::dsml::DsmlOutput::<false>::grammar_envelope(&config.content)
             }
             Some((ToolParserKind::Xtml, _, _)) => Some(crate::grammar::OutputEnvelope {
+                recipient: None,
                 reasoning_end: config
                     .content
                     .start
@@ -158,6 +169,7 @@ impl OutputPipeline {
                 TaggedOutput::<super::gemma_call::GemmaCall>::grammar_envelope(&config.content)
             }
             None => Some(crate::grammar::OutputEnvelope {
+                recipient: None,
                 reasoning_end: (config.content.start == super::tagged::OutputStart::Reasoning)
                     .then_some("</think>"),
                 tool: None,

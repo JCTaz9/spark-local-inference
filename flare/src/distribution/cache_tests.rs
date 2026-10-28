@@ -380,7 +380,7 @@ fn empty_platform_uses_unknown_device_and_keeps_signed_closure() {
 
 #[test]
 fn warm_reference_rebuilds_a_different_signed_envelope() {
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use ring::signature::Ed25519KeyPair;
 
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
     let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -435,7 +435,7 @@ fn warm_reference_rebuilds_a_different_signed_envelope() {
 
 #[test]
 fn local_package_branch_rejects_a_different_signed_envelope() {
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use ring::signature::Ed25519KeyPair;
 
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
     let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -498,7 +498,7 @@ fn local_package_branch_rejects_a_different_signed_envelope() {
 
 #[test]
 fn cold_wrong_expected_envelope_does_not_publish_a_default() {
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use ring::signature::Ed25519KeyPair;
 
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
     let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -1128,7 +1128,6 @@ fn failed_verification_leaves_the_previous_default_untouched() {
 
 #[test]
 fn corrupted_warm_rank_entry_is_rebuilt_and_republished() {
-    use std::io::Write as _;
 
     let temp = tempfile::tempdir().unwrap();
     let model_root = temp.path().join("flare");

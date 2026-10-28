@@ -68,7 +68,7 @@ class RecurrentAttention(torch.nn.Module):
 
 class FullAttention(torch.nn.Module):
     def __init__(self, module, weights, source, metadata, pool, layer, *, mode, session, workspace, name, buffers,
-                 cache_only=False, projection_staging=None):
+                 projection_staging=None):
         super().__init__()
         self.canonical, self.metadata = module, metadata
         config = weights.config
@@ -88,13 +88,12 @@ class FullAttention(torch.nn.Module):
         self.attended, self.output = empty("attended", self.heads * self.dim), empty("output", config.hidden)
         prefix = f"layers.{layer}.self_attn."
         def projection(field, inputs, output):
-            weight = (getattr(module, field).weight if layer == "draft"
-                      else weights.projections[prefix + field])
+            weight = weights.projections[prefix + field]
             if isinstance(weight, TensorFP8Weight):
                 return TensorFP8Projection(inputs, weight, output, session=session, name=name + "." + field,
                                            staging=projection_staging)
             return UnquantizedProjection(inputs, weight, output, session=session, name=name + "." + field)
-        operands = (("k_proj", source, self.k), ("v_proj", source, self.v)) if cache_only else (
+        operands = (
             ("q_proj", source, self.qg), ("k_proj", source, self.k),
             ("v_proj", source, self.v), ("o_proj", self.attended, self.output))
         self.projections = {
@@ -106,7 +105,7 @@ class FullAttention(torch.nn.Module):
         key_cache, value_cache = pool.attention(layer, config)
         self.writer = PreparedPagedKVWriter(self.key, self.v.view(tokens, self.kv_heads, self.dim),
             key_cache, value_cache, self.slots, session=session, name=name + ".write")
-        self.attention = None if cache_only else PreparedPagedAttention(self.q, key_cache, value_cache, metadata.page_table,
+        self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, metadata.page_table,
             self.lengths, metadata.query_start_loc, self.attended.view(tokens, self.heads, self.dim),
             mode=mode, width=metadata.max_query_tokens if mode == "verify" else 1,
             session=session, workspace=workspace, name=name + ".attention")
@@ -114,7 +113,7 @@ class FullAttention(torch.nn.Module):
     def write_cache(self, hidden_states, position_embeddings):
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
-        for field in (("q_proj", "k_proj", "v_proj") if self.attention is not None else ("k_proj", "v_proj")):
+        for field in ("q_proj", "k_proj", "v_proj"):
             self.projections[field](hidden_states)
         query, gate = self.qg.view(-1, self.heads, 2 * self.dim).chunk(2, dim=-1)
         q, k = apply_rotary_pos_emb(self.canonical.q_norm(query),
@@ -193,7 +192,8 @@ class PreparedDecoder:
             name=name + ".prompt", copy_source=True)
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto")
-        self.auxiliary = zeros(source.shape) if weights.draft is not None else None
+        self.auxiliary = (zeros((source.shape[0], config.hidden * len(config.draft.target_layers)))
+                          if weights.draft is not None else None)
         self.replay = None
         if mode == "verify":
             self.commit_counts = torch.zeros(metadata.starts.numel(), dtype=torch.int32, device=source.device)
@@ -228,10 +228,12 @@ class PreparedDecoder:
         embedding = torch.cat((frequency, frequency), dim=-1)
         position_embeddings = embedding.cos().bfloat16(), embedding.sin().bfloat16()
         hidden = self.embedding()
-        for layer in self.layers:
+        taps = () if self.auxiliary is None else self.weights.config.draft.target_layers
+        for index, layer in enumerate(self.layers):
             hidden = layer(hidden, position_embeddings=position_embeddings)
-        if self.auxiliary is not None:
-            self.auxiliary.copy_(self.weights.tree.norm(hidden))
+            if index in taps:
+                column = taps.index(index) * hidden.shape[-1]
+                self.auxiliary[:, column:column + hidden.shape[-1]].copy_(hidden)
         if self.scoring is not None:
             self.scoring.source.copy_(self.weights.tree.norm(hidden))
             self.scoring()

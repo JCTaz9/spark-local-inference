@@ -188,7 +188,7 @@ pub(super) fn scalar_parameter_value(raw: &str, schema: Option<&Value>) -> Value
         .unwrap_or_else(|| Value::String(raw.into()))
 }
 
-fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
+pub(super) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
     let mut value = scalar_parameter_value(raw, schema);
     if let Some(schema) = schema {
         match &mut value {

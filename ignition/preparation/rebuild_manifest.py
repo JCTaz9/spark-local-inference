@@ -218,6 +218,10 @@ def from_plan(model, plan, *, compiled_forwards):
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
         collective_tuning=plan.collective_tuning)
+    if plan.collective_ladder is not None:
+        import json
+
+        result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
     if plan.shard_hyperconnections:

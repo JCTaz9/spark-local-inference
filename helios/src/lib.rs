@@ -1,5 +1,6 @@
 pub mod cache;
 mod cuda;
+#[cfg_attr(not(feature = "runtime-package"), allow(dead_code))]
 pub mod engram;
 pub mod error;
 pub mod execution;

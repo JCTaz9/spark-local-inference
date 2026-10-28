@@ -299,7 +299,8 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     path.write_text(configuration_text.format(alias=model.checkpoint.alias))
     configuration = Configuration.load(path)
     if expected is None:
-        expected = (4, 4096, 6) if model.recipe.name == "gemma4" else (32, 4096, 128)
+        expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
+                    (4, 4096, 32) if model.recipe.name == "muse_spark" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -308,6 +309,11 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     if model.recipe.name != "mimo_v2":
         devices = tuple(replace(device, total_bytes=256 * GIB, free_bytes=255 * GIB) for device in devices)
     host = preparation.Host(devices, None)
+    if expected[0] > model.recipe.max_concurrency:
+        with pytest.raises(UsageError, match="concurrency"):
+            preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
+                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
+        return
     plan = preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
     assert plan.world_size == world_size
@@ -641,9 +647,12 @@ def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_p
     bootstrap = import_module(f"ignition.recipes.{recipe.name}.bootstrap")
     assert recipe.collective_tuning == "static"
     assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
-    world = min(recipe.tensor_parallel)
+    from ignition.preparation.collective_ladder import load
+
+    world = min((size for size in recipe.tensor_parallel if size > 1), default=1)
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") | {"world_size": world} if mode == "runtime" and world in (2, 3, 4, 6, 8, 10) else None
     devices = tuple(replace(gpu(i, 4096), total_bytes=4096 * GIB) for i in range(world))
-    plan = replace(derive(model=recipe, gpus=devices, speculation=None), collective_tuning=mode)
+    plan = replace(derive(model=recipe, gpus=devices, selected=tuple(range(world)), speculation=None), collective_tuning=mode, collective_ladder=ladder)
     original = bootstrap.PreparationConfig
 
     class Captured(Exception):
@@ -652,6 +661,8 @@ def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_p
     def config(**kwargs):
         assert kwargs["collective_tuning"] == mode
         assert original(**kwargs).collective_tuning == mode
+        assert kwargs["collective_ladder"] is ladder
+        assert original(**kwargs).collective_ladder is ladder
         raise Captured
 
     monkeypatch.setattr(bootstrap, "PreparationConfig", config)
@@ -668,6 +679,29 @@ def test_cli_derive_carries_resolved_collective_policy(tmp_path, configured, fla
     values = {} if configured is None else {"preparation": {"collective_tuning": configured}}
     config = Configuration(tmp_path / "config.toml", values, False)
     model = ResolvedModel(replace(SOLO, collective_tuning="runtime"), SOLO.checkpoints[0])
-    plan = cli_derive(config, model, Host((gpu(0, 95),), None), gpus=None,
-                      concurrency=Setting(4, "flag"), speculation=None, collective_tuning=flag)
+    plan = cli_derive(config, model, Host(tuple(gpu(i, 95) for i in range(4)), None), gpus="0-3",
+                      concurrency=Setting(4, "flag"), speculation=None, collective_tuning=flag,
+                      collective_ladder="ignition/preparation/ladders/gb202_pcie_tp4.json" if expected == "runtime" else None)
     assert plan.collective_tuning == expected
+
+
+def test_collective_ladder_plan_and_rebuild_round_trip():
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation.collective_ladder import load
+
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
+    base = derive(gpus=tuple(gpu(i, 95) for i in range(4)), selected=(0, 1, 2, 3))
+    plan = replace(base, collective_tuning="runtime", collective_ladder=ladder)
+    assert plan.to_dict()["collective_ladder"] == ladder
+    manifest = rebuild_manifest.from_plan(ResolvedModel(SOLO, SOLO.checkpoints[0]), plan, compiled_forwards=True)
+    encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+    decoded = proto.RebuildManifest.FromString(encoded.SerializeToString())
+    assert json.loads(decoded.collective_ladder_json) == ladder
+    with pytest.raises(UsageError, match="runtime"):
+        replace(plan, collective_tuning="static")
+    with pytest.raises(UsageError, match="TP size"):
+        replace(derive(), collective_tuning="runtime", collective_ladder=ladder)
+    with pytest.raises(UsageError, match="compute capability"):
+        replace(base, gpus=tuple(replace(g, capability=(12, 1)) for g in base.gpus),
+                collective_tuning="runtime", collective_ladder=ladder)
