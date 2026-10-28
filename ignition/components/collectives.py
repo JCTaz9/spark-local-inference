@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from b12x.preparation import CollectiveRequirement, PreparedCall
+from b12x.preparation import AutotuneEffort, CollectiveRequirement, PreparedCall
 
 from ignition.preparation.tuning import declare, register_finalizer
 
@@ -54,6 +54,8 @@ def _roce_plan(runtime, coordinator, surface):
 @torch.library.custom_op("flare::pcie_all_reduce", mutates_args=("output",))
 def _all_reduce(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, plan=owner.plan)
 
 
@@ -76,6 +78,7 @@ class PreparedAllReduce:
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -118,7 +121,13 @@ class PreparedAllReduce:
             if (runtime.world_size < 2 or runtime.algorithm != "oneshot"
                     or not runtime.single_channel):
                 raise ValueError("prepared PCIe reductions require single-channel b12x direct all-reduce")
-            self.plan = runtime.plan(source, out=output)
+            from b12x.comm.pcie import joint_finalist_policy
+
+            channel = runtime.for_stream()
+            startup_joint = (getattr(session, "collective_tuning", "static") == "runtime"
+                             and source.dtype == torch.bfloat16
+                             and getattr(channel, "_joint_workspace", None) is not None)
+            self.plan = runtime.plan(source, out=output, **({"joint_only": True} if startup_joint else {}))
             group = runtime.exchange_group
 
             def prepare(state):
@@ -131,9 +140,16 @@ class PreparedAllReduce:
                                     output=output, owners=(runtime, source, output))
 
         ranks = tuple(dist.get_process_group_ranks(group))
+        options = {}
+        startup_joint = startup_joint and session._autotune_effort is not AutotuneEffort.OFF
+        if startup_joint:
+            options["finalist_policy"] = joint_finalist_policy()
         request = self.plan.request(name=name, prepare_call=prepare,
-            collective=CollectiveRequirement(key=name, ranks=ranks))
+            collective=CollectiveRequirement(key=name, ranks=ranks), **options)
         declare(session, (request,), coordinator=coordinator)
+        if startup_joint:
+            from ignition.preparation.startup_tuning import register_collective
+            register_collective(self, session)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 

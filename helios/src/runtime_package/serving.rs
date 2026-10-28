@@ -1,7 +1,7 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding},
+    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding, TunedBinding, TuningGraphDescriptor},
 };
 
 impl NativeResources {
@@ -47,6 +47,9 @@ impl NativeResources {
                     .position(|name| *name == g.name)
                     .ok_or_else(|| invalid("execution references an unknown graph"))?;
                 Ok(GraphDescriptor {
+                    tuned_bindings: g.tuned_bindings.iter().map(|binding| TunedBinding {
+                        buffer: binding.buffer.clone(), tuning_graph: binding.tuning_graph.clone(),
+                    }).collect(),
                     confidence_width: g.confidence_width as usize,
                     draft_tokens: if g.kind == "speculative" {
                         g.draft_tokens.ok_or_else(|| {
@@ -78,7 +81,16 @@ impl NativeResources {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let tuning_graphs = execution.tuning_graphs.iter().map(|graph| {
+            let index = self.names.iter().position(|name| *name == graph.name)
+                .ok_or_else(|| invalid("tuning metadata references an unknown graph"))?;
+            Ok(TuningGraphDescriptor {
+                name: graph.name.clone(), handle: self.executables[index] as usize,
+                outputs: graph.outputs.clone(), status_buffer: graph.status_buffer.clone(),
+            })
+        }).collect::<Result<Vec<_>>>()?;
         let manifest = ExecutionManifest {
+            tuning_graphs,
             collectives: None,
             engram: None,
             cache: self.cache.clone(),

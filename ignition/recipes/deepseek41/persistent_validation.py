@@ -95,7 +95,7 @@ def _rms(actual, source, weight, epsilon, role):
     _check(actual, exact, exact.abs() * relative + _rounding(actual), role)
 
 
-def _rotated_dot(actual, left, right, angles, *, extra=0, role):
+def _rotated_dot(actual, left, right, angles, positions, *, extra=0, role):
     exact = left @ right.T
     error = _gamma(left.shape[1] + extra) * (left.abs() @ right.abs().T)
     # The projection rounds to BF16 before rotary multiplication.
@@ -124,6 +124,9 @@ def _rotated_dot(actual, left, right, angles, *, extra=0, role):
         + _gamma(3) * (odd * cosine).abs()
         + _gamma(3) * (even * sine).abs()
     )
+    inactive = positions < 0
+    rotated[inactive] = 0
+    error[inactive] = 0
     _check(
         actual.view_as(rotated),
         rotated,
@@ -168,12 +171,15 @@ def _mix(layer, residual, kind, post, comb, pre):
 def _prologue(layer, channel, case):
     scratch = layer.scratch
     rows = scratch.mlp_output.shape[0]
-    if not torch.equal(scratch.attention_hc.residual, case.residual):
+    saved = {target.data_ptr(): value for target, value in case.inputs}
+    residual = saved[scratch.residual.data_ptr()]
+    pre_mix = saved[scratch.pre_mix.data_ptr()]
+    if not torch.equal(scratch.attention_hc.residual, residual):
         raise AssertionError(
             "carry prologue changes the fixture's identity residual handoff"
         )
     collapse = (
-        (case.pre_mix.double()[..., None] * case.residual.double()).sum(1).bfloat16()
+        (pre_mix.double()[..., None] * residual.double()).sum(1).bfloat16()
     )
     _rms(
         scratch.attention_hc.normalized,
@@ -247,6 +253,9 @@ def _prologue(layer, channel, case):
         + even_error * sine.abs()
         + _gamma(3) * ((odd * cosine).abs() + (even * sine).abs())
     )
+    inactive = layer.metadata.positions < 0
+    exact[inactive] = 0
+    error[inactive] = 0
     _check(
         scratch.attention.window_values,
         exact,
@@ -259,6 +268,7 @@ def _prologue(layer, channel, case):
         query,
         _weight(layer.weights.attention["q_b"].weight),
         layer.persistent_angles.values,
+        layer.metadata.positions,
         role="prologue query projection and rotary output",
     )
 

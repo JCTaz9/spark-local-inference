@@ -489,12 +489,13 @@ mod tests {
 
     #[test]
     fn rebuild_wire_tags_keep_upstream_joint_tuning_separate_from_persistent_decoder() {
-        // Upstream field 23 selects joint attention-plan tuning, which this
-        // runtime leaves uninterpreted.
+        // Field 23 selects joint attention-plan tuning independently of
+        // persistent decoder preparation.
         let upstream = [0x08, 0x01, 0xb8, 0x01, 0x01];
         let decoded = wire::RebuildManifest::decode(upstream.as_slice()).unwrap();
         assert_eq!(decoded.version, 1);
         assert!(!decoded.persistent_decoder);
+        assert!(decoded.joint_tuning);
 
         // Persistent decoder uses field 26, and vocabulary sampling retains
         // speculation field 11 inside the existing field 18 message.
@@ -640,11 +641,13 @@ mod tests {
             graphs: vec![],
             reservations: vec![],
             execution: Some(wire::Execution {
+                tuning_graphs: vec![],
                 abi_version: 9,
                 max_active: 32,
                 input_frame_bytes: 0,
                 buffers: vec![],
                 graphs: vec![wire::ExecutionGraph {
+                    tuned_bindings: vec![],
                     confidence_width: 0,
                     name: "decode_b32".into(),
                     kind: "decode".into(),

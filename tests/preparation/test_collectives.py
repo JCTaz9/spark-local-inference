@@ -258,51 +258,30 @@ def test_sharded_tuning_reconciles_every_cache_and_adopts_each_race_fastest_resu
 
 
 def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
-    from ignition.preparation.collectives import _winners
+    from ignition.preparation.collectives import _tuning_results
 
-    winners = _winners([race("b", 5.0, 4), race("a", 2.0, 1), race("b", 5.0, 2), race("a", 3.0, 0),
+    winners = _tuning_results([race("b", 5.0, 4), race("a", 2.0, 1), race("b", 5.0, 2), race("a", 3.0, 0),
                         race("a", 0, 0, assignment=False)])
     assert [(item.key, item.candidate_index) for item in winners] == [("a", 1), ("b", 2)]
     with pytest.raises(RuntimeError, match="no rank completed"):
-        _winners([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
+        _tuning_results([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
-def test_sharded_finalists_relay_every_rank_including_an_empty_shard(monkeypatch):
+def test_sharded_finalists_preserve_empty_shards_and_rank_order():
+    from dataclasses import replace
     from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
-    from ignition.preparation.collectives import _winners
+    from ignition.preparation.collectives import _tuning_results
 
-    ranks = (4, 7)
-    policy = FinalistPolicy(family_fields=("split_k_slices",), per_family=1, max_total=2)
-    first = TuningRequirement("qkv", ranks, {"candidate": 4}, 5.0, 4,
-        finalists=(FinalistRecord(assignment=FrozenMapping({"candidate": 4}),
-            family=FrozenMapping({"split_k_slices": 1}), candidate_index=4, latency_us=5.0),),
-        finalist_policy=policy)
-    empty = TuningRequirement("qkv", ranks, None, None, None, rejected_count=2,
-        finalist_policy=policy)
-    slower = TuningRequirement("gemm", ranks, {"candidate": 0}, 10.0, 0)
-    faster = TuningRequirement("gemm", ranks, {"candidate": 1}, 8.0, 1)
-
-    assert _winners((first, slower, empty, faster)) == (faster, first, empty)
-    with pytest.raises(ValueError, match="every declared rank"):
-        _winners((first,))
+    policy = FinalistPolicy(family_fields=("width",))
+    assignment = FrozenMapping({"width": 1})
+    first = TuningRequirement("qkv", (0, 1, 2, 3), assignment, 5., 0,
+        finalist_policy=policy,
+        finalists=(FinalistRecord(assignment=assignment, family=assignment, candidate_index=0, latency_us=5.),))
+    shards = (first, *(replace(first, assignment=None, latency_us=None, candidate_index=None,
+                              finalists=()) for _ in range(3)))
+    assert _tuning_results(shards) == shards
     with pytest.raises(ValueError, match="policies differ"):
-        _winners((first, TuningRequirement("qkv", ranks, None, None, None,
-            finalist_policy=FinalistPolicy(family_fields=("tile_n",)))))
-
-    owner = coordinator(monkeypatch)
-    blank = dict(done=False, ready_collectives=(), ready_cache=None,
-        ready_tuning=(), ready_collective_tuning=None)
-    states = [SimpleNamespace(**{**blank, "ready_tuning": (first, slower)}),
-              SimpleNamespace(**{**blank, "done": True})]
-    peers = [(False, (), None, None, (empty, faster), None),
-             (True, (), None, None, (), None)]
-    advances = []
-    job = SimpleNamespace(advance=lambda **kwargs: advances.append(kwargs) or states.pop(0),
-                          result=lambda: "prepared")
-    monkeypatch.setattr(dist, "all_gather_object",
-        lambda results, local, **kwargs: results.__setitem__(slice(None), [local, peers.pop(0)]))
-    assert owner.prepare(SimpleNamespace(begin=lambda *args, **kwargs: job), ()) == "prepared"
-    assert advances == [{"collective_key": None}, {"tuning": (faster, first, empty)}]
+        _tuning_results((first, replace(shards[1], finalist_policy=None)))
 
 
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
@@ -347,3 +326,18 @@ def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatc
     assert "'missing': 1200, 'extra': 1200" in str(error.value)
     assert len(str(error.value)) < 500
     assert closed == [True]
+
+
+@pytest.mark.parametrize("mode", [None, "static", "runtime"])
+def test_joint_workspace_is_provisioned_only_for_runtime_selection(monkeypatch, mode):
+    from b12x.comm.pcie import AllReduce
+    from ignition.preparation.collectives import create_all_reduce_runtime
+
+    calls = []
+    result, group, device, ipc = object(), object(), object(), object()
+    monkeypatch.setattr(AllReduce, "from_exchange_group", lambda **kwargs: calls.append(kwargs) or result)
+    options = {} if mode is None else {"collective_tuning": mode}
+    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc, **options) is result
+    assert calls == [dict(exchange_group=group, device=device, single_channel=True,
+                         max_size=32 * 2560 * 2, eager_buffer_bytes=32 * 2560 * 2,
+                         ipc=ipc, joint=mode == "runtime")]

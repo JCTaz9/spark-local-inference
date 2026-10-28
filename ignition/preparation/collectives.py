@@ -49,7 +49,8 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         package_storage.transports.append(runtime)
     return runtime
 
-def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2):
+def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
+                              collective_tuning="static"):
     """Allocate one b12x IPC channel for the largest hidden activation.
 
     Every rank supplies identical capacities before preparing graph variants.
@@ -61,11 +62,14 @@ def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=Non
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
+    if collective_tuning not in ("static", "runtime"):
+        raise ValueError("collective_tuning must be static or runtime")
     nbytes = max_tokens * hidden_size * element_bytes
     if nbytes % 16:
         raise ValueError("all-reduce capacity must occupy complete 16-byte packs")
     return AllReduce.from_exchange_group(exchange_group=group, device=device, single_channel=True,
-                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc)
+                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc,
+                                         joint=collective_tuning == "runtime")
 
 
 def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
@@ -134,28 +138,25 @@ def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head
         total_heads=heads, head_dim=head_dim, query_head_dim=query_head_dim, stream_affine=False, ipc=ipc)
 
 
-def _winners(contributions):
-    """Select ordinary winners and relay every finalist shard in rank order."""
-    members = {}
+def _tuning_results(contributions):
+    """Forward finalist shards in rank order and select ordinary race winners."""
+    races = {}
     for item in contributions:
-        members.setdefault(item.key, []).append(item)
-    selected = []
-    for key in sorted(members):
-        shards = members[key]
-        policy = getattr(shards[0], "finalist_policy", None)
-        if any(getattr(item, "finalist_policy", None) != policy for item in shards):
+        races.setdefault(item.key, []).append(item)
+    results = []
+    for key in sorted(races):
+        members = races[key]
+        policy = getattr(members[0], "finalist_policy", None)
+        if any(getattr(item, "finalist_policy", None) != policy for item in members):
             raise ValueError("sharded finalist policies differ across ranks")
         if policy is not None:
-            ranks = shards[0].ranks
-            if len(shards) != len(ranks) or any(item.ranks != ranks for item in shards):
-                raise ValueError("finalist tuning requires every declared rank's shard")
-            selected.extend(shards)
-            continue
-        ready = [item for item in shards if item.assignment is not None]
-        if not ready:
-            raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
-        selected.append(min(ready, key=lambda item: (item.latency_us, item.candidate_index)))
-    return tuple(selected)
+            results.extend(members)
+        else:
+            completed = [item for item in members if item.assignment is not None]
+            if not completed:
+                raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
+            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+    return tuple(results)
 
 
 class CollectivePreparation:
@@ -165,8 +166,9 @@ class CollectivePreparation:
     coordinator releases a collective only after all group members report the
     same declaration. When the session shards tuning, it also relays b12x's
     two exchanges: every rank's cached selections, which b12x reconciles in
-    rank order, and each race's fastest result among the ranks' disjoint
-    candidate shares. It is unused after graph handoff.
+    rank order, and candidate results. Ordinary races use the fastest result;
+    finalist races retain every shard for b12x to consolidate. It is unused
+    after graph handoff.
     """
 
     def __init__(self, group, *, timeout=timedelta(minutes=2)):
@@ -299,8 +301,8 @@ class CollectivePreparation:
                                 differences[rank] = {"missing": len(missing), "extra": len(extra),
                                                      "examples": sorted(missing | extra)[:2]}
                         raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    winners = _winners(contribution for item in states for contribution in item[4])
-                    authorization = {"tuning": winners[0] if len(winners) == 1 else winners}
+                    results = _tuning_results(contribution for item in states for contribution in item[4])
+                    authorization = {"tuning": results[0] if len(results) == 1 else results}
                     continue
                 ready = [item[1] for item in states]
                 if all(ready):

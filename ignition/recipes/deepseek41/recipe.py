@@ -20,10 +20,10 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "draft_head_quantization": speculation.draft_head_quantization,
         "markov_head_quantization": speculation.markov_head_quantization,
         "vocabulary_parallel_sampling": speculation.vocabulary_parallel_sampling}
-    config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
-        persistent_decoder=plan.persistent_decoder,
+        persistent_decoder=plan.persistent_decoder, joint_tuning=plan.joint_tuning,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,

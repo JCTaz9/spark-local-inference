@@ -11,48 +11,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-class Fixture:
-    def __init__(self, layer, pool, cases, signature):
-        self.layer, self.pool, self.cases, self.target_signature = (
-            layer,
-            pool,
-            tuple(cases),
-            signature,
-        )
-        self.layer_index, self.state_row, self.TARGET_TOKENS = 0, 1, 8
-        self.active_case = None
-        self.tune_seeds = (cases[0].seed, cases[1].seed)
+from ignition.recipes.deepseek41.contextual_tuning import CatalogLayerFixture
 
-    def _check_layer(self, layer):
-        assert (
-            layer.metadata is self.layer.metadata
-            and layer.weights is self.layer.weights
-        )
 
-    def _poison(self, layer):
-        from ignition.recipes.deepseek41.contextual_tuning import CatalogLayer0Fixture
-
-        CatalogLayer0Fixture._poison(self, layer)
-
-    def _restore(self, case, layer):
-        from ignition.recipes.deepseek41.contextual_tuning import CatalogLayer0Fixture
-
-        CatalogLayer0Fixture._restore(self, case, layer)
-        if layer.carry:
-            scratch = layer.scratch
-            scratch.mlp_output.zero_()
-            scratch.ffn_hc.residual.copy_(case.residual)
-            scratch.ffn_hc.post.zero_()
-            scratch.ffn_hc.comb.copy_(
-                torch.eye(4, device=scratch.residual.device).expand(8, 4, 4)
-            )
-
-    def restore_tune(self, layer, case_index=0):
-        self._poison(layer)
-        self._restore(self.cases[case_index], layer)
+class Fixture(CatalogLayerFixture):
+    """Use catalog input restoration and inspect one routed expert's packed weights."""
 
     def validate_numeric(self, layer):
-        from ignition.recipes.deepseek41.contextual_tuning import CatalogLayer0Fixture
+        from ignition.recipes.deepseek41.contextual_tuning import CatalogLayerFixture
 
         if not getattr(self, "anchored", False):
             from ignition.recipes.deepseek41.persistent_moe_reference import (
@@ -105,7 +71,7 @@ class Fixture:
                     flush=True,
                 )
                 del decoded
-        return CatalogLayer0Fixture.validate_numeric(self, layer)
+        return CatalogLayerFixture.validate_numeric(self, layer)
 
 
 class Selection:
@@ -122,9 +88,7 @@ class Selection:
 
 
 def _rank(rank, checkpoint, root, carry):
-    from b12x.attention._shared.mla.compressed_reference import (
-        pack_deepseek_v41_cache_reference,
-    )
+    from types import SimpleNamespace
     from ignition.components.paged_batch import Metadata
     from ignition.components.parallel import TensorParallelShard
     from ignition.preparation.checkpoint import inspect_indexed_checkpoint
@@ -137,10 +101,6 @@ def _rank(rank, checkpoint, root, carry):
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.deepseek41.attention import Rotary
-    from ignition.recipes.deepseek41.contextual_tuning import (
-        _Case,
-        CatalogLayer0Fixture,
-    )
     from ignition.recipes.deepseek41.decoder import PreparedLayer, Scratch
     from ignition.recipes.deepseek41.pool import ContinuationPool
     from ignition.recipes.deepseek41.persistent_selection import PersistentSelection
@@ -221,53 +181,12 @@ def _rank(rank, checkpoint, root, carry):
                     carry=carry,
                     defer_post=False,
                 )
-                cases = []
-                for ordinal in range(3):
-                    generator = torch.Generator().manual_seed(921 + ordinal)
-                    history = (
-                        (torch.randn((128, 512), generator=generator) * 0.125)
-                        .bfloat16()
-                        .to(device)
-                    )
-                    pool.window(0)[1].copy_(
-                        pack_deepseek_v41_cache_reference(
-                            history, page_size=128, cache_kind="swa"
-                        ).reshape_as(pool.window(0)[1])
-                    )
-                    pages = torch.full_like(metadata.page_table, -1)
-                    pages[0, :33] = torch.arange(33, dtype=pages.dtype, device=device)
-                    metadata.set(
-                        torch.tensor([4096], dtype=torch.int64, device=device),
-                        torch.tensor([8], dtype=torch.int32, device=device),
-                        torch.tensor([1], dtype=torch.int64, device=device),
-                        pages,
-                        torch.arange(
-                            1000 + ordinal * 8, 1008 + ordinal * 8, device=device
-                        ).view(1, 8),
-                        torch.ones(1, dtype=torch.int32, device=device),
-                    )
-                    scratch.residual.copy_(
-                        embedding[ordinal * 8 : ordinal * 8 + 8, None, :]
-                    )
-                    scratch.pre_mix.zero_()
-                    scratch.pre_mix[:, 0] = 1
-                    layer.attention.window_metadata()
-                    cases.append(
-                        _Case(
-                            ordinal,
-                            pool.window(0)[1].clone(),
-                            CatalogLayer0Fixture._metadata_snapshot(metadata),
-                            CatalogLayer0Fixture._indices_snapshot(
-                                layer.attention.window_metadata
-                            ),
-                            scratch.residual.clone(),
-                            scratch.pre_mix.clone(),
-                        )
-                    )
-                fixture = Fixture(layer, pool, cases, signature)
+                decoder = SimpleNamespace(layers=(layer,),
+                    weights=SimpleNamespace(config=config, embedding=embedding), vision=None)
+                fixture = Fixture("checkpoint.target", signature, decoder, 0)
                 selector = PersistentSelection(
-                    {},
-                    {},
+                    {"checkpoint": SimpleNamespace(target=SimpleNamespace(decoder=decoder))},
+                    {"checkpoint": signature},
                     ordinary=None,
                     arena=arena,
                     coordinator=coordinator,

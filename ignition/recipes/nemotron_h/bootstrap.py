@@ -48,6 +48,7 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
@@ -149,7 +150,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "headers": [s.header_sha256 for s in manifest.shards],
             "contract": "nemotron-h.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="nemotron-h", numerical_policy="default", coordinator=coordinator,

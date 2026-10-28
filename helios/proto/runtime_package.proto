@@ -98,6 +98,12 @@ message RebuildManifest {
   bool local_checkpoint = 21;
   // Neighbor relays over a chain in rank order; exclusive with roce_ring.
   bool roce_chain = 22;
+  // Preparation-only joint attention-plan selection across the captured text shapes.
+  bool joint_tuning = 23;
+  // Preparation-only lowrank hyperconnection partitioning with BF16 gate-logit reduction.
+  bool shard_hyperconnections = 24;
+  // Preparation-time collective selection policy: static or runtime.
+  string collective_tuning = 25;
   // Preparation compares complete persistent and separated decoder compositions.
   bool persistent_decoder = 26;
 }
@@ -302,6 +308,7 @@ enum GraphOperation {
   SCORED_PREFILL = 12;
 
 }
+message TunedBinding { string buffer = 1; string tuning_graph = 2; }
 message GraphContract {
   string graph = 1;
   repeated ValueBinding inputs = 2;
@@ -313,6 +320,7 @@ message GraphContract {
   // The graph consumes its pending input directly from this persistent device value.
   StateView pending_token = 7;
   GraphOperation kind = 8;
+  repeated TunedBinding tuned_bindings = 9;
 }
 enum ToolParserKind {
   TOOL_PARSER_UNSPECIFIED = 0;
@@ -677,6 +685,12 @@ message Execution {
   uint64 input_frame_bytes = 3;
   repeated Buffer buffers = 4;
   repeated ExecutionGraph graphs = 5;
+  repeated TuningGraph tuning_graphs = 6;
+}
+message TuningGraph {
+  string name = 1;
+  repeated string outputs = 2;
+  string status_buffer = 3;
 }
 message Buffer {
   string name = 1;
@@ -705,6 +719,7 @@ message ExecutionGraph {
   uint64 packed_token_capacity = 13;
   // Number of confidence prefixes produced per request in the selected completion frame.
   uint32 confidence_width = 14;
+  repeated TunedBinding tuned_bindings = 15;
 }
 enum DraftSource { NO_DRAFT = 0; MTP = 1; COPY_DRAFT = 2; }
 message InputBinding { string buffer_name = 1; uint64 host_offset = 2; uint64 nbytes = 3; }

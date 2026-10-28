@@ -80,7 +80,7 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             return Err("copy proposal source requires speculative graphs".into());
         }
     } else if manifest.abi_version != ABI_VERSION {
-        return Err("speculative catalog requires ABI4".into());
+        return Err("speculative catalog requires ABI5".into());
     }
     for graph in &manifest.graphs {
         if matches!(graph.kind, GraphKind::Speculative | GraphKind::Mixed)

@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-pytestmark = pytest.mark.skipif(
+_gpu_only = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1",
     reason="requires four assigned CUDA devices and FLARE_RUN_TP_CUDA_TESTS=1",
 )
@@ -31,17 +31,28 @@ def _operands(rows, columns, step):
 
 
 def _selected_query(operation):
-    plan = operation.plan
-    return plan.query.alternatives[plan.selection.config.implementation]
+    query = operation.plan.prepared.state.query
+    return dict(surface=query.surface, call=dict(query.call))
 
 
 def _expected(values, rank, query):
     surface = query["surface"]
     assert surface in ("OneshotAllReduce.all_reduce", "PCIeTwoShotBF16.all_reduce"), surface
-    transport = query["call"]["transport"] if surface == "OneshotAllReduce.all_reduce" else None
-    if surface == "OneshotAllReduce.all_reduce":
-        assert transport in ("pull", "tp4_push_sentinel", "tp4_push_rsag"), transport
-    if transport in ("tp4_push_sentinel", "tp4_push_rsag"):
+    transport = query["call"]["transport"]
+    if surface == "PCIeTwoShotBF16.all_reduce":
+        assert transport in ("push", "pull"), transport
+        transport = "bulk_" + transport
+    else:
+        if transport in ("joint_latency", "joint_bandwidth"):
+            mode = query["call"]["submode"]
+            modes = (("full", "payload_rsag", "pull") if transport == "joint_latency"
+                     else ("payload_rsag", "bulk_push", "bulk_pull", "pull"))
+            assert mode in modes, (transport, mode)
+            transport = {"full": "remote_push_full", "payload_rsag": "remote_push_rsag"}.get(mode, mode)
+        else:
+            assert transport in ("pull", "remote_push_full", "remote_push_rsag"), transport
+    bulk = transport in ("bulk_push", "bulk_pull")
+    if transport in ("remote_push_full", "remote_push_rsag"):
         values = [value.clone() for value in values]
         for value in values:
             bits = value.view(torch.int16)
@@ -49,19 +60,20 @@ def _expected(values, rank, query):
     cyclic = []
     for first in range(4):
         value = values[first].float()
-        if surface == "PCIeTwoShotBF16.all_reduce":
+        if bulk:
             value = torch.zeros_like(value) + value
         for offset in range(1, 4):
             value = value + values[(first + offset) % 4].float()
         cyclic.append(value.bfloat16())
-    if surface == "PCIeTwoShotBF16.all_reduce" or transport == "tp4_push_rsag":
-        # Each quarter is summed once by its owner, then copied to every rank.
+    if bulk or transport == "remote_push_rsag":
         elements = values[0].numel()
-        assert elements % 32 == 0
-        quarter = elements // 4
-        parts = [cyclic[owner].flatten()[owner * quarter:(owner + 1) * quarter].clone()
+        assert elements % 8 == 0
+        packs = elements // 8
+        shard = ((packs + 3) // 4 if bulk else packs // 4) * 8
+        parts = [cyclic[owner].flatten()[min(elements, owner * shard):
+                 elements if owner == 3 else min(elements, (owner + 1) * shard)].clone()
                  for owner in range(4)]
-        if transport == "tp4_push_rsag":
+        if transport == "remote_push_rsag":
             for owner, part in enumerate(parts):
                 if owner != rank:
                     bits = part.view(torch.int16)
@@ -72,17 +84,51 @@ def _expected(values, rank, query):
 
 def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_transport():
     zeros = [torch.zeros((1, 32), dtype=torch.bfloat16) for _ in range(4)]
-    for transport, bits in (("pull", 0), ("tp4_push_sentinel", -32768), ("tp4_push_rsag", -32768)):
+    for transport, bits in (("pull", 0), ("remote_push_full", -32768), ("remote_push_rsag", -32768)):
         query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport))
         assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
     negative = [value.neg() for value in zeros]
-    query = dict(surface="PCIeTwoShotBF16.all_reduce", call={})
-    assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
+    for transport in ("push", "pull"):
+        query = dict(surface="PCIeTwoShotBF16.all_reduce", call=dict(transport=transport))
+        assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
+    for family, modes in (("joint_latency", ("full", "payload_rsag", "pull")),
+                          ("joint_bandwidth", ("payload_rsag", "bulk_push", "bulk_pull", "pull"))):
+        for mode in modes:
+            query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=family, submode=mode))
+            bits = -32768 if mode in ("full", "payload_rsag") else 0
+            assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
+            bits = 0 if mode.startswith("bulk_") else -32768
+            assert torch.all(_expected(negative, 0, query).view(torch.int16) == bits)
+        with pytest.raises(AssertionError):
+            _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce",
+                                   call=dict(transport=family, submode="unknown")))
     for transport in ("unknown", None):
         with pytest.raises(AssertionError):
             _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport)))
     with pytest.raises(AssertionError):
         _expected(zeros, 0, dict(surface="unknown", call={}))
+    with pytest.raises(AssertionError):
+        _expected(zeros, 0, dict(surface="PCIeTwoShotBF16.all_reduce", call=dict(transport="unknown")))
+
+
+@pytest.mark.parametrize("elements", (8, 40, 72))
+@pytest.mark.parametrize("mode", ("payload_rsag", "bulk_push", "bulk_pull"))
+def test_collective_oracle_preserves_pack_owners_and_cancellation_order(elements, mode):
+    values = [torch.full((elements,), value, dtype=torch.bfloat16)
+              for value in (1e8, 1, -1e8, 1)]
+    query = dict(surface="OneshotAllReduce.all_reduce",
+                 call=dict(transport="joint_bandwidth", submode=mode))
+    packs = elements // 8
+    shard = (packs + 3) // 4 if mode.startswith("bulk_") else packs // 4
+    owners = [min(pack // shard, 3) if shard else 3 for pack in range(packs)]
+    for rank in range(4):
+        expected = torch.tensor([1 if owner % 2 == 0 else 0 for owner in owners], dtype=torch.bfloat16)
+        if mode == "payload_rsag":
+            for index, owner in enumerate(owners):
+                if owner != rank and expected[index] == 0:
+                    expected.view(torch.int16)[index] = -32768
+        assert torch.equal(_expected(values, rank, query).view(torch.int16),
+                           expected.repeat_interleave(8).view(torch.int16))
 
 
 def _rank(rank, rendezvous, directory, widths):
@@ -230,12 +276,14 @@ def _rank(rank, rendezvous, directory, widths):
 
 
 @pytest.mark.parametrize("widths", [(4096, 5120), (2560,)], ids=["4096-5120", "qwen-2560"])
+@_gpu_only
 def test_package_owned_tp4_collective_graph_variants(tmp_path, widths):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
     mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths), nprocs=4, join=True)
 
 
+@_gpu_only
 def test_exported_tp4_collectives_replay_after_preparation_exit(tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     root = Path(__file__).resolve().parents[2]

@@ -1,6 +1,6 @@
 # Prepared execution manifest
 
-Execution ABI `4` describes graph execution and transport over one existing CUDA
+Execution ABI `5` describes graph execution and transport over one existing CUDA
 context. A resource owner retains the context, graphs and allocations through
 shutdown. `NativeResources` reconstructs these resources from a runtime package written
 by Ignition before native serving starts. The model recipe defines the numerical behavior of each executable.
@@ -9,7 +9,7 @@ The Python representation is a dictionary with these fields:
 
 ```python
 {
-    "abi_version": 4,
+    "abi_version": 5,
     "context": int,                 # Existing CUcontext handle.
     "device": int,                  # Visible device ordinal.
     "max_active": int,              # 1 through 64.
@@ -42,10 +42,45 @@ The Python representation is a dictionary with these fields:
                     "nbytes": int,  # Entire named buffer extent.
                 },
             ],
+            "tuned_bindings": [
+                {"buffer": str, "tuning_graph": str},
+            ],
+        },
+    ],
+    "tuning_graphs": [
+        {
+            "name": str,
+            "handle": int,
+            "outputs": [str, ...],
+            "status_buffer": str,
         },
     ],
 }
 ```
+
+## Startup tuning bindings
+
+A tuned binding names a persistent device buffer and the captured tuning graph
+that produces it. The consumer reads the same storage directly. A producer can
+write multiple outputs, and several consumers can share an output. Each output
+has exactly one producer and cannot also receive request uploads or overlap
+mutable request or cache state. Tuning graphs are self-contained and have no
+request geometry, frame bindings, or request completion records.
+
+The executor runs each referenced producer once after all ranks and transports
+are ready, before dependent execution. All ranks agree on the producer order and
+binding schema. Each producer has a separate contiguous `int32[1]` status buffer:
+the executor initializes it to -1, and the graph writes 0 after successfully
+publishing its outputs. A nonzero terminal status fails startup. CUDA failures
+and deadlines retain the normal coordinated drain requirements.
+
+Tuning graphs implement measurement and selection. Native execution treats their
+outputs as opaque values; it neither interprets kernel protocols nor searches
+configurations. Outputs remain fixed during serving. Package graph selection
+retains referenced producers and their executable resources and removes unused
+producers. Tuning storage remains owned through execution drain.
+
+## Serving graph transport
 
 Supported dtypes are `bool`, `uint8`, `int32`, `int64`, `float32`, `float16`, and
 `bfloat16`. Shapes are nonempty and every extent is positive. `nbytes` equals
@@ -87,7 +122,7 @@ normal FP32 temperature and use the same stochastic sampling executable.
 Unsupported mode strings reject manifest parsing before CUDA initialization.
 A model contract defines the required graph capacities.
 
-Two graph inputs are reserved and required in every executable's bindings:
+Two graph inputs are reserved and required in every serving executable's bindings:
 
 | Buffer | Dtype | Shape | Writer |
 |---|---|---|---|
@@ -185,7 +220,7 @@ vector. Accepted drafts number either `emitted_count-1` or `emitted_count`;
 the latter occurs when EOS or the output budget clips inside the accepted draft
 prefix. It never exceeds the offered count. Ordinary sampling emits at most
 one token and reports width one. Maintenance and non-sampling prefill emit
-zero tokens. Every graph in an ABI4 catalog writes the 24-field layout.
+zero tokens. Every serving graph in an ABI5 catalog writes the 24-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
 request state advances. A speculative completion requires a
@@ -196,7 +231,7 @@ invalid. Each speculative graph declares one fixed
 `token_capacity`, so a finalizer writes that value into field 15 of every
 record it emits.
 
-ABI4 optionally declares `completion_speculative_survival`, a contiguous
+ABI5 optionally declares `completion_speculative_survival`, a contiguous
 `float32[2,capacity,7]` output indexed by completion frame, physical request
 slot, and draft-prefix depth. Each value is the cumulative product of
 `min(1, p(token)/q(token))` through that prefix, using the distributions used

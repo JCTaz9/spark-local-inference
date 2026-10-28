@@ -15,6 +15,9 @@ pub(super) const DRAINED: u8 = 7;
 pub(super) const RELEASE: u8 = 8;
 pub(super) const FAILED: u8 = 9;
 pub(super) const PREPARE_MORE: u8 = 10;
+pub(super) const TUNE: u8 = 11;
+pub(super) const TUNED: u8 = 12;
+pub(super) const STARTED: u8 = 13;
 const MAX_PACKET: usize = 64 * 1024 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -158,7 +161,7 @@ impl<'a> Reader<'a> {
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
-        5,
+        6,
         manifest.abi_version as usize,
         manifest.max_active,
         manifest.input_frame_bytes,
@@ -195,11 +198,23 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
         if graph.kind == super::super::GraphKind::Speculative {
             number(&mut bytes, graph.draft_tokens);
         }
+        number(&mut bytes, graph.tuned_bindings.len());
+        for binding in &graph.tuned_bindings {
+            string(&mut bytes, &binding.buffer);
+            string(&mut bytes, &binding.tuning_graph);
+        }
         for binding in &graph.input_bindings {
             string(&mut bytes, &binding.buffer_name);
             number(&mut bytes, binding.host_offset);
             number(&mut bytes, binding.nbytes);
         }
+    }
+    number(&mut bytes, manifest.tuning_graphs.len());
+    for graph in &manifest.tuning_graphs {
+        string(&mut bytes, &graph.name);
+        string(&mut bytes, &graph.status_buffer);
+        number(&mut bytes, graph.outputs.len());
+        for output in &graph.outputs { string(&mut bytes, output); }
     }
     number(&mut bytes, usize::from(manifest.cache.is_some()));
     if let Some(cache) = &manifest.cache {

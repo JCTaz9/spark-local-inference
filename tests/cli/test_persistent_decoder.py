@@ -89,7 +89,7 @@ def test_upstream_joint_tuning_wire_tag_does_not_enable_persistent_decoder():
     # tuning. Its bool payload must not select a persistent decoder here.
     upstream = bytes.fromhex("08 01 b8 01 01")
     decoded = proto.RebuildManifest.FromString(upstream)
-    assert decoded.version == 1 and not decoded.persistent_decoder
+    assert decoded.version == 1 and decoded.joint_tuning and not decoded.persistent_decoder
     assert decoded.SerializeToString() == upstream
 
 

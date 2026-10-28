@@ -1,4 +1,4 @@
-"""ABI4 completion writers preserve physical lanes and frame ownership."""
+"""ABI5 completion writers preserve physical lanes and frame ownership."""
 from __future__ import annotations
 
 import os

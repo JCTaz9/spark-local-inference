@@ -688,13 +688,32 @@ impl VerifiedPackage {
         }
     }
     pub fn verify_stored_data(&self) -> Result<()> {
+        self.verify_stored_data_with_progress(None)
+    }
+
+    /// Report hashed bytes to `phase` where the on-disk format can count them. Legacy packages
+    /// hash through one archive pass and keep their own progress reporting.
+    pub fn verify_stored_data_with_progress(
+        &self,
+        phase: Option<&crate::startup::Phase>,
+    ) -> Result<()> {
         match self {
             Self::Legacy(package) => package.verify_stored_data(),
-            Self::Payload(package) => package.verify_stored_data(),
+            Self::Payload(package) => package.verify_stored_data_with_progress(phase),
         }
     }
     pub fn authorize(self, accepted: &str, verify_weights: bool) -> Result<AuthorizedPackage> {
-        self.authorize_with_progress(accepted, verify_weights, None)
+        self.authorize_with_progress(accepted, verify_weights, true, None)
+    }
+
+    /// Authorize signed metadata without reading payload bytes. A controller that mirrors only a
+    /// node-held package's index leaves payload verification to the serving ranks.
+    pub fn authorize_metadata(
+        self,
+        accepted: &str,
+        verify_weights: bool,
+    ) -> Result<AuthorizedPackage> {
+        self.authorize_with_progress(accepted, verify_weights, false, None)
     }
 
     /// Authorize the package while reporting mandatory and requested stored-data verification.
@@ -702,14 +721,16 @@ impl VerifiedPackage {
         self,
         accepted: &str,
         verify_weights: bool,
+        verify_payloads: bool,
         progress: Option<&crate::startup::StartupProgress>,
     ) -> Result<AuthorizedPackage> {
         match self {
             Self::Legacy(package) => {
+                let verify = verify_weights && verify_payloads;
                 let phase = progress
-                    .filter(|_| verify_weights)
+                    .filter(|_| verify)
                     .map(|progress| progress.phase("Verify stored data", None));
-                let authorized = package.authorize(accepted, verify_weights)?;
+                let authorized = package.authorize(accepted, verify)?;
                 if let Some(phase) = phase {
                     phase.finish("stored-data contents");
                 }
@@ -719,6 +740,7 @@ impl VerifiedPackage {
                 kind: AuthorizedKind::Payload(package.authorize_with_progress(
                     accepted,
                     verify_weights,
+                    verify_payloads,
                     progress,
                 )?),
             }),
@@ -1385,6 +1407,59 @@ pub struct PayloadSource {
 }
 
 const HASH_CHUNK: usize = 4 << 20;
+
+/// Hash each payload once, spreading independent payloads across a bounded worker set. Every
+/// byte is still checked; only the order of independent reads changes. `hash` returns the bytes
+/// it verified so an active phase can report progress while the cache is being read.
+fn verify_payload_ids(
+    ids: std::collections::BTreeSet<Vec<u8>>,
+    hash: impl Fn(&[u8]) -> Result<u64> + Sync,
+    phase: Option<&crate::startup::Phase>,
+) -> Result<()> {
+    let ids: Vec<Vec<u8>> = ids.into_iter().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(8, |count| count.get())
+        .max(8)
+        .min(16)
+        .min(ids.len());
+    let hash = |id: &[u8]| -> Result<()> {
+        let bytes = hash(id)?;
+        if let Some(phase) = phase {
+            phase.advance_bytes(bytes);
+        }
+        Ok(())
+    };
+    if workers <= 1 {
+        for id in &ids {
+            hash(id)?;
+        }
+        return Ok(());
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failure = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(id) = ids.get(index) else { break };
+                if let Err(error) = hash(id) {
+                    let mut slot = failure.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                    break;
+                }
+            });
+        }
+    });
+    match failure.into_inner().unwrap() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
 
 impl PayloadSource {
     fn payload_file(&self, id: &[u8]) -> Result<(&super::archive::PayloadFile, u64)> {
@@ -2135,11 +2210,27 @@ impl PayloadVerifiedPackage {
     /// descriptor. This includes initializers plus selected frontend assets, module globals,
     /// offloaded table planes, and executable resources.
     pub fn verify_stored_data(&self) -> Result<()> {
-        let ids = payload_reader::required_payloads(&self.verified)?;
-        for id in ids {
-            self.hash_payload(&id)?;
-        }
-        Ok(())
+        self.verify_stored_data_with_progress(None)
+    }
+
+    /// Hash the stored payloads while advancing `phase` by the bytes each payload verifies, so a
+    /// launch that must rehash a cached rank reports progress instead of appearing stuck.
+    pub fn verify_stored_data_with_progress(
+        &self,
+        phase: Option<&crate::startup::Phase>,
+    ) -> Result<()> {
+        verify_payload_ids(
+            payload_reader::required_payloads(&self.verified)?,
+            |id| {
+                let placement = self
+                    .placements
+                    .get(id)
+                    .ok_or_else(|| invalid("payload has no physical placement"))?;
+                self.hash_payload(id)?;
+                Ok(placement.nbytes)
+            },
+            phase,
+        )
     }
     pub fn describe(
         &self,
@@ -2279,13 +2370,14 @@ impl PayloadVerifiedPackage {
         accepted: &str,
         verify_weights: bool,
     ) -> Result<PayloadAuthorizedPackage> {
-        self.authorize_with_progress(accepted, verify_weights, None)
+        self.authorize_with_progress(accepted, verify_weights, true, None)
     }
 
     fn authorize_with_progress(
         self,
         accepted: &str,
         verify_weights: bool,
+        verify_payloads: bool,
         progress: Option<&crate::startup::StartupProgress>,
     ) -> Result<PayloadAuthorizedPackage> {
         let Self {
@@ -2316,20 +2408,22 @@ impl PayloadVerifiedPackage {
             executables,
             authorized,
         };
-        let payloads = source.verification_payloads(verify_weights)?;
-        let total = payloads.iter().try_fold(0u64, |total, (_, slice)| {
-            total
-                .checked_add(slice.len())
-                .ok_or_else(|| invalid("verification byte count overflow"))
-        })?;
-        let phase = progress.map(|progress| progress.phase("Verify stored data", Some(total)));
-        payloads.verify_with_progress(&|bytes| {
-            if let Some(phase) = &phase {
-                phase.advance_bytes(bytes);
+        if verify_payloads {
+            let payloads = source.verification_payloads(verify_weights)?;
+            let total = payloads.iter().try_fold(0u64, |total, (_, slice)| {
+                total
+                    .checked_add(slice.len())
+                    .ok_or_else(|| invalid("verification byte count overflow"))
+            })?;
+            let phase = progress.map(|progress| progress.phase("Verify stored data", Some(total)));
+            payloads.verify_with_progress(&|bytes| {
+                if let Some(phase) = &phase {
+                    phase.advance_bytes(bytes);
+                }
+            })?;
+            if let Some(phase) = phase {
+                phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
             }
-        })?;
-        if let Some(phase) = phase {
-            phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
         }
         Ok(PayloadAuthorizedPackage { source, packages })
     }
@@ -2429,11 +2523,15 @@ impl PayloadAuthorizedPackage {
     /// handles. This includes initializers plus selected frontend assets, module globals,
     /// offloaded table planes, and executable resources.
     pub fn verify_stored_data(&self) -> Result<()> {
-        let ids = payload_reader::required_payloads(self.source.authorized.verified())?;
-        for id in ids {
-            self.source.hash_payload(&id)?;
-        }
-        Ok(())
+        verify_payload_ids(
+            payload_reader::required_payloads(self.source.authorized.verified())?,
+            |id| {
+                let (_, nbytes) = self.source.payload_file(id)?;
+                self.source.hash_payload(id)?;
+                Ok(nbytes)
+            },
+            None,
+        )
     }
     pub(super) fn descriptor(&self) -> Result<wire::ModelIndex> {
         build_descriptor(self.source.authorized.verified(), &self.packages, |use_| {
@@ -3610,7 +3708,12 @@ mod payload_package_tests {
                     corrupt_payload_companion(&root.join(&location.file));
                 }
                 let package = VerifiedPackage::open_tensor_parallel(&root, &publishers, 2, Some(1)).unwrap();
-                let result = package.authorize_with_progress("example", verify_weights, Some(&crate::startup::StartupProgress::silent()));
+                let result = package.authorize_with_progress(
+                    "example",
+                    verify_weights,
+                    true,
+                    Some(&crate::startup::StartupProgress::silent()),
+                );
                 assert_eq!(result.is_err(), !optional || verify_weights, "{name}, verify_weights={verify_weights}");
                 drop(result);
                 drop(metadata);

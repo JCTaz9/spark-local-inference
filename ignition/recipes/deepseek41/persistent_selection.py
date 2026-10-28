@@ -6,7 +6,7 @@ families and other physical capacities retain their existing composition.
 """
 
 from copy import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from hashlib import sha256
 import json
@@ -26,92 +26,29 @@ from ignition.components.rotary import PreparedRotaryAngles
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.scratch import GraphBufferPool
 from ignition.progress import phase
-from .contextual_tuning import (
-    CatalogCompressedLayerFixture,
-    _LayerTrial,
-)
+from .contextual_tuning import CatalogLayerFixture, _LayerTrial
 
 
-class _LayerFixture(CatalogCompressedLayerFixture):
-    """Valid compressed history and explicit carry inputs for one catalog layer.
+class _LayerFixture(CatalogLayerFixture):
+    """Restore the catalog's complete layer inputs for persistent composition races."""
 
-    The incoming carry applies a zero branch and identity residual mixing to a
-    checkpoint embedding. Both candidate compositions therefore consume the same
-    nonzero BF16 model input without running preceding layers in the timed region.
-    """
+    def __init__(self, name, signature, decoder, index):
+        super().__init__(name, signature, decoder, index)
+        self.tune_seeds = (8101 + index * 3, 8102 + index * 3)
+        self.holdout_seed = 8103 + index * 3
 
-    def __init__(self, forwards, signatures, index):
-        super().__init__(
-            forwards,
-            signatures,
-            tune_seeds=(8101 + index * 3, 8102 + index * 3),
-            holdout_seed=8103 + index * 3,
-        )
-        layer = self.target_decoder.layers[index]
-        if (
-            layer.engram is not None
-            or layer.boundary is not None
-            or layer.attention.global_kv is not None
-            or layer.attention.ratio <= 0
-        ):
-            raise ValueError(
-                "persistent layer fixture requires a compressed consumer without Engram or KV production"
-            )
-        self.layer_index = index
-        self.source_layer = layer.attention.source.layer
-        self.index_source = self.target_decoder.weights.config.index_source(index)
-        self.page_size = 128 // layer.attention.ratio
-        self.carry, self.closed_post = layer.carry, layer.post is not None
-        self.identity = torch.eye(
-            4, dtype=torch.float32, device=layer.scratch.residual.device
-        ).expand(self.TARGET_TOKENS, 4, 4)
 
-    def _check_layer(self, layer):
-        reference = self.target_decoder.layers[self.layer_index]
-        if (
-            layer.carry != self.carry
-            or (layer.post is not None) != self.closed_post
-            or layer.engram is not None
-            or layer.boundary is not None
-            or layer.attention.global_kv is not None
-            or layer.attention.ratio <= 0
-            or layer.metadata is not reference.metadata
-            or layer.attention.pool is not self.pool
-            or layer.scratch.residual.data_ptr()
-            != reference.scratch.residual.data_ptr()
-        ):
-            raise ValueError(
-                "persistent trial differs from its catalog layer or incoming state contract"
-            )
-
-    def _restore(self, case, layer):
-        super()._restore(case, layer)
-        if self.carry:
-            scratch = layer.scratch
-            scratch.mlp_output.zero_()
-            scratch.ffn_hc.residual.copy_(case.residual)
-            scratch.ffn_hc.post.zero_()
-            scratch.ffn_hc.comb.copy_(self.identity)
-
-    def initialize(self, target_seed_graph):
-        super().initialize(target_seed_graph)
-        if self.target_decoder.layers[self.layer_index].attention.selectors:
-            # An index source recomputes selected positions; its input pages and
-            # candidate prefix remain immutable, while selected rows are output.
-            selected = self.target_decoder.layers[
-                self.layer_index
-            ].scratch.attention.selected
-            self.cases = tuple(
-                replace(
-                    case,
-                    extras=tuple(
-                        (target, value)
-                        for target, value in case.extras
-                        if target is not selected
-                    ),
-                )
-                for case in self.cases
-            )
+def _target_context(forwards, signatures):
+    for name, signature in signatures.items():
+        if (signature.kind != "speculative" or signature.batch_capacity != 1
+                or signature.packed_token_capacity != 8):
+            continue
+        forward = forwards[name]
+        while hasattr(forward, "forward"):
+            forward = forward.forward
+        if hasattr(forward, "target"):
+            return name + ".target", signature, forward.target.decoder
+    raise ValueError("--persistent-decoder requires an eight-row batch-one DSpark target catalog")
 
 
 @dataclass(frozen=True)
@@ -192,17 +129,7 @@ def _outputs(layer):
 
 
 def _validate_history(fixture, layer):
-    case = fixture.active_case
-    if case is None:
-        raise RuntimeError("persistent trial has no restored input case")
-    if not torch.equal(
-        fixture.pool.window(fixture.layer_index)[fixture.state_row], case.window
-    ):
-        raise AssertionError("persistent decoder changed committed attention history")
-    if any(not torch.equal(target, saved) for target, saved in case.extras):
-        raise AssertionError(
-            "persistent decoder changed source cache pages or candidate input rows"
-        )
+    fixture.validate_result(layer)
     if any(not bool(torch.isfinite(tensor).all()) for tensor in _outputs(layer)):
         raise AssertionError(
             "persistent decoder produced nonfinite branch or hyperconnection state"
@@ -242,6 +169,7 @@ class PersistentSelection:
     ):
         self.forwards, self.signatures = forwards, signatures
         self.ordinary = ordinary
+        self.target_context = _target_context(forwards, signatures)
         self.arena, self.coordinator, self.collective = arena, coordinator, collective
         self.device, self.graph_pool = device, graph_pool
         self.cache_root, self.compile_decoder = cache_root, compile_decoder
@@ -287,51 +215,11 @@ class PersistentSelection:
         )
 
     def _fixture(self, index):
-        if index == 0:
-            return self.ordinary.fixtures[0]
-        return _LayerFixture(self.forwards, self.signatures, index)
+        return _LayerFixture(*self.target_context, index)
 
     def _initialize(self, session, fixture):
-        if fixture.cases:
-            return
-        if isinstance(fixture, _LayerFixture):
-            functions = {"persistent-target-seed": fixture.target_seed_forward}
-            signatures = {
-                "persistent-target-seed": replace(fixture.target_signature, inputs=())
-            }
-
-            def before(name):
-                fixture._set_metadata(
-                    fixture.target_decoder.metadata,
-                    seed=fixture.tune_seeds[0],
-                    rows=fixture.TARGET_TOKENS,
-                    start=fixture.start,
-                )
-        else:
-            functions = {
-                "context-prefill-layer0": fixture.prefill_setup_forward,
-                "context-target-seed": fixture.target_seed_forward,
-            }
-            signatures = fixture.setup_signatures()
-            before = fixture.restore_setup
-        graphs, compiled = self._capture(
-            session,
-            functions,
-            signatures,
-            before_run=before,
-            label=f"Prepare persistent layer {fixture.layer_index} inputs",
-        )
-        try:
-            if isinstance(fixture, _LayerFixture):
-                fixture.initialize(graphs["persistent-target-seed"])
-            else:
-                fixture.initialize(
-                    graphs["context-prefill-layer0"], graphs["context-target-seed"]
-                )
-        finally:
-            for graph in graphs.values():
-                graph.reset()
-            compiled.clear()
+        if not fixture.cases:
+            fixture.initialize()
 
     def _variant(self, layer, packed, prologue_weights, angles, tactic, shared_mode):
         candidate = copy(layer)
@@ -413,7 +301,7 @@ class PersistentSelection:
             layer.shared.down_projection.plan.selection.config.mode,
         ]
         shared_mode = int(modes[0] == "a16") + 2 * int(modes[1] == "a16")
-        if shared_mode and fixture.TARGET_TOKENS > 8:
+        if shared_mode and fixture.tokens > 8:
             raise ValueError(
                 "persistent BF16 shared projections exceed their declared scratch capacity"
             )
@@ -428,7 +316,7 @@ class PersistentSelection:
                 buffers=self.angle_buffers.cursor(),
             )
         angles = self.angles[angle_key]
-        kernel = decoder_query(rows=fixture.TARGET_TOKENS, shared_a16=shared_mode)
+        kernel = decoder_query(rows=fixture.tokens, shared_a16=shared_mode)
         dependencies = self._exchange(
             "composition-dependencies",
             dict(
@@ -439,7 +327,7 @@ class PersistentSelection:
         )
         query = _CompositionQuery(
             layer.index,
-            fixture.TARGET_TOKENS,
+            fixture.tokens,
             layer.carry,
             layer.post is not None,
             tuple(peer["shared_mode"] for peer in dependencies),
@@ -480,7 +368,7 @@ class PersistentSelection:
         prepared.close()
         functions = {name: _LayerTrial(variant) for name, variant in variants.items()}
         signatures = {
-            name: replace(fixture.target_signature, inputs=()) for name in functions
+            name: fixture.trial_signature for name in functions
         }
         graphs, compiled = self._capture(
             session,
@@ -603,7 +491,7 @@ class PersistentSelection:
             heldout, heldout_compiled = self._capture(
                 session,
                 {check_name: _LayerTrial(winner)},
-                {check_name: replace(fixture.target_signature, inputs=())},
+                {check_name: fixture.trial_signature},
                 before_run=lambda name: (
                     fixture._poison(winner),
                     fixture._restore(fixture.cases[2], winner),
@@ -666,7 +554,7 @@ class PersistentSelection:
         choices, ordinary_report = self.ordinary(session, requests, finalists)
         session.bind_context_plans(choices)
         session.preview_context_bindings()
-        target = self.ordinary.fixtures[0].target_decoder
+        target = self.target_context[2]
         report = []
         for index, layer in enumerate(target.layers):
             if (
@@ -714,7 +602,7 @@ class PersistentSelection:
         return dict(
             prepared_dense_view_bytes=self.prepared_dense_view_bytes,
             retained_dense_view_bytes=sum(
-                item[0].dense_nbytes for item in self.retained
+                item[0].dense_nbytes for item in self.retained if item[0] is not None
             ),
             retained_channel_bytes=0 if self.channel is None else self.channel.nbytes,
             physical_rows=8,

@@ -106,3 +106,17 @@ def test_draft_factory_uses_its_bf16_channel_without_changing_target(monkeypatch
     draft(vocabulary_runtime=target_runtime)
     assert calls[0]['vocabulary_runtime'] is draft_runtime
     assert target.keywords['mla_compute_mode'] == calls[0]['mla_compute_mode'] == 'bf16'
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_local_reduction_workspace_follows_collective_tuning(monkeypatch, mode):
+    config = bootstrap.PreparationConfig(collective_tuning=mode, max_active=1)
+    calls = []
+    monkeypatch.setattr(bootstrap, "create_all_reduce_runtime",
+                        lambda *args, **kwargs: calls.append(kwargs) or object())
+    for name in ("create_all_gather_runtime", "create_dma_all_reduce_runtime", "create_result_broadcast_runtime"):
+        monkeypatch.setattr(bootstrap, name, lambda *args, **kwargs: object())
+    bootstrap._collective_runtimes(config, None, None,
+        coordinator=SimpleNamespace(spans_hosts=False),
+        package_storage=SimpleNamespace(peer_storage=object()), verification_samples=8)
+    assert calls[0]["collective_tuning"] == mode

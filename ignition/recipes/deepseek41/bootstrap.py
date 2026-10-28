@@ -69,18 +69,23 @@ def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, visi
 
 
 def _can_race_contextual_plans(config, signatures, device):
-    if (not config.dspark or config.autotune_effort == "off" or not any(
-            signature.kind == "speculative" and signature.batch_capacity == 1
-            and signature.token_capacity == 8 and signature.packed_token_capacity is not None
-            and signature.packed_token_capacity >= 8 for signature in signatures.values())):
+    if not config.joint_tuning:
         return False
+    if config.autotune_effort == "off":
+        raise ValueError("--joint-tuning requires --autotune-effort default or audit")
     from b12x.quantization import mla_norm_mxfp8
 
-    return mla_norm_mxfp8.is_supported(device)
+    if not mla_norm_mxfp8.is_supported(device):
+        raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
+    if not any(signature.kind in ("prefill", "scored_prefill", "decode", "speculative")
+               for signature in signatures.values()):
+        raise ValueError("--joint-tuning requires prepared text graphs")
+    return True
 
 
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
@@ -88,6 +93,7 @@ class PreparationConfig:
     persistent_decoder: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
+    joint_tuning: bool = False
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
@@ -303,7 +309,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
@@ -386,7 +392,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
@@ -566,7 +572,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 progress=progress)
         if config.persistent_decoder:
             if contextual is None:
-                raise ValueError("--persistent-decoder requires tuning and an eight-row batch-one DSpark target catalog")
+                raise ValueError("--persistent-decoder requires --joint-tuning and an eight-row batch-one DSpark target catalog")
             from .persistent_selection import PersistentSelection
             contextual=PersistentSelection(forwards,signatures,ordinary=contextual,arena=arena,
                 coordinator=coordinator,collective=collective,device=device,

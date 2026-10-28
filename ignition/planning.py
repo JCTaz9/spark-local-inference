@@ -185,6 +185,9 @@ class Plan:
     roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "default"
+    collective_tuning: str | None = None
+    joint_tuning: bool = False
+    shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
     persistent_decoder: bool = False
@@ -196,6 +199,22 @@ class Plan:
     online_mxfp8: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
+
+    def __post_init__(self):
+        if self.collective_tuning is None:
+            object.__setattr__(self, "collective_tuning", self.recipe.collective_tuning)
+        if self.collective_tuning not in ("static", "runtime"):
+            raise UsageError("--collective-tuning must be static or runtime")
+        if self.shard_hyperconnections:
+            if self.recipe.name != "qwen38":
+                raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
+            if self.world_size < 2:
+                raise UsageError("--shard-hyperconnections requires tensor parallelism")
+        if self.joint_tuning:
+            if self.recipe.name != "deepseek41":
+                raise UsageError("--joint-tuning requires DeepSeek V4.1")
+            if self.autotune_effort == "off":
+                raise UsageError("--joint-tuning requires --autotune-effort default or audit")
 
     @property
     def world_size(self) -> int:
@@ -302,6 +321,9 @@ class Plan:
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
             "autotune_effort": self.autotune_effort,
+            "collective_tuning": self.collective_tuning,
+            "joint_tuning": self.joint_tuning,
+            "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "persistent_decoder": self.persistent_decoder,

@@ -8,17 +8,20 @@ import torch
 
 @pytest.mark.parametrize("surface", ["PCIeTwoShotBF16.all_reduce", "OneshotAllReduce.all_reduce"])
 def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surface):
+    from b12x.comm import pcie
     from b12x.comm.pcie import _twoshot_preparation
     from b12x.preparation import PreparedCall
     from ignition.components import collectives
 
+    monkeypatch.setattr(pcie, "joint_finalist_policy", lambda: object(), raising=False)
     source = torch.full((32, 5120), 3, dtype=torch.bfloat16)
     output = torch.empty_like(source)
     callbacks, calls, selected = [], [], []
     plan = SimpleNamespace(query=SimpleNamespace(surface=surface))
     plan.request = lambda **kwargs: callbacks.append(kwargs) or object()
     runtime = SimpleNamespace(algorithm="oneshot", world_size=4, single_channel=True,
-                              exchange_group=object(), plan=lambda *_args, **_kwargs: plan)
+                              exchange_group=object(), for_stream=lambda: SimpleNamespace(),
+                              plan=lambda *_args, **_kwargs: plan)
     monkeypatch.setattr(collectives, "_roce", lambda _: False)
     monkeypatch.setattr(collectives, "declare", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1, 2, 3])
@@ -48,3 +51,77 @@ def test_preparation_uses_selected_surface_and_retains_storage(monkeypatch, surf
     assert torch.equal(source, output)
     assert calls == (["two"] if surface == "PCIeTwoShotBF16.all_reduce" else ["bind"])
     assert operation.runtime is runtime and operation.plan is plan
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+@pytest.mark.parametrize("effort", ["off", "default", "audit"])
+def test_joint_plan_preserves_explicit_tuning_effort(monkeypatch, effort, mode):
+    from b12x.comm import pcie
+    from b12x.preparation import AutotuneEffort
+    from ignition.components import collectives
+    from ignition.preparation import startup_tuning
+
+    calls, requests, registered = [], [], []
+    plan = SimpleNamespace(request=lambda **kwargs: requests.append(kwargs) or object())
+    runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True,
+        exchange_group=object(), for_stream=lambda: SimpleNamespace(_joint_workspace=object()),
+        plan=lambda *args, **kwargs: calls.append(kwargs) or plan)
+    policy = object()
+    monkeypatch.setattr(pcie, "joint_finalist_policy", lambda: policy, raising=False)
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0, 1])
+    monkeypatch.setattr(startup_tuning, "register_collective", lambda owner, session: registered.append(owner))
+    source = torch.ones(32, dtype=torch.bfloat16)
+    output = torch.empty_like(source)
+    operation = collectives.PreparedAllReduce(source, output, runtime=runtime,
+        session=SimpleNamespace(_autotune_effort=AutotuneEffort(effort), collective_tuning=mode), coordinator=object(), name="reduce")
+    assert calls == [dict(out=output, **({"joint_only": True} if mode == "runtime" else {}))]
+    if effort == "off" or mode == "static":
+        assert "finalist_policy" not in requests[0]
+        assert registered == []
+    else:
+        assert requests[0]["finalist_policy"] is policy
+        assert registered == [operation]
+
+
+def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypatch):
+    from importlib import import_module
+    from ignition.components import collectives
+
+    pcie = import_module("b12x.comm.pcie")
+    api = import_module("b12x.comm.pcie.api")
+    monkeypatch.delattr(pcie, "joint_finalist_policy", raising=False)
+    monkeypatch.delattr(api, "joint_finalist_policy", raising=False)
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    def channel():
+        raise AssertionError("capability lookup must follow the required API import")
+    runtime = SimpleNamespace(algorithm="oneshot", world_size=2, single_channel=True, for_stream=channel)
+    source = torch.ones(32, dtype=torch.bfloat16)
+    with pytest.raises(ImportError, match="joint_finalist_policy"):
+        collectives.PreparedAllReduce(source, torch.empty_like(source), runtime=runtime,
+            session=object(), coordinator=object(), name="reduce")
+
+
+def test_collective_choice_keys_distinguish_alternatives_and_finalist_policy():
+    from b12x.comm.pcie import joint_finalist_policy
+    from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
+    from b12x.preparation import FrozenMapping
+    from b12x.preparation.session import PreparationJob
+
+    def key(implementation, policy):
+        config = CollectiveConfig(implementation=implementation, threads=256, blocks=64)
+        query = CollectiveQuery(operation="all_reduce", world_size=2, rank=0,
+            alternatives=FrozenMapping({implementation: {"call": {"shape": (32, 2560)}}}), default=config)
+        plan = SimpleNamespace(contract=TUNING, invocation=FrozenMapping())
+        request = SimpleNamespace(plan=plan, dependencies=(), finalist_policy=policy)
+        obligation = SimpleNamespace(request=request, candidate_program_identity="same-program",
+            configuration=SimpleNamespace(encoded_query=FrozenMapping(TUNING.encode_query(query)), pinned=None))
+        return PreparationJob._choice_key(None, obligation, {})
+
+    static = key("oneshot", None)
+    runtime_without_finalists = key("joint_latency", None)
+    runtime = key("joint_latency", joint_finalist_policy())
+    assert len({static, runtime_without_finalists, runtime}) == 3
+    assert static == key("oneshot", None)
+    assert runtime == key("joint_latency", joint_finalist_policy())

@@ -74,21 +74,32 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-The pinned PyTorch 2.14.1 and Triton 3.8 preparation environment requires two
-Inductor patches. `patches/torch-inductor-triton-cache-filenames.patch` matches
+Ignition applies two bundled Inductor patches to the pinned PyTorch 2.14.1 and
+Triton 3.8 preparation environment before importing preparation libraries in
+`export`, `debug-serve`, and `join`, including commands launched through `uv run`.
+`ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
 Triton's 150-character physical cache filenames while retaining full CUDA symbol
-names. `patches/torch-inductor-cooperative-static-launch.patch` preserves
+names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
 cooperative vision reductions in portable static kernels through Triton's CUDA
 launcher, including their cooperative launch attributes and frozen selections.
-Apply both patches once after installing or reinstalling Torch in the dedicated
-Flare preparation environment, on every preparation host, before compiling forwards:
+Patch application checks dependency versions and exact source context, accepts
+already applied hunks, and replaces installation files atomically without
+modifying uv's shared wheel cache. Each preparation host needs a writable,
+dedicated Flare environment. Reinstalling Torch restores its distribution files;
+the preparation command reapplies the patches.
+
+`uv sync` installs dependencies without running the patches, and `uv build`
+includes the patch files in Ignition's wheel and source distribution without
+modifying its isolated build environment. For standalone Python tools and tests
+that import Inductor before invoking Ignition preparation, apply the bundled
+patches before starting their process:
 
 ```sh
-patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
-  -p1 < patches/torch-inductor-triton-cache-filenames.patch
-patch -d "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
-  -p1 < patches/torch-inductor-cooperative-static-launch.patch
+uv run --locked --extra prepare python -m ignition.patches
 ```
+
+`python scripts/setup_preparation.py` runs the locked preparation/test sync,
+rebuilds FlashInfer and Heliopause, and applies both patches before exiting.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
@@ -155,6 +166,18 @@ configuration constraints; it exists to check that the default search prunes
 no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
+
+`--collective-tuning static|runtime` selects when collective choices become fixed.
+`static` uses ordinary preparation-time autotuning and emits no collective startup
+tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
+overrides the recipe default; the command-line option overrides configuration.
+`runtime` uses joint kernels for eligible plain BF16 direct PCIe reductions.
+With autotune effort `default` or `audit`, preparation tunes the compiled launcher
+and retains the best measured CTA count for each of its submodes. A captured
+startup tuner selects among those prepared profiles when the package loads;
+geometry stays fixed and no search runs during requests. Effort `off` disables
+races in either mode: runtime mode retains the heuristic joint profile and emits
+no startup tuner. Other collective paths are unchanged.
 
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
@@ -338,6 +361,17 @@ rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
 
+`ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
+the 320-wide hyperconnection bottleneck across ranks, including target and MTP
+final mixers. Each rank loads its down-projection rows and up-projection columns;
+normalization and residual injection stay replicated. Partial gate logits round
+to BF16 before transport, and the reduced BF16 logits feed sigmoid and the stream
+mean. This changes reduction rounding relative to the replicated projection.
+The option requires TP2 or TP4 and is recorded in the package's rebuild metadata.
+Replicated execution is the default: the compute savings must outweigh the extra
+10,240-element reduction per mixer and token. Changing the option requires a
+fresh export; `--reuse-weights` requires matching prepared weight layouts.
+
 Vision recipes accept `--image-concurrency N`, independently of
 `--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
 as `image_concurrency` in `[defaults]` or a model's configuration section.
@@ -423,7 +457,7 @@ packed KV storage.
 `--persistent-decoder` enables complete-layer comparison of separated execution,
 fused attention prologues, and persistent WO/MoE/mHC execution. It defaults to
 disabled and requires four local SM120 GPUs, seven learned draft tokens, native
-expert scales, and enabled tuning. Preparation compares the batch-one target
+expert scales, `--joint-tuning`, and enabled tuning. Preparation compares the batch-one target
 graph with eight physical rows; other capacities, vision, Engram, and KV-source
 boundaries use their standard components. The tuner keeps the fastest qualified
 composition per compared layer, including separated execution. Planning reserves
@@ -433,7 +467,7 @@ layouts used by their selected graphs.
 ```sh
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --max-concurrency 1 --mtp-draft-tokens 7 \
-  --expert-scale-compression native --persistent-decoder
+  --expert-scale-compression native --joint-tuning --persistent-decoder
 ```
 
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
@@ -447,6 +481,16 @@ without generating proposals. Ordinary graphs remain available for native
 Standalone proposal, verification, and joined wider speculative graphs are not
 registered in the packed catalog. Image preprocessing preserves the checkpoint's
 row-major patch layout and 1024-token image limit.
+
+`--joint-tuning` enables joint selection of QKV projection, query normalization,
+and query expansion plans. It covers every prepared text execution shape,
+including prefill, ordinary decode, width-one continuations, packed target
+verification, and DSpark proposals. Matching operator declarations share a
+selection scored across their layer contexts; distinct declarations are tuned
+independently. Batch capacity, physical token capacity, attention mode, and mHC
+seams determine the measured contexts. The option defaults to off and requires
+MXFP8 query normalization on the selected GPUs and `--autotune-effort default`
+or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.

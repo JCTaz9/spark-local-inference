@@ -217,9 +217,13 @@ def from_plan(model, plan, *, compiled_forwards):
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
-        persistent_decoder=plan.persistent_decoder)
+        collective_tuning=plan.collective_tuning, persistent_decoder=plan.persistent_decoder)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
+    if plan.shard_hyperconnections:
+        result['shard_hyperconnections'] = True
+    if plan.joint_tuning:
+        result['joint_tuning'] = True
     if (s := plan.speculation) is not None:
         result['speculation'] = dict(draft_tokens=s.draft_tokens,
             adaptive=s.adaptive,

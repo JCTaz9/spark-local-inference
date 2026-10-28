@@ -53,6 +53,10 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 The Python distribution and source package are named `ignition`. Install the
 preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
+Preparation commands apply the bundled, version-checked Inductor patches before
+importing preparation libraries; `uv run --locked --extra prepare ignition ...`
+uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
+for patch application in standalone Python tools.
 
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
@@ -180,8 +184,8 @@ verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
 record no history preference. Package defaults fill omitted settings; explicit
-startup settings win. Serving requires execution ABI 4 and prepared model
-contract 2; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
+startup settings win. Serving requires execution ABI 5 and prepared model
+contract 3; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
@@ -247,6 +251,9 @@ explicit flags take precedence.
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
+| `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
+| `--shard-hyperconnections` | Partition Qwen3.8 Flash target and MTP hyperconnection bottlenecks across TP ranks and all-reduce BF16 gate logits before sigmoid. Requires TP2 or TP4. Command line only; changing it requires re-export. | off (replicated) |
+| `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime additionally captures startup submode selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
@@ -797,7 +804,7 @@ selects a destination and `--form` selects packed or directory form. Conversion
 leaves its source intact. Conversion rejects logical-resource containers;
 export them again with Ignition to obtain a payload package. Serving accepts
 payload format 2 and signed format-6 logical-resource containers, both requiring
-execution ABI 4 and prepared model contract 2. Other execution ABI or prepared
+execution ABI 5 and prepared model contract 3. Other execution ABI or prepared
 contract versions require re-export.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's
@@ -937,6 +944,7 @@ max_concurrency = 4
 [preparation]
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
+# collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
 
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
@@ -1021,6 +1029,7 @@ Configuration assigns each decision to one owner:
 | Weight format, KV precision, page geometry, kernel plans | Checkpoint metadata and recipe preparation |
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
+| Collective selection | `--collective-tuning`, then `[preparation] collective_tuning`, otherwise the recipe default (`static`) |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |

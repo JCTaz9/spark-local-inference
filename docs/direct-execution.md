@@ -16,11 +16,16 @@ given, and neither `run`, `export` nor Flare accepts them.
 
 A fault that reproduces through direct graph replay does not depend on Helios's
 scheduler, transport frames or native replay. A fault that reproduces under
-`--eager` does not depend on CUDA graph capture or replay; one that disappears
-under `--eager` points at what replay does differently (see "Eager forwards"
+`--eager` request execution does not depend on replaying request graphs; one that disappears
+under `--eager` points at what request replay does differently (see "Eager forwards"
 below). Preparing with `--no-compile` additionally separates compiled forwards
 from the recipe's Python forwards. Every run prepares from the checkpoint;
 there is no package.
+
+Both modes replay referenced startup tuning graphs before accepting requests.
+Ranks agree on producer order and binding schemas, then check every producer's
+completion status. Selected bindings remain fixed during requests. Eager mode
+releases graph executables only after startup tuning completes.
 
 ## Usage
 

@@ -30,7 +30,7 @@ def test_manifest_offsets_are_stable_across_graphs(monkeypatch):
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = execution.manifest()
     assert manifest["context"] == 9
-    assert manifest["abi_version"] == 4
+    assert manifest["abi_version"] == 5
     assert manifest["input_frame_bytes"] == 152
     decode, prefill = manifest["graphs"]
     assert decode["estimated_duration_ns"] == 123_000
@@ -140,7 +140,7 @@ def test_speculative_manifest_exports_vector_abi(monkeypatch):
     spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12], spans))
     manifest = execution.manifest()
-    assert manifest["abi_version"] == 4
+    assert manifest["abi_version"] == 5
     assert manifest["graphs"][0]["kind"] == "speculative"
     assert manifest["graphs"][0]["token_capacity"] == 8
     assert manifest["input_frame_bytes"] == 152
@@ -224,7 +224,7 @@ def test_mixed_manifest_preserves_both_capacities_and_decode_mode(monkeypatch, p
     spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 1), (24576, 4)]
     monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11], spans))
     manifest = execution.manifest(all_variants=True)
-    assert manifest["abi_version"] == 4
+    assert manifest["abi_version"] == 5
     graph, = manifest["graphs"]
     from ignition.preparation.runtime_package_pb2 import ExecutionGraph
     encoded = ExecutionGraph(**{k: v for k, v in graph.items() if k != "handle"})

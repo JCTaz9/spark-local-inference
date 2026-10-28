@@ -95,6 +95,29 @@ class GraphSignature:
             raise ValueError("reserved execution buffers are bound automatically")
 
 
+@dataclass(frozen=True)
+class TunedBinding:
+    buffer: str
+    tuning_graph: str
+
+    def __post_init__(self):
+        if any(not isinstance(value, str) or not value.strip() for value in (self.buffer, self.tuning_graph)):
+            raise ValueError("tuned bindings require buffer and tuning graph names")
+
+
+@dataclass(frozen=True)
+class TuningGraph:
+    graph: Any
+    outputs: tuple[str, ...]
+    status_buffer: str
+
+    def __post_init__(self):
+        if not self.outputs or len(set(self.outputs)) != len(self.outputs):
+            raise ValueError("tuning graphs require distinct persistent outputs")
+        if self.status_buffer in self.outputs:
+            raise ValueError("tuning status must be separate from selected outputs")
+
+
 class PreparedExecution(PreparedGraphBundle):
     """Retain immutable graph ownership and export the matching native ABI.
 
@@ -105,10 +128,23 @@ class PreparedExecution(PreparedGraphBundle):
     """
 
     def __init__(self, *, signatures: Mapping[str, GraphSignature], max_active: int = 4,
-                 estimated_durations_ns=None, export_zero_ranges=(), export_events=None, **kwargs):
-        super().__init__(**kwargs)
+                 estimated_durations_ns=None, export_zero_ranges=(), export_events=None,
+                 tuning_graphs=None, tuned_bindings=None, **kwargs):
+        serving = dict(kwargs.pop("graphs"))
+        tuners = dict(tuning_graphs or {})
+        if set(serving).intersection(tuners):
+            raise ValueError("serving and tuning graph names must be distinct")
+        if any(not isinstance(value, TuningGraph) for value in tuners.values()):
+            raise TypeError("startup tuning entries must be TuningGraph objects")
+        super().__init__(graphs={**serving, **{name: value.graph for name, value in tuners.items()}}, **kwargs)
+        self.serving_graphs = MappingProxyType(serving)
+        self.tuning_graphs = MappingProxyType(tuners)
+        bindings = {name: tuple(values) for name, values in (tuned_bindings or {}).items()}
+        if not bindings.keys() <= serving.keys():
+            raise ValueError("tuned bindings must name serving graphs")
+        self.tuned_bindings = MappingProxyType(bindings)
         request_capacity(max_active)
-        if signatures.keys() != self.graphs.keys():
+        if signatures.keys() != self.serving_graphs.keys():
             raise ValueError("every prepared graph requires exactly one signature")
         if any(not isinstance(value, GraphSignature) for value in signatures.values()):
             raise TypeError("prepared graph signatures must be GraphSignature objects")
@@ -122,9 +158,27 @@ class PreparedExecution(PreparedGraphBundle):
                 raise ValueError("graph signature references an unregistered input buffer")
         from ignition.components.completion import validate_completion_buffers
         validate_completion_buffers(self.buffers, request_capacity(max_active))
+        uploads = {"frame_index", "submission_sequence", "logprob_requested", "logprob_token_ids", "logprob_token_id_counts"}
+        uploads.update(field for signature in signatures.values() for field in signature.inputs)
+        for name, tuner in tuners.items():
+            if not {*tuner.outputs, tuner.status_buffer} <= self.buffers.keys():
+                raise ValueError("tuning graphs reference unregistered persistent buffers")
+            status = self.buffers[tuner.status_buffer]
+            if str(status.dtype) != "torch.int32" or tuple(status.shape) != (1,):
+                raise ValueError("tuning graph status must be int32[1]")
+            if uploads.intersection((*tuner.outputs, tuner.status_buffer)):
+                raise ValueError("tuning outputs and status cannot receive host uploads")
+        for values in bindings.values():
+            if any(not isinstance(value, TunedBinding) for value in values):
+                raise TypeError("serving tuning dependencies must be TunedBinding objects")
+            if len({value.buffer for value in values}) != len(values):
+                raise ValueError("serving graph has duplicate tuned buffers")
+            for value in values:
+                if value.tuning_graph not in tuners or value.buffer not in tuners[value.tuning_graph].outputs:
+                    raise ValueError("tuned binding must name an output of its tuning graph")
         self.signatures = MappingProxyType(dict(signatures))
-        durations = dict.fromkeys(self.graphs, 0) if estimated_durations_ns is None else dict(estimated_durations_ns)
-        if durations.keys() != self.graphs.keys() or any(
+        durations = dict.fromkeys(self.serving_graphs, 0) if estimated_durations_ns is None else dict(estimated_durations_ns)
+        if durations.keys() != self.serving_graphs.keys() or any(
                 type(value) is not int or not 0 <= value < 1 << 64 for value in durations.values()):
             raise ValueError("graph duration estimates must cover the catalog with unsigned nanoseconds")
         self.estimated_durations_ns = MappingProxyType(durations)
@@ -154,7 +208,9 @@ class PreparedExecution(PreparedGraphBundle):
                 cursor += nbytes
         graphs = []
         speculative = any(signature.kind == "speculative" for signature in self.signatures.values())
-        for (name, _), handle in zip(self.graphs.items(), handles, strict=True):
+        graph_handles = dict(zip(self.graphs, handles, strict=True))
+        for name in self.serving_graphs:
+            handle = graph_handles[name]
             signature = self.signatures[name]
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
@@ -167,6 +223,8 @@ class PreparedExecution(PreparedGraphBundle):
                 "estimated_duration_ns": self.estimated_durations_ns[name],
                 "input_bindings": [{"buffer_name": field, "host_offset": offsets[field][0],
                                     "nbytes": offsets[field][1]} for field in inputs]})
+            graphs[-1]["tuned_bindings"] = [dict(buffer=value.buffer, tuning_graph=value.tuning_graph)
+                for value in self.tuned_bindings.get(name, ())]
             if signature.speculation_enabled is not None:
                 graphs[-1]["speculation_enabled"] = signature.speculation_enabled
             if signature.packed_token_capacity:
@@ -174,10 +232,12 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.draft_tokens is not None:
                 graphs[-1].update(draft_tokens=signature.draft_tokens,
                                   verify_tokens=signature.token_capacity, draft_source=1)
-        abi_version = 4
+        abi_version = 5
         return {"abi_version": abi_version, "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
-                "buffers": descriptors, "graphs": graphs}
+                "buffers": descriptors, "graphs": graphs,
+                "tuning_graphs": [dict(name=name, handle=graph_handles[name], outputs=list(value.outputs),
+                                       status_buffer=value.status_buffer) for name, value in self.tuning_graphs.items()]}
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

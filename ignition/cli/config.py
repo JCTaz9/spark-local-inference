@@ -19,7 +19,7 @@ _SECTIONS = {
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str},
+    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str},
     "prefix_cache": {"memory": str, "disk_limit": str, "disk_transport": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
@@ -32,6 +32,7 @@ _BUILT_IN = {
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
+    "preparation.collective_tuning": None,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.disk_transport": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
@@ -105,6 +106,8 @@ class Configuration:
                 raise UsageError(f"{path}: {key} in [{section}] must be {schema[key].__name__}")
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
+            if key == "collective_tuning" and value not in ("static", "runtime"):
+                raise UsageError(f"{path}: collective_tuning must be static or runtime")
             if key == "port" and not 1 <= value <= 65535:
                 raise UsageError(f"{path}: port in [{section}] must be 1 through 65535")
             if key in ("max_concurrency", "image_concurrency", "speculative_token_capacity",
@@ -163,6 +166,7 @@ class Configuration:
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
             '# autotune_effort = "default"    # off, default, audit',
+            '# collective_tuning = "static"  # static, runtime; omitted uses recipe default',
             "", "[memory]",
             f'# reserve = "{self.get("memory.reserve").value}"'
             "                   # GPU memory left untouched for processes that start later",

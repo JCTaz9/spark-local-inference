@@ -449,6 +449,7 @@ def test_uncached_checkpoint_downloads_before_export(host, monkeypatch):
 def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_path):
     from ignition.cli.config import Configuration
 
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
@@ -469,6 +470,7 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
 @pytest.mark.parametrize("configured", (False, True))
 @pytest.mark.parametrize("inherited_cuda", (None, "/system/cuda"))
 def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, tmp_path, configured, inherited_cuda):
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     package = tmp_path / "site-packages" / "nvidia"
     compiler = package / "cu13" / "bin" / "nvcc"
     compiler.parent.mkdir(parents=True)
@@ -499,6 +501,7 @@ def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeyp
     from ignition.cli.config import Configuration
     from ignition.recipes.kimi3.recipe import RECIPE
 
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", *RECIPE.b12x_environment):

@@ -36,7 +36,7 @@ capacities fail admission.
 Payload packages use `PackageBody.format_version` 2 with a signed payload
 envelope and unsigned `LocationSet`. Each executable resource is one zstd
 level-3 frame with a signed decoded length and compressed-chunk commitments.
-Execution ABI 4, prepared model contract 2, and payload format 2 are independent
+Execution ABI 5, prepared model contract 3, and payload format 2 are independent
 version domains. A package with another execution ABI or prepared contract
 requires re-export with Ignition and fails loading before replay.
 
@@ -69,7 +69,7 @@ serving contract and replay path unchanged.
 
 | Field | Meaning |
 |---|---|
-| `version` | Semantic contract version, 2 |
+| `version` | Semantic contract version, 3 |
 | `vocabulary` | Valid sampled token range and histogram/mask geometry |
 | `input_vocabulary` | Valid input range, including declared nonsampled image sentinels |
 | `vision` | Feature-slot and per-window feature capacities, patch-to-feature ratio, and captured patch capacities |
@@ -104,6 +104,14 @@ padding across the request capacity. Packed-token indices follow each lane's
 actual token count. Integer offsets and padding are declared separately.
 Omitted transfers retain device bytes; scratch buffers need no host value source.
 The execution transport owns frame index and submission sequence.
+
+`GraphContract.tuned_bindings` names persistent buffers populated by captured
+startup tuning graphs. Each binding declares the buffer and its producer graph
+name, matching the physical execution descriptor exactly. Producers belong to
+the execution manifest's separate tuning catalog. Their outputs cannot overlap
+request inputs, writable graph state, or cache storage. Startup executes required
+producers before exposing the dependent serving graphs; selection logic belongs
+to the captured producer. See [startup tuning bindings](manifest.md#startup-tuning-bindings).
 
 Shared packing resolves sources, types, extents, and indexing once at startup.
 It uses bounded host staging, initializes admission histograms once, and uploads
@@ -196,7 +204,7 @@ readmission, and offload consume the same storage contract.
 A completion cursor names committed state and its lag behind target consumption.
 For a successful speculative lane, the reported draft cursor must equal
 `max(consumed_tokens - lag_tokens, 0)`. A graph with no draft cursor reports -1.
-Sampled IDs must fit the vocabulary; the ABI4 reserved model field remains -1.
+Sampled IDs must fit the vocabulary; the ABI5 reserved model field remains -1.
 The scheduler independently validates generations, submission order, accepted
 counts, and request endpoints before retiring any lane.
 

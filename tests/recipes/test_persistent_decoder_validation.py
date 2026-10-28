@@ -43,3 +43,19 @@ def test_fp64_dot_bound_rejects_values_outside_rounding_bound():
             right,
             role="bounded test projection",
         )
+
+
+def test_rotary_projection_requires_zero_output_for_inactive_rows():
+    from ignition.recipes.deepseek41.persistent_validation import _rotated_dot
+
+    left = torch.ones((2, 1), dtype=torch.float64)
+    right = torch.full((512, 1), 0.125, dtype=torch.float64)
+    angles = torch.zeros((2, 32, 2))
+    angles[..., 0] = 1
+    positions = torch.tensor([16, -1])
+    output = torch.full((2, 1, 512), 0.125, dtype=torch.bfloat16)
+    output[1] = 0
+    _rotated_dot(output, left, right, angles, positions, role="masked rotary projection")
+    output[1, 0, 0] = 0.125
+    with pytest.raises(AssertionError, match="declared rounding bounds"):
+        _rotated_dot(output, left, right, angles, positions, role="masked rotary projection")

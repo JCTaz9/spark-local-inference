@@ -194,6 +194,13 @@ pub(crate) fn execution(
         }
 
     }
+    if let Some(tuners) = object.get_mut("tuning_graphs") {
+        for tuner in tuners.as_array_mut()
+            .ok_or_else(|| super::invalid("tuning graphs must be an array"))? {
+            tuner.as_object_mut()
+                .ok_or_else(|| super::invalid("invalid tuning graph"))?.remove("handle");
+        }
+    }
     message("Execution", &value)
 }
 
@@ -819,6 +826,23 @@ fn export_serving<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_tuning_export_preserves_bindings_and_omits_process_handles() {
+        let value = serde_json::json!({
+            "abi_version": 5, "max_active": 1, "input_frame_bytes": 8, "buffers": [],
+            "graphs": [{"name": "decode", "kind": "decode", "handle": 17,
+                "tuned_bindings": [{"buffer": "winner", "tuning_graph": "tune"}]}],
+            "tuning_graphs": [{"name": "tune", "handle": 18,
+                "outputs": ["winner"], "status_buffer": "status"}]
+        });
+        let encoded = execution(&value, &[]).unwrap();
+        assert_eq!(encoded.tuning_graphs[0].name, "tune");
+        assert_eq!(encoded.tuning_graphs[0].outputs, ["winner"]);
+        assert_eq!(encoded.tuning_graphs[0].status_buffer, "status");
+        assert_eq!(encoded.graphs[0].tuned_bindings[0].tuning_graph, "tune");
+        assert_eq!(encoded.graphs[0].tuned_bindings[0].buffer, "winner");
+    }
+
     fn rebuild_catalog() -> (super::super::wire::RebuildWeights, Vec<super::super::wire::Allocation>) {
         use super::super::wire;
         (wire::RebuildWeights {
@@ -984,7 +1008,7 @@ mod tests {
             snapshot_spans: None,
             sizing: None,
         };
-        let input = serde_json::json!({"abi_version":4,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
+        let input = serde_json::json!({"abi_version":5,"context":42,"device":0,"buffers":[{"name":"token","address":4128,"nbytes":4,"dtype":"int32","shape":[1],"strides":[1]}],"graphs":[{"name":"verify","kind":"speculative","handle":123,"token_capacity":3,"draft_tokens":2,"packed_token_capacity":3,"confidence_width":0}]});
         let parsed = execution(&input, &[allocation]).unwrap();
         assert_eq!(parsed.buffers[0].reference.as_ref().unwrap().offset, 32);
         assert_eq!(parsed.graphs[0].draft_tokens, Some(2));

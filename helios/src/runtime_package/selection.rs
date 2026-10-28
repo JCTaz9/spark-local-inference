@@ -186,6 +186,7 @@ impl LoadOptions {
         let selected_token_capacity = verification_token_limit.map_or(token_capacity, |budget| token_capacity.min(budget as u64));
         let widths: Vec<_> = widths.into_iter().filter(|_| enabled).collect();
         let mut rank_catalog = None;
+        let mut rank_tuning_catalog = None;
         for (rank, package) in packages.iter_mut().enumerate() {
             let execution = package.execution.as_mut().ok_or_else(|| invalid("rank lacks serving contract"))?;
             if execution.abi_version != crate::execution::ABI_VERSION {
@@ -194,6 +195,7 @@ impl LoadOptions {
             if execution.max_active != prepared as u64 {
                 return Err(invalid("rank concurrency capacities differ"));
             }
+            let all_serving_names: HashSet<_> = execution.graphs.iter().map(|graph| graph.name.clone()).collect();
             let mut names = HashSet::new();
             let mut variants = HashSet::new();
             for graph in &execution.graphs {
@@ -236,8 +238,13 @@ impl LoadOptions {
                     return Err(invalid("invalid or duplicate serving graph variant"));
                 }
             }
+            for graph in &execution.tuning_graphs {
+                if graph.name.is_empty() || !names.insert(graph.name.clone()) {
+                    return Err(invalid("duplicate or unnamed startup tuning graph"));
+                }
+            }
             let resources: HashSet<_> = package.graphs.iter().map(|g| g.name.clone()).collect();
-            if names != resources {
+            if names != resources || resources.len() != package.graphs.len() {
                 return Err(invalid("execution catalog must describe every captured graph exactly once"));
             }
             execution.graphs.retain(|graph| {
@@ -278,15 +285,56 @@ impl LoadOptions {
                     return Err(invalid(format!("rank {rank} lacks speculative graph for batch {batch} within selected generation geometry")));
                 }
             }
+            let mut tuning_names = HashSet::new();
+            let mut outputs = HashSet::new();
+            for tuner in &execution.tuning_graphs {
+                if tuner.name.is_empty() || all_serving_names.contains(&tuner.name)
+                    || !tuning_names.insert(tuner.name.as_str()) || tuner.outputs.is_empty()
+                    || tuner.status_buffer.is_empty()
+                    || !package.graphs.iter().any(|graph| graph.name == tuner.name) {
+                    return Err(invalid("invalid startup tuning graph catalog"));
+                }
+                for output in tuner.outputs.iter().chain(std::iter::once(&tuner.status_buffer)) {
+                    if !outputs.insert(output.as_str())
+                        || !execution.buffers.iter().any(|buffer| buffer.name == *output) {
+                        return Err(invalid("startup tuning storage requires one registered producer"));
+                    }
+                }
+            }
+            let mut referenced = HashSet::new();
+            for graph in &execution.graphs {
+                for binding in &graph.tuned_bindings {
+                    if !execution.tuning_graphs.iter().any(|tuner|
+                        tuner.name == binding.tuning_graph && tuner.outputs.contains(&binding.buffer)) {
+                        return Err(invalid("tuned binding has no declared startup producer"));
+                    }
+                    referenced.insert(binding.tuning_graph.clone());
+                }
+            }
+            execution.tuning_graphs.retain(|graph| referenced.contains(&graph.name));
+            let tuning_catalog: Vec<_> = execution.tuning_graphs.iter().map(|graph| {
+                let storage: Vec<_> = graph.outputs.iter().chain(std::iter::once(&graph.status_buffer))
+                    .map(|name| {
+                        let buffer = execution.buffers.iter().find(|buffer| buffer.name == *name).unwrap();
+                        (name.clone(), buffer.dtype.clone(), buffer.nbytes, buffer.shape.clone(), buffer.strides.clone())
+                    }).collect();
+                (graph.name.clone(), graph.outputs.clone(), graph.status_buffer.clone(), storage)
+            }).collect();
+            if rank_tuning_catalog.as_ref().is_some_and(|expected| *expected != tuning_catalog) {
+                return Err(invalid("selected startup tuning catalogs differ between ranks"));
+            }
+            rank_tuning_catalog = Some(tuning_catalog);
             let catalog: BTreeSet<_> = execution.graphs.iter().map(|g|
                 (g.name.clone(), g.kind.clone(), g.sampling_mode.clone(), g.batch_capacity,
                     g.token_capacity, g.prefill_capacity, g.packed_token_capacity, g.draft_tokens,
-                    g.verify_tokens, g.draft_source, g.confidence_width)).collect();
+                    g.verify_tokens, g.draft_source, g.confidence_width,
+                    g.tuned_bindings.iter().map(|binding| (binding.buffer.clone(), binding.tuning_graph.clone())).collect::<Vec<_>>())).collect();
             if rank_catalog.as_ref().is_some_and(|expected| *expected != catalog) {
                 return Err(invalid("selected graph catalogs differ between ranks"));
             }
             rank_catalog = Some(catalog);
-            let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str()).collect();
+            let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str())
+                .chain(execution.tuning_graphs.iter().map(|g| g.name.as_str())).collect();
             package.graphs.retain(|g| selected.contains(g.name.as_str()));
             prune_kernels(package)?;
         }
@@ -439,6 +487,64 @@ mod tests {
         }
     }
 
+    fn tuning_package() -> Package {
+        let mut package = package();
+        let function = package.graphs.last().unwrap().functions[0];
+        for name in ["tune", "unused_tune"] {
+            package.graphs.push(Graph {
+                name: name.into(), flags: 0, resource: name.into(), node_count: 1, edge_count: 0,
+                functions: vec![function],
+            });
+        }
+        let execution = package.execution.as_mut().unwrap();
+        for name in ["winner", "status", "unused_winner", "unused_status"] {
+            execution.buffers.push(wire::Buffer {
+                name: name.into(), nbytes: 4, dtype: "int32".into(), shape: vec![1], strides: vec![1],
+                ..Default::default()
+            });
+        }
+        execution.tuning_graphs = vec![
+            wire::TuningGraph { name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into() },
+            wire::TuningGraph { name: "unused_tune".into(), outputs: vec!["unused_winner".into()], status_buffer: "unused_status".into() },
+        ];
+        for graph in &mut execution.graphs {
+            if graph.name == "decode1-no-mtp" {
+                graph.tuned_bindings.push(wire::TunedBinding { buffer: "winner".into(), tuning_graph: "tune".into() });
+            }
+        }
+        package
+    }
+
+    #[test]
+    fn selected_graphs_retain_startup_producers_and_their_kernels() {
+        let package = tuning_package();
+        let function = package.graphs.iter().find(|graph| graph.name == "tune").unwrap().functions[0];
+        let mut packages = [package];
+        LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(&mut packages, &mut config()).unwrap();
+        let package = &packages[0];
+        assert!(package.graphs.iter().any(|graph| graph.name == "tune"));
+        assert!(!package.graphs.iter().any(|graph| graph.name == "unused_tune"));
+        assert!(package.functions.iter().any(|item| item.id == function));
+        assert_eq!(package.execution.as_ref().unwrap().tuning_graphs.len(), 1);
+    }
+
+    #[test]
+    fn startup_producer_selection_rejects_dangling_and_rank_mismatched_schemas() {
+        for invalid in 0..4 {
+            let mut packages = [tuning_package(), tuning_package()];
+            let execution = packages[1].execution.as_mut().unwrap();
+            match invalid {
+                0 => execution.tuning_graphs[0].outputs[0] = "missing".into(),
+                1 => execution.buffers.iter_mut().find(|buffer| buffer.name == "winner").unwrap().dtype = "float32".into(),
+                2 => execution.tuning_graphs[0].name = "decode1-no-mtp".into(),
+                _ => execution.tuning_graphs[1].outputs[0] = "winner".into(),
+            }
+            assert!(LoadOptions { max_concurrency: Some(1), mtp_draft_tokens: Some(0), ..Default::default() }
+                .select(&mut packages, &mut config()).is_err());
+        }
+    }
+
     fn config() -> Value {
         serde_json::json!({"speculative_token_capacity": 24, "speculative_widths": [1,2,3,4,5,6], "speculative_fixed_width": null})
     }
@@ -455,7 +561,7 @@ mod tests {
                 if let Some(stored) = stored {
                     let bytes = [0x68, u8::from(stored)];
                     let mut contract = wire::ServingContract::decode(bytes.as_slice()).unwrap();
-                    contract.model_contract = Some(wire::ModelContract { version: 2, ..Default::default() });
+                    contract.model_contract = Some(wire::ModelContract { version: 3, ..Default::default() });
                     let decoded = super::super::protobuf::serving_contract(contract, 4).unwrap();
                     configuration["history_drafts"] = decoded["history_drafts"].clone();
                 }
@@ -1406,7 +1512,7 @@ mod tests {
     #[test]
     fn malformed_rounds_and_obsolete_abis_reject_before_loading() {
         for rank in [0usize, 1] {
-            for abi in [0, 1, 2, 3, 5] {
+            for abi in [0, 1, 2, 3, 4, 6] {
                 let mut ranks = [round_package(8, 48, false), round_package(8, 48, false)];
                 ranks[rank].execution.as_mut().unwrap().abi_version = abi;
                 assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string().contains("execution ABI"));

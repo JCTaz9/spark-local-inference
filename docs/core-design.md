@@ -321,7 +321,7 @@ same boundary; violations must be resolved before committing.
   Independent enum identifiers select reusable tool/reasoning parsers and image
   preparation/layout implementations only. Review every field and all consumers.
 - **Model packages enforce versioned contracts.** Serving requires payload format
-  2, execution ABI 4, and prepared model contract 2. Other execution ABI or
+  2, execution ABI 5, and prepared model contract 3. Other execution ABI or
   prepared contract versions fail before replay and require re-export. Semantic
   changes require explicit versioning; removed Protobuf fields and enum values
   remain reserved. Remove superseded loaders and migration-only tests. Backward
@@ -829,6 +829,14 @@ model startup always uses the batched, tuned lifecycle.
 Bound addresses must not change after capture.
 The arena remains owned until all referencing graphs and native CUDA work drain.
 
+Serving graphs may declare persistent bindings produced by named startup tuning
+graphs. Preparation compiles and captures those producers with their candidate
+kernels, fixtures, and workspace. Native startup runs each required producer once
+after rank transports are ready, before serving. The producer measures candidates
+and writes its selected values directly into consumer storage; Helios validates
+dependencies and completion without interpreting the values. No compilation,
+recapture, or configuration search occurs during request execution.
+
 One preparation-owned auxiliary stream overlaps independent GDN projections,
 shared and routed experts, and QSA selection with its main QKV producer.
 Concurrent branches use disjoint scratch views. Opaque operations preserve
@@ -968,7 +976,7 @@ writes.
 Each selected graph declares its continuation-row requirement and embedding-table
 resource IDs. A speculative completion cursor references the graph's updated
 history storage and a token lag, or is absent when the graph maintains no draft
-history. ABI4 uses 24-field completions for every operation.
+history. ABI5 uses 24-field completions for every serving operation.
 
 Captured operators use b12x's default numerical policy and tuned execution plans.
 MoE reductions may use arrival-ordered atomic additions, so identical graph inputs
@@ -1231,7 +1239,7 @@ manage penalties, grammar masks and request-state updates. Temperature must be
 positive; zero-temperature requests are rejected because greedy decoding
 collapses the model's probability distribution.
 
-Execution ABI 4 uses `sampling_mode="general"` as their sole
+Execution ABI 5 uses `sampling_mode="general"` as their sole
 supported manifest value. Bounded top-k optimization is deferred. Measure
 sampler cost inside the complete graph before changing it; threshold ties
 must never be truncated to a fixed number of candidates.

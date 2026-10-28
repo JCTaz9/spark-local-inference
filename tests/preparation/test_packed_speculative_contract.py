@@ -46,7 +46,7 @@ def test_manifest_preserves_shallow_depth_and_requires_vector_completion(monkeyp
     manifest = execution.manifest()
     encoded = p.ExecutionGraph(**{k: v for k, v in manifest["graphs"][0].items() if k != "handle"})
     decoded = p.ExecutionGraph.FromString(encoded.SerializeToString())
-    assert manifest["abi_version"] == 4
+    assert manifest["abi_version"] == 5
     assert (decoded.draft_tokens, decoded.verify_tokens, decoded.packed_token_capacity) == (1, 6, 128)
     assert decoded.draft_source == p.MTP
     assert decoded.confidence_width == 1

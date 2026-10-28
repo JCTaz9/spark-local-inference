@@ -368,6 +368,9 @@ pub struct GraphExecutor {
     pub(super) copy_logprobs: bool,
     resources: Option<Resources>,
     resolved_uploads: Vec<ResolvedUpload>,
+    startup_next: usize,
+    startup_ready: bool,
+    diagnostic_choices: Vec<(Vec<u32>, Vec<String>)>,
     next_sequence: u64,
     completed: Fence,
     poison: Option<Error>,
@@ -382,6 +385,18 @@ impl GraphExecutor {
     /// until close confirms both streams drained. No other executor may mutate
     /// these inputs, graph executables, scratch or completion rows concurrently.
     pub unsafe fn new(manifest: ExecutionManifest) -> Result<Self> {
+        let mut executor = unsafe { Self::new_unstarted(manifest)? };
+        let started = Instant::now();
+        for index in executor.manifest.referenced_tuning_graphs() {
+            executor.run_tuning_graph(index)?;
+        }
+        executor.finish_startup()?;
+        executor.report_startup(started);
+        Ok(executor)
+    }
+
+    /// Construct rank-local streams without launching any collective graphs.
+    pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
         let upload_capacity = manifest
             .graphs
@@ -453,12 +468,159 @@ impl GraphExecutor {
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
+            startup_next: 0,
+            startup_ready: false,
+            diagnostic_choices: Vec::new(),
             next_sequence: 1,
             completed: Fence(0),
             poison: None,
             shutdown: None,
             _thread_bound: PhantomData,
         })
+    }
+
+    pub(super) fn run_tuning_graph(&mut self, index: usize) -> Result<()> {
+        let order = self.manifest.referenced_tuning_graphs();
+        if self.startup_ready || order.get(self.startup_next) != Some(&index) {
+            return Err("startup tuning graph order differs from the manifest".into());
+        }
+        let graph = &self.manifest.tuning_graphs[index];
+        let status = self.manifest.buffer(&graph.status_buffer)?;
+        let resources = self.resources.as_ref().ok_or("executor is closed")?;
+        let mut reset = resources.model.host_buffer(4)?;
+        reset.bytes_mut().copy_from_slice(&(-1i32).to_ne_bytes());
+        let readback = resources.model.host_buffer(4)?;
+        let outputs = graph.outputs.iter().map(|name| {
+            let buffer = self.manifest.buffer(name)?;
+            Ok((buffer, resources.model.host_buffer(buffer.nbytes.min(64))?))
+        }).collect::<Result<Vec<_>>>()?;
+        let completed = resources.model.event()?;
+        let started = Instant::now();
+        let result = (|| -> Result<()> {
+            // Pinned buffers remain alive until the event confirms all transfers.
+            unsafe { resources.model.upload(status.address, &reset, 0, 4)?; }
+            resources.model.launch(graph.handle)?;
+            unsafe { resources.model.download(&readback, status.address, 4)?; }
+            for (buffer, host) in &outputs {
+                unsafe { resources.model.download(host, buffer.address, buffer.nbytes.min(64))?; }
+            }
+            resources.model.record(&completed)?;
+            while !completed.completed()? {
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    return Err("startup tuning graph completion deadline expired".into());
+                }
+                if let Some(health) = &self.manifest.collectives { (health.0)()?; }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Record after any accepted commands so even a failed enqueue can drain.
+            let drained = resources.model.record(&completed).and_then(|()| {
+                loop {
+                    if completed.completed()? { return Ok(()); }
+                    if started.elapsed() > std::time::Duration::from_secs(120) {
+                        return Err("startup CUDA drain deadline expired".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            });
+            if drained.is_err() {
+                // Constructor failure cannot return an undrained ownership lease.
+                eprintln!("startup tuning failed before CUDA drain: {error}; terminating the CUDA process");
+                std::process::abort();
+            }
+            return Err(error);
+        }
+        let status = i32::from_ne_bytes(readback.bytes().try_into().unwrap());
+        if status != 0 {
+            return Err(format!("startup tuning graph {:?} failed with status {status}", graph.name).into());
+        }
+        let mut profiles = outputs.iter().filter_map(|(_, host)| {
+            <[u8; 4]>::try_from(host.bytes()).ok().map(u32::from_ne_bytes)
+        }).collect::<Vec<_>>();
+        profiles.sort_unstable();
+        profiles.dedup();
+        let consumers = self.manifest.graphs.iter().filter(|consumer| {
+            consumer.tuned_bindings.iter().any(|binding| binding.tuning_graph == graph.name)
+        }).map(|consumer| consumer.name.clone()).collect();
+        self.diagnostic_choices.push((profiles, consumers));
+        self.startup_next += 1;
+        Ok(())
+    }
+
+    pub(super) fn report_startup(&self, started: Instant) {
+        if self.startup_next != 0 {
+            eprintln!("Startup tuning: {} graphs completed in {:.2}s", self.startup_next, started.elapsed().as_secs_f64());
+            self.report_collective_choices();
+        }
+    }
+
+    fn report_collective_choices(&self) {
+        use std::collections::BTreeMap;
+        use std::fmt::Write;
+
+        // Temporary interpretation of Qwen graph names and b12x packed selectors.
+        fn mode(value: u32) -> &'static str {
+            match value >> 16 {
+                0 => "Full", 1 => "Payload RSAG", 2 => "Bulk Push",
+                3 => "Bulk Pull", 4 => "Pull", _ => "Unknown",
+            }
+        }
+        fn describe(profiles: impl Iterator<Item = u32>) -> String {
+            let mut modes: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+            for value in profiles {
+                let ctas = value & 0xffff;
+                let range = modes.entry(mode(value)).or_insert((ctas, ctas));
+                range.0 = range.0.min(ctas);
+                range.1 = range.1.max(ctas);
+            }
+            modes.into_iter().map(|(name, (lo, hi))| {
+                if lo == hi { format!("{name} ({lo} CTAs)") }
+                else { format!("{name} ({lo}–{hi} CTAs)") }
+            }).collect::<Vec<_>>().join(", ")
+        }
+        let mut totals = BTreeMap::new();
+        let mut prefill = BTreeMap::<usize, Vec<u32>>::new();
+        let mut decode = Vec::new();
+        let mut shared = Vec::new();
+        for (profiles, consumers) in &self.diagnostic_choices {
+            let name = if profiles.len() == 1 { mode(profiles[0]) } else { "Mixed/unknown" };
+            *totals.entry(name).or_insert(0usize) += 1;
+            if consumers.iter().any(|name| name.starts_with("speculative")) {
+                decode.extend(profiles.iter().copied());
+            }
+            let sizes = consumers.iter().filter_map(|name| {
+                name.strip_prefix("prefill").and_then(|size| size.parse::<usize>().ok())
+            }).collect::<Vec<_>>();
+            if sizes.len() > 1 {
+                shared.extend(profiles.iter().copied());
+            } else if let Some(size) = sizes.first() {
+                prefill.entry(*size).or_default().extend(profiles.iter().copied());
+            }
+        }
+        let mut text = format!("  Collective choices · device {} · diagnostic\n", self.manifest.device);
+        let counts = totals.iter().map(|(name, count)| format!("{name}: {count} groups"))
+            .collect::<Vec<_>>().join(" · ");
+        writeln!(text, "  {counts}").unwrap();
+        if !decode.is_empty() {
+            writeln!(text, "  Decode/speculative   {}", describe(decode.into_iter())).unwrap();
+        }
+        if !shared.is_empty() {
+            writeln!(text, "  Shared across sizes  {}", describe(shared.into_iter())).unwrap();
+        }
+        for (size, profiles) in prefill {
+            writeln!(text, "  Prefill {size:>4} tokens  {}", describe(profiles.into_iter())).unwrap();
+        }
+        eprint!("{text}");
+    }
+
+    pub(super) fn finish_startup(&mut self) -> Result<()> {
+        if self.startup_next != self.manifest.referenced_tuning_graphs().len() {
+            return Err("startup tuning graphs have not completed".into());
+        }
+        self.startup_ready = true;
+        Ok(())
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
@@ -495,7 +657,7 @@ impl GraphExecutor {
         let Some(resources) = &self.resources else {
             return false;
         };
-        self.poison.is_none()
+        self.startup_ready && self.poison.is_none()
             && resources.frames[self.next_sequence as usize % 2].pending.is_none()
             && !resources
                 .frames

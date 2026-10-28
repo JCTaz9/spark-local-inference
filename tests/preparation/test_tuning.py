@@ -1508,3 +1508,22 @@ def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals(
     collective = declaration("reduce")
     collective.collective = object()
     assert _local_tuning_catalog((first, collective)) == _local_tuning_catalog((first,))
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_collective_selection_is_reported_without_partitioning_operator_cache(backend, tmp_path, mode):
+    session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode)
+    assert session.collective_tuning == mode
+    from b12x.preparation._cache import SelectionCache
+
+    static = make_session(device=0, checkpoint="collective-policy")
+    assert session.namespace == static.namespace
+    identity = dict(schema_version=23, tuning_cache_version=1, namespace=session.namespace.to_dict())
+    original = dict(schema_version=23, tuning_cache_version=1,
+                    namespace=dict(checkpoint="collective-policy", workload_schema="test-operators-v1",
+                                   numerical_policy="default"))
+    assert SelectionCache(tmp_path, identity).path == SelectionCache(tmp_path, original).path
+    static.close()
+    session.declare((declaration("op"),))
+    assert session.tune()["collective_tuning"] == mode
+    session.close()

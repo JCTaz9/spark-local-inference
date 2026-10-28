@@ -206,6 +206,7 @@ class Recipe:
     prepare: Callable
     usage: Callable
     sampling_defaults: SamplingDefaults
+    collective_tuning: str = "static"
     mapped_host_name: str = ""
     max_images: int = 0
     image_bytes: int = 0

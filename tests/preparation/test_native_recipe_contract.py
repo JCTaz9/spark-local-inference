@@ -164,7 +164,7 @@ def _recipe_metadata(recipe, *, all_variants=True):
     else:
         signatures.pop("vision-1-1-0-None", None)
         contract = module.prepare(signatures, buffers, pool, **kwargs)
-    bundle = SimpleNamespace(buffers=buffers, signatures=signatures,
+    bundle = PreparedExecution(buffers=buffers, signatures=signatures,
         graphs=dict.fromkeys(signatures), max_active=capacity, device=0,
         estimated_durations_ns=dict.fromkeys(signatures, 1))
     bundle._validate_resources = lambda: (1, list(range(1, len(signatures) + 1)),

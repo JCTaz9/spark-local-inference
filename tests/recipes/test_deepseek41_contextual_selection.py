@@ -9,34 +9,74 @@ import torch
 from b12x.preparation import Finalist, FrozenMapping, PreparedCall, Selection
 
 from ignition.recipes.deepseek41.contextual_selection import (
-    CatalogContextualSelection, contextual_summary, prepared_layer_variant,
+    CatalogContextualSelection, catalog_contexts, contextual_summary, prepared_layer_variant,
 )
 
 
-def test_contextual_admission_requires_fused_norm_device_support(monkeypatch):
+def test_context_discovery_covers_catalog_shapes_and_shared_draft_decoders():
+    from ignition.preparation.execution import GraphSignature
+    from ignition.recipes.deepseek41.bootstrap import PreparationConfig
+
+    def decoder(batch, tokens, width, mode):
+        def layer(ratio=0, carry=False):
+            return SimpleNamespace(metadata=SimpleNamespace(positions=torch.empty(tokens),
+                starts=torch.empty(batch), max_query_tokens=width), engram=None, boundary=None,
+                carry=carry, post=object(), attention=SimpleNamespace(norm_quant=object(),
+                    global_kv=None, mode=mode, ratio=ratio, selectors=(), concurrent_query=None))
+        return SimpleNamespace(layers=(layer(), layer(), layer(1), layer(1, True)))
+
+    config = PreparationConfig(speculative_widths=tuple(range(1, 9)))
+    forwards, signatures, expected = {}, {}, {}
+    drafts = {batch: SimpleNamespace(name=f"proposal{batch}",
+        draft=decoder(batch, batch * 7, 7, "draft")) for batch in config.batch_capacities}
+    for batch, tokens in config.packed_speculative_shapes:
+        name = f"packed{batch}x{tokens}"
+        target = decoder(batch, tokens, 8, "verify")
+        forwards[name] = SimpleNamespace(target=SimpleNamespace(decoder=target), source=drafts[batch])
+        signatures[name] = GraphSignature("speculative", batch, 8, packed_token_capacity=tokens)
+        expected[name + ".target"] = target
+        expected[f"proposal{batch}.draft"] = drafts[batch].draft
+    for kind, shapes in (("prefill", [(1, tokens, tokens) for tokens in config.prefill_capacities]),
+                         ("scored_prefill", [(1, 4096, 4096)]),
+                         ("decode", [(batch, batch, 1) for batch in config.batch_capacities]),
+                         ("speculative", [(batch, batch, 1) for batch in config.batch_capacities])):
+        for batch, tokens, width in shapes:
+            name = f"{kind}{batch}x{tokens}"
+            model = decoder(batch, tokens, width, "prefill" if "prefill" in kind else "decode")
+            forward = SimpleNamespace(decoder=model)
+            forwards[name] = SimpleNamespace(forward=forward) if kind == "scored_prefill" else forward
+            signatures[name] = GraphSignature(kind, batch, width,
+                inputs=("prompt_target_tokens",) if kind == "scored_prefill" else ())
+            expected[name] = model
+    contexts = list(catalog_contexts(forwards, signatures))
+    assert {name for name, _, _, _ in contexts} == set(expected)
+    assert len(contexts) == len(expected) * 3
+    for name, _, model, index in contexts:
+        assert model is expected[name]
+        assert index in (0, 2, 3)
+
+
+@pytest.mark.parametrize("kind,batch,width,packed", [("prefill", 1, 4096, 0),
+    ("decode", 32, 1, 0), ("speculative", 4, 6, 13)])
+def test_joint_tuning_is_explicit_and_accepts_every_text_shape(monkeypatch, kind, batch, width, packed):
     from b12x.quantization import mla_norm_mxfp8
     from ignition.preparation.execution import GraphSignature
     from ignition.recipes.deepseek41.bootstrap import _can_race_contextual_plans
 
-    config = SimpleNamespace(dspark=True, autotune_effort="default")
-    signatures = {"packed": GraphSignature("speculative", 1, 8,
-        speculation_enabled=True, packed_token_capacity=8, draft_tokens=7)}
+    config = SimpleNamespace(joint_tuning=False, autotune_effort="default")
+    signatures = {"graph": GraphSignature(kind, batch, width, packed_token_capacity=packed)}
     device = torch.device("cuda:0")
-    supported, probes = {"value": False}, []
-    monkeypatch.setattr(mla_norm_mxfp8, "is_supported",
-        lambda actual: probes.append(actual) or supported["value"])
-
+    monkeypatch.setattr(mla_norm_mxfp8, "is_supported", lambda device: True)
     assert not _can_race_contextual_plans(config, signatures, device)
-    supported["value"] = True
+    config.joint_tuning = True
     assert _can_race_contextual_plans(config, signatures, device)
-    assert probes == [device, device]
     config.autotune_effort = "off"
-    assert not _can_race_contextual_plans(config, signatures, device)
-    assert not _can_race_contextual_plans(SimpleNamespace(dspark=False, autotune_effort="default"),
-                                           signatures, device)
-    assert not _can_race_contextual_plans(SimpleNamespace(dspark=True, autotune_effort="default"),
-                                           {}, device)
-    assert probes == [device, device]
+    with pytest.raises(ValueError, match="autotune-effort"):
+        _can_race_contextual_plans(config, signatures, device)
+    config.autotune_effort = "default"
+    monkeypatch.setattr(mla_norm_mxfp8, "is_supported", lambda device: False)
+    with pytest.raises(ValueError, match="selected device"):
+        _can_race_contextual_plans(config, signatures, device)
 
 
 class Plan:
@@ -105,9 +145,9 @@ def test_tuple_identity_serializes_nested_b12x_query_metadata():
     attention = SimpleNamespace(projections={"qkv_a": SimpleNamespace(plan=plans[0]),
                                               "q_b": SimpleNamespace(plan=plans[2])},
                                 norm_quant=SimpleNamespace(plan=plans[1]))
-    selector.layers = (SimpleNamespace(attention=attention),)
-    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0),
-                         SimpleNamespace(layer_index=37))
+    selector.layers = (SimpleNamespace(attention=attention, metadata=SimpleNamespace(positions=torch.empty(8))),)
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0"),
+                         SimpleNamespace(layer_index=37, label="packed.layer37"))
     configs = {"qkv_a": (1,), "norm": (2,), "q_b": (3,)}
     identity = selector._tuple_name(0, configs, (0, 0, 0))
     assert identity == selector._tuple_name(0, configs, (0, 0, 0))
@@ -140,14 +180,14 @@ def test_public_b12x_declarations_supply_selector_families_and_override_requests
         attention = SimpleNamespace(projections={"qkv_a": SimpleNamespace(plan=plans[0]),
                                                   "q_b": SimpleNamespace(plan=plans[2])},
                                     norm_quant=SimpleNamespace(plan=plans[1]))
-        layers.append(SimpleNamespace(attention=attention))
+        layers.append(SimpleNamespace(attention=attention, metadata=SimpleNamespace(positions=torch.empty(8))))
         for role, plan in zip(("qkv_a", "norm", "q_b"), plans, strict=True):
             name = f"layer{index}.{role}"
             call = lambda state: PreparedCall(run=lambda: None)
             requests[name] = plan.request(name=name, prepare_call=call, benchmark_call=call)
     selector.layers = tuple(layers)
-    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0),
-                         SimpleNamespace(layer_index=37))
+    selector.fixtures = (SimpleNamespace(target_signature=SimpleNamespace(token_capacity=8), layer_index=0, label="packed.layer0"),
+                         SimpleNamespace(layer_index=37, label="packed.layer37"))
     names = selector._names(requests)
     policies = selector.finalist_policies(requests)
     assert set(policies) == set(requests)
@@ -204,13 +244,13 @@ def test_export_summary_identifies_tuple_configs_and_both_measured_layers():
                          "context-standalone": {"0": 92.0, "37": 106.0}},
         "total_us": {"context-selected": 195.0}, "standalone_total_us": 198.0,
         "cache_policy": {"0": "cold", "37": "cold"}, "rounds": 3, "samples": 2,
-        "lock_gpu_clocks": False}
-    line = contextual_summary(report)
-    assert line.startswith("Selected complete-layer plans: ")
-    payload = json.loads(line.split(": ", 1)[1])
+        "lock_gpu_clocks": False, "contexts": ("packed.layer0", "packed.layer37"), "target_rows": 8}
+    line = contextual_summary({"groups": [report]})
+    assert line.startswith("Selected joint plans: ")
+    payload = json.loads(line.split(": ", 1)[1])[0]
     assert payload["configs"] == report["winner_configs"]
     assert payload["layer_us"] == {"0": 90.0, "37": 105.0}
-    assert payload["standalone_layer_us"] == {"0": 92.0, "37": 106.0}
+    assert payload["contexts"] == ["packed.layer0", "packed.layer37"]
     assert payload["sum_us"] == 195.0 and payload["standalone_sum_us"] == 198.0
 
 
@@ -241,8 +281,8 @@ def test_context_race_captures_every_tuple_with_optional_compilation(monkeypatch
     monkeypatch.setattr(module, "prepared_layer_variant", lambda layer, **plans: plans)
     monkeypatch.setattr(module, "ContextCandidate", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2 << 30, 4 << 30))
-    fixture = SimpleNamespace(layer_index=0,
-        target_signature=GraphSignature("speculative", 1, 8),
+    fixture = SimpleNamespace(layer_index=0, label="packed.layer0",
+        trial_signature=GraphSignature("speculative", 1, 8),
         trial_forward=lambda layer: lambda: None,
         restore_tune=lambda layer: restored.append(layer),
         prepared_call=lambda name, graph, compiled, layer: PreparedCall(
@@ -256,7 +296,7 @@ def test_context_race_captures_every_tuple_with_optional_compilation(monkeypatch
              (0, "q_b"): (object(),)}
     selector._race_layer(session, fixture, 0, {}, plans, None,
                          ((0, 0, 0), (1, 0, 0)))
-    assert captured == [(("tuple-0-layer0", "tuple-1-layer0"),
-                         "context-layer0-plan-family" if compile_decoder else None)]
+    assert captured == [(("tuple-0-context0", "tuple-1-context0"),
+                         "packed.layer0-plan-family" if compile_decoder else None)]
     assert len(restored) == 2 and len(reset) == 2
     assert calls == [(2, 2)]

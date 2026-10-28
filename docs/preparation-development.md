@@ -147,7 +147,9 @@ winner; component names do not identify separate tuning workloads.
 order. Each candidate executes on the whole TP group and is scored by the slowest
 rank. `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
-No tuning coordination runs after graph handoff.
+Preparation-time search ends before graph handoff. Captured startup tuning
+graphs may select among prepared submodes before serving begins; native rank
+coordination only launches those graphs and waits for their completion.
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles

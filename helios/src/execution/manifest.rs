@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{BufferSpan, Error, ExecutionError, GraphBundle, Result};
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 pub const VECTOR_RECORD_FIELDS: usize = 24;
 pub const MAX_OUTPUT_TOKENS: usize = 8;
 pub const REQUEST_LANES: usize = 64;
@@ -153,6 +153,22 @@ pub struct InputBinding {
     pub nbytes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(deny_unknown_fields))]
+pub struct TunedBinding {
+    pub buffer: String,
+    pub tuning_graph: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TuningGraphDescriptor {
+    pub name: String,
+    pub handle: usize,
+    pub outputs: Vec<String>,
+    pub status_buffer: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphDescriptor {
     /// Confidence prefixes produced per request in the completion frame.
@@ -172,6 +188,7 @@ pub struct GraphDescriptor {
     /// Zero denotes an indeterminate duration.
     pub estimated_duration_ns: u64,
     pub input_bindings: Vec<InputBinding>,
+    pub tuned_bindings: Vec<TunedBinding>,
 }
 
 impl GraphDescriptor {
@@ -218,9 +235,59 @@ pub struct ExecutionManifest {
     pub input_frame_bytes: usize,
     pub buffers: Vec<BufferDescriptor>,
     pub graphs: Vec<GraphDescriptor>,
+    pub tuning_graphs: Vec<TuningGraphDescriptor>,
 }
 
 impl ExecutionManifest {
+    fn validate_tuning(&self) -> Result<()> {
+        let host_inputs: HashSet<_> = self.graphs.iter().flat_map(|graph|
+            graph.input_bindings.iter().map(|binding| binding.buffer_name.as_str())).collect();
+        let mut names: HashSet<&str> = self.graphs.iter().map(|graph| graph.name.as_str()).collect();
+        let mut producers = HashMap::new();
+        let mut statuses = HashSet::new();
+        for graph in &self.tuning_graphs {
+            if graph.name.is_empty() || !names.insert(&graph.name) || graph.outputs.is_empty() {
+                return Err("tuning graphs require unique names and persistent outputs".into());
+            }
+            let status = self.buffer(&graph.status_buffer)?;
+            if status.dtype != Dtype::Int32 || status.shape != [1] || status.strides != [1]
+                || !statuses.insert(graph.status_buffer.as_str()) {
+                return Err("tuning status requires a unique int32[1] buffer".into());
+            }
+            for output in &graph.outputs {
+                self.buffer(output)?;
+                if producers.insert(output.as_str(), graph.name.as_str()).is_some() {
+                    return Err("tuning outputs require exactly one producer".into());
+                }
+            }
+        }
+        for name in producers.keys().chain(statuses.iter()) {
+            if host_inputs.contains(name) || matches!(*name, "completion_records" | "completion_logprobs" | "prompt_logprobs" | "proposal_confidence" | "completion_speculative_survival" | "readiness_timestamps") {
+                return Err("tuning storage cannot overlap request transport storage".into());
+            }
+        }
+        if statuses.iter().any(|name| producers.contains_key(name)) {
+            return Err("tuning status cannot also be a tuning output".into());
+        }
+        for graph in &self.graphs {
+            let mut bindings = HashSet::new();
+            for binding in &graph.tuned_bindings {
+                if !bindings.insert(&binding.buffer)
+                    || producers.get(binding.buffer.as_str()) != Some(&binding.tuning_graph.as_str()) {
+                    return Err("tuned bindings must name their exact persistent output producer".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn referenced_tuning_graphs(&self) -> Vec<usize> {
+        let referenced: HashSet<_> = self.graphs.iter().flat_map(|graph|
+            graph.tuned_bindings.iter().map(|binding| binding.tuning_graph.as_str())).collect();
+        self.tuning_graphs.iter().enumerate().filter_map(|(index, graph)|
+            referenced.contains(graph.name.as_str()).then_some(index)).collect()
+    }
+
     pub fn completion_fields(&self) -> usize {
         VECTOR_RECORD_FIELDS
     }
@@ -373,7 +440,8 @@ impl ExecutionManifest {
         GraphBundle {
             context: self.context,
             device: self.device,
-            graph_execs: self.graphs.iter().map(|graph| graph.handle).collect(),
+            graph_execs: self.graphs.iter().map(|graph| graph.handle)
+                .chain(self.tuning_graphs.iter().map(|graph| graph.handle)).collect(),
             buffers: self
                 .buffers
                 .iter()
@@ -459,7 +527,7 @@ impl ExecutionManifest {
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
             if self.abi_version != ABI_VERSION || buffer.dtype != Dtype::Float32
                 || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
-                return Err("completion_speculative_survival requires ABI4 and two float32 frames of seven prefixes per request slot".into());
+                return Err("completion_speculative_survival requires ABI5 and two float32 frames of seven prefixes per request slot".into());
             }
         }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
@@ -477,6 +545,7 @@ impl ExecutionManifest {
                 return Err("readiness timestamps require two contiguous int64 frames of three timestamps per interval".into());
             }
         }
+        self.validate_tuning()?;
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
         for graph in &self.graphs {

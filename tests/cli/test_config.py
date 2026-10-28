@@ -159,3 +159,20 @@ def test_autotune_effort_configuration_and_flag_precedence(tmp_path, effort):
     for legacy in ("exhaustive", "medium", "max"):
         with pytest.raises(UsageError, match="autotune_effort"):
             load(tmp_path, f'[preparation]\nautotune_effort = "{legacy}"\n')
+
+
+@pytest.mark.parametrize("recipe_mode", ["static", "runtime"])
+@pytest.mark.parametrize("configured", [None, "static", "runtime"])
+@pytest.mark.parametrize("flag", [None, "static", "runtime"])
+def test_collective_tuning_resolves_flag_configuration_and_recipe(tmp_path, recipe_mode, configured, flag):
+    from types import SimpleNamespace
+    from ignition.cli.preparation import collective_tuning_mode
+
+    config = load(tmp_path, "" if configured is None else f'[preparation]\ncollective_tuning = "{configured}"\n')
+    model = SimpleNamespace(recipe=SimpleNamespace(collective_tuning=recipe_mode))
+    assert collective_tuning_mode(config, model, flag) == (flag or configured or recipe_mode)
+
+
+def test_collective_tuning_rejects_unknown_policy(tmp_path):
+    with pytest.raises(UsageError, match="collective_tuning must be static or runtime"):
+        load(tmp_path, '[preparation]\ncollective_tuning = "dynamic"')

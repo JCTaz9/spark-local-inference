@@ -17,7 +17,7 @@ from b12x.quantization import mla_norm_mxfp8
 from ignition.preparation.capture import capture_forwards
 from ignition.progress import phase
 
-from .contextual_tuning import CatalogCompressedLayerFixture, CatalogLayer0Fixture
+from .contextual_tuning import CatalogLayerFixture
 
 
 _ROLES = ("qkv_a", "norm", "q_b")
@@ -31,17 +31,16 @@ _POLICIES = {
 
 
 def contextual_summary(report):
-    """One export line identifying the selected tuple and its measured layers."""
-    winner, standalone = report["winner"], report["standalone_tuple"]
-    detail = {"objective": report["objective"], "winner": winner,
-              "configs": report["winner_configs"],
-              "layer_us": report["latencies_us"][winner],
-              "standalone_layer_us": report["latencies_us"][standalone],
-              "sum_us": report["total_us"][winner],
-              "standalone_sum_us": report["standalone_total_us"],
-              "cache_policy": report["cache_policy"], "rounds": report["rounds"],
-              "samples": report["samples"], "lock_gpu_clocks": report["lock_gpu_clocks"]}
-    return "Selected complete-layer plans: " + json.dumps(detail, sort_keys=True, separators=(",", ":"))
+    """Report the measured contexts and selected projection tuple for each shape."""
+    groups = []
+    for group in report["groups"]:
+        winner = group["winner"]
+        groups.append({"contexts": group["contexts"], "target_rows": group["target_rows"],
+            "configs": group["winner_configs"], "layer_us": group["latencies_us"][winner],
+            "sum_us": group["total_us"][winner], "standalone_sum_us": group["standalone_total_us"],
+            "cache_policy": group["cache_policy"], "rounds": group["rounds"], "samples": group["samples"],
+            "lock_gpu_clocks": group["lock_gpu_clocks"]})
+    return "Selected joint plans: " + json.dumps(groups, sort_keys=True, separators=(",", ":"))
 
 
 def _role_plans(layer):
@@ -52,29 +51,74 @@ def _role_plans(layer):
             attention.projections["q_b"].plan)
 
 
-class CatalogContextualSelection:
-    """Race legal QKV, normalization, and query-expansion tuples in catalog layers.
+def catalog_contexts(forwards, signatures):
+    """Visit every prepared text shape and each shared proposal decoder once."""
+    seen_decoders = set()
+    for name, signature in signatures.items():
+        if signature.kind not in ("prefill", "scored_prefill", "decode", "speculative"):
+            continue
+        forward = forwards[name]
+        while hasattr(forward, "forward"):
+            forward = forward.forward
+        if hasattr(forward, "target"):
+            decoders = ((name + ".target", forward.target.decoder),
+                        (forward.source.name + ".draft", forward.source.draft))
+        else:
+            decoders = ((name, forward.decoder),
+                        (name + ".draft", getattr(forward, "draft", None)))
+        for context_name, decoder in decoders:
+            if decoder is None or id(decoder) in seen_decoders:
+                continue
+            seen_decoders.add(id(decoder))
+            shapes = set()
+            found = False
+            for index, layer in enumerate(decoder.layers):
+                attention = layer.attention
+                if (attention.norm_quant is None or layer.engram is not None
+                        or layer.boundary is not None or attention.global_kv is not None):
+                    continue
+                shape = (layer.metadata.positions.numel(), layer.metadata.starts.numel(),
+                         layer.metadata.max_query_tokens, attention.mode, attention.ratio,
+                         layer.carry, layer.post is not None, bool(attention.selectors),
+                         attention.concurrent_query is not None)
+                if shape in shapes:
+                    continue
+                shapes.add(shape)
+                found = True
+                yield context_name, signature, decoder, index
+            if not found:
+                raise ValueError(f"joint tuning has no restorable attention context for {context_name}")
 
-    Both representative layers reuse the prepared target decoder's storage.
-    They are timed in separate races so each input and cache restoration stays
-    outside its measured graph replay. A shared tuple wins on the sum of its
-    tensor-parallel max-rank layer latencies.
+
+class CatalogContextualSelection:
+    """Race projection tuples in every prepared text execution shape.
+
+    Matching operator declarations share one choice, scored by the sum of the
+    complete-layer contexts in which they execute. Distinct declarations have
+    independent races. Inputs and trial graphs are released between contexts.
     """
 
     def __init__(self, forwards, signatures, *, arena, coordinator, collective,
                  device, graph_pool, cache_root, compile_decoder, warmup_storage,
                  progress=None):
-        self.fixtures = (CatalogLayer0Fixture(forwards, signatures),
-                         CatalogCompressedLayerFixture(forwards, signatures))
-        if self.fixtures[0].target_decoder is not self.fixtures[1].target_decoder:
-            raise ValueError("contextual layers must share one prepared target decoder")
         if coordinator is None or len(coordinator.ranks) < 2:
-            raise ValueError("contextual layer choice requires the model's tensor-parallel coordinator")
-        self.layers = (self.fixtures[0].target_decoder.layers[0],
-                       self.fixtures[1].target_decoder.layers[self.fixtures[1].layer_index])
-        if any(layer.attention_reduce.runtime is not collective
-               or layer.mlp_reduce.runtime is not collective for layer in self.layers):
-            raise ValueError("contextual layers must use the captured tensor-parallel runtime")
+            raise ValueError("joint tuning requires the model's tensor-parallel coordinator")
+        self.fixtures = tuple(CatalogLayerFixture(*context)
+                              for context in catalog_contexts(forwards, signatures))
+        if not self.fixtures:
+            raise ValueError("joint tuning requires prepared text graphs")
+        self.layers = tuple(fixture.layer for fixture in self.fixtures)
+        groups = []
+        for fixture in self.fixtures:
+            plans = _role_plans(fixture.layer)
+            for group in groups:
+                if all(first.same_declaration_except_override(second) for first, second in
+                       zip(_role_plans(group[0].layer), plans, strict=True)):
+                    group.append(fixture)
+                    break
+            else:
+                groups.append([fixture])
+        self.groups = tuple(tuple(group) for group in groups)
         self.arena, self.coordinator, self.collective = arena, coordinator, collective
         self.device, self.graph_pool = device, graph_pool
         self.cache_root = None if cache_root is None else Path(cache_root)
@@ -93,9 +137,6 @@ class CatalogContextualSelection:
             if any(len(by_plan.get(id(plan), ())) != 1 for plan in roles):
                 raise ValueError("contextual layer plan must name one recorded request")
             names.append(tuple(by_plan[id(plan)][0] for plan in roles))
-        for first, second in zip((_role_plans(self.layers[0])), (_role_plans(self.layers[1])), strict=True):
-            if not first.same_declaration_except_override(second):
-                raise ValueError("representative layers require matching operator declarations")
         return tuple(names)
 
     def finalist_policies(self, requests):
@@ -114,7 +155,7 @@ class CatalogContextualSelection:
             def payload(group):
                 return {json.dumps(reference.contract.config_payload(item.selection.config).to_dict(),
                                    sort_keys=True) for item in group}
-            if payload(groups[0]) != payload(groups[1]):
+            if any(payload(group) != payload(groups[0]) for group in groups[1:]):
                 raise ValueError(f"representative layers have different {role} finalist catalogs")
             configs[role] = tuple(item.selection.config for item in groups[0])
         return configs
@@ -154,8 +195,8 @@ class CatalogContextualSelection:
                     "config": plan.contract.config_payload(configs[role][offset]).to_dict()}
                    for plan, role, offset in zip(plans, _ROLES, selection, strict=True)]
         encoded = json.dumps({"operators": payload,
-            "target_rows": self.fixtures[0].target_signature.token_capacity,
-            "context_layers": (self.fixtures[0].layer_index, self.fixtures[1].layer_index)},
+            "target_rows": self.layers[0].metadata.positions.numel(),
+            "contexts": tuple(fixture.label for fixture in self.fixtures)},
             sort_keys=True, separators=(",", ":")).encode()
         return f"context-{index:02d}-{sha256(encoded).hexdigest()[:12]}"
 
@@ -165,23 +206,9 @@ class CatalogContextualSelection:
         return capture_forwards(functions, signatures, session=session, device=self.device,
             stream=stream, pool=self.graph_pool, collective=self.collective,
             coordinator=self.coordinator, compile_decoder=self.compile_decoder,
-            progress=self.progress, label=label, cache_root=self.cache_root,
+            progress=self.progress, label=label, cache_root=self.cache_root, report_catalog=False,
             warmup_storage=self.warmup_storage, capture_names=tuple(functions),
             before_run=before_run, compile_group=compile_group)
-
-    def _initialize_fixtures(self, session):
-        layer_zero, compressed = self.fixtures
-        setup = {"context-prefill-layer0": layer_zero.prefill_setup_forward,
-                 "context-target-seed": layer_zero.target_seed_forward}
-        graphs, compiled = self._capture(session, setup, layer_zero.setup_signatures(),
-            label="Capture contextual layer inputs", before_run=layer_zero.restore_setup)
-        try:
-            layer_zero.initialize(graphs["context-prefill-layer0"], graphs["context-target-seed"])
-            compressed.initialize(graphs["context-target-seed"])
-        finally:
-            for graph in graphs.values():
-                graph.reset()
-            compiled.clear()
 
     def _side_workspace(self, plans):
         sizes = []
@@ -225,21 +252,21 @@ class CatalogContextualSelection:
     def _race_layer(self, session, fixture, fixture_index, configs, plans, workspace, selections):
         functions, signatures, members = {}, {}, {}
         for index, selection in enumerate(selections):
-            name = self._tuple_name(index, configs, selection) + f"-layer{fixture.layer_index}"
+            name = self._tuple_name(index, configs, selection) + f"-context{fixture_index}"
             variant_plans = tuple(plans[(fixture_index, role)][offset]
                                   for role, offset in zip(_ROLES, selection, strict=True))
             layer = prepared_layer_variant(self.layers[fixture_index],
                 qkv_plan=variant_plans[0], norm_plan=variant_plans[1],
                 query_plan=variant_plans[2], side_workspace=workspace)
             functions[name] = fixture.trial_forward(layer)
-            signatures[name] = replace(fixture.target_signature, inputs=())
+            signatures[name] = fixture.trial_signature
             members[name] = (variant_plans, layer)
         def before_run(name):
             fixture.restore_tune(members[name][1])
 
         graphs, compiled = self._capture(session, functions, signatures,
-            label=f"Capture contextual layer {fixture.layer_index}", before_run=before_run,
-            compile_group=(f"context-layer{fixture.layer_index}-plan-family"
+            label=f"Capture joint tuning {fixture.label}", before_run=before_run,
+            compile_group=(f"{fixture.label}-plan-family"
                            if self.compile_decoder else None))
         after_free = torch.cuda.mem_get_info(self.device)[0]
         if after_free < max(1 << 30, session.headroom_bytes):
@@ -251,7 +278,7 @@ class CatalogContextualSelection:
             candidates = tuple(ContextCandidate(name=name, plans=members[name][0],
                 call=fixture.prepared_call(name, graphs[name], compiled.get(name), members[name][1]))
                 for name in functions)
-            with phase(self.progress, f"Compare complete layer {fixture.layer_index}",
+            with phase(self.progress, f"Compare complete layer {fixture.label}",
                        total=len(candidates) * session.rounds) as stage:
                 self._race_stage = stage
                 try:
@@ -277,9 +304,9 @@ class CatalogContextualSelection:
                        for role, offset in zip(_ROLES, selection, strict=True))
         layer = prepared_layer_variant(self.layers[fixture_index], qkv_plan=chosen[0],
             norm_plan=chosen[1], query_plan=chosen[2], side_workspace=workspace)
-        name = f"context-heldout-layer{fixture.layer_index}"
+        name = f"{fixture.label}-heldout"
         graphs, compiled = self._capture(session, {name: fixture.trial_forward(layer)},
-            {name: replace(fixture.target_signature, inputs=())},
+            {name: fixture.trial_signature},
             label="Validate contextual layer choice",
             before_run=lambda name: fixture.restore_tune(layer))
         try:
@@ -292,7 +319,7 @@ class CatalogContextualSelection:
             graphs[name].reset()
             compiled.clear()
 
-    def __call__(self, session, requests, finalists):
+    def _select_group(self, session, requests, finalists):
         names = self._names(requests)
         configs = self._configs(names, finalists)
         selections = tuple(product(*(range(len(configs[role])) for role in _ROLES)))
@@ -305,17 +332,21 @@ class CatalogContextualSelection:
         if any(workspace is not None and workspace.untyped_storage().data_ptr() != backing
                for workspace in side_workspaces):
             raise RuntimeError("contextual scratch binding moved an overlapping projection view")
-        self._initialize_fixtures(session)
         measurements, race_results = {}, {}
         for fixture_index, fixture in enumerate(self.fixtures):
-            result, free_after = self._race_layer(session, fixture, fixture_index, configs,
-                plans, side_workspaces[fixture_index], selections)
-            race_results[fixture_index] = result
-            measurements[fixture_index] = result.latencies_us
-            self._free_after[fixture.layer_index] = free_after
+            self.collective = fixture.layer.attention_reduce.runtime
+            fixture.initialize()
+            try:
+                result, free_after = self._race_layer(session, fixture, fixture_index, configs,
+                    plans, side_workspaces[fixture_index], selections)
+                race_results[fixture_index] = result
+                measurements[fixture_index] = result.latencies_us
+                self._free_after[fixture.label] = free_after
+            finally:
+                fixture.close()
         totals = {self._tuple_name(index, configs, selection): sum(
             measurements[fixture_index][self._tuple_name(index, configs, selection)
-                + f"-layer{fixture.layer_index}"]
+                + f"-context{fixture_index}"]
             for fixture_index, fixture in enumerate(self.fixtures))
             for index, selection in enumerate(selections)}
         standalone = tuple(next((index for index, config in enumerate(configs[role])
@@ -328,10 +359,15 @@ class CatalogContextualSelection:
         winner_index = min(range(len(selections)),
             key=lambda index: (totals[self._tuple_name(index, configs, selections[index])], index))
         winning_selection = selections[winner_index]
-        validation = {str(fixture.layer_index):
-            self._validate_winner(session, fixture, fixture_index, plans,
-                side_workspaces[fixture_index], winning_selection)
-            for fixture_index, fixture in enumerate(self.fixtures)}
+        validation = {}
+        for fixture_index, fixture in enumerate(self.fixtures):
+            self.collective = fixture.layer.attention_reduce.runtime
+            fixture.initialize()
+            try:
+                validation[fixture.label] = self._validate_winner(session, fixture, fixture_index,
+                    plans, side_workspaces[fixture_index], winning_selection)
+            finally:
+                fixture.close()
         choices, obligations = {}, []
         shared = {id(requests[group[role_index]].plan): plans[(fixture_index, role)][offset]
                   for fixture_index, group in enumerate(names)
@@ -368,19 +404,35 @@ class CatalogContextualSelection:
                                                               winning_selection, strict=True)},
             "standalone_tuple": standalone_name,
             "standalone_total_us": totals[standalone_name],
-            "target_rows": self.fixtures[0].target_signature.token_capacity,
-            "layer_indices": tuple(fixture.layer_index for fixture in self.fixtures),
-            "cache_policy": {str(fixture.layer_index): race_results[index].cache_policy
+            "target_rows": self.layers[0].metadata.positions.numel(),
+            "contexts": tuple(fixture.label for fixture in self.fixtures),
+            "cache_policy": {fixture.label: race_results[index].cache_policy
                              for index, fixture in enumerate(self.fixtures)},
             "rounds": session.rounds, "samples": session.samples,
             "lock_gpu_clocks": session.lock_gpu_clocks,
             "capture_free_after_bytes": dict(self._free_after),
-            "latencies_us": {name: {str(fixture.layer_index): measurements[index][
-                                        name + f'-layer{fixture.layer_index}']
+            "latencies_us": {name: {fixture.label: measurements[index][
+                                        name + f'-context{index}']
                                     for index, fixture in enumerate(self.fixtures)}
                              for name in totals},
             "total_us": totals, "heldout": validation}
         return choices, report
+
+    def __call__(self, session, requests, finalists):
+        fixtures, layers = self.fixtures, self.layers
+        choices, reports = {}, []
+        try:
+            for group in self.groups:
+                self.fixtures = group
+                self.layers = tuple(fixture.layer for fixture in group)
+                selected, report = self._select_group(session, requests, finalists)
+                if choices.keys() & selected.keys():
+                    raise ValueError("joint tuning groups overlap operator declarations")
+                choices.update(selected)
+                reports.append(report)
+        finally:
+            self.fixtures, self.layers = fixtures, layers
+        return choices, {"groups": reports, "contexts": len(fixtures)}
 
 
 def prepared_layer_variant(layer, *, qkv_plan, norm_plan, query_plan, side_workspace=None):
