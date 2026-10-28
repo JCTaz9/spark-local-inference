@@ -118,8 +118,10 @@ class PreparedMHC:
         self.composed = self.row_calls = None
         if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
             # SM103 prefill composes FlashInfer's mHC kernels; b12x's fused launches stay for decode.
-            self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch, rms_eps=rms_eps,
+            self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch,
+                inputs=inputs, session=session, name=name, workspace=workspace, rms_eps=rms_eps,
                 hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
+            self.plan = self.composed.plan
             return
         if max_rows_per_call is not None and tokens > max_rows_per_call:
             self.row_calls = []
