@@ -24,34 +24,51 @@ def validate_mla_compute_mode(mode):
 
 
 @torch.library.custom_op("flare::compressed_cache_write", mutates_args=("cache",))
-def _write(kv: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, handle: int) -> None:
-    mla.write_cache(kv, cache, slots, plan=plan_from_handle(handle))
+def _write(kv: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor, handle: int,
+           history: torch.Tensor | None = None, history_rows: torch.Tensor | None = None) -> None:
+    mla.write_cache(kv, cache, slots, plan=plan_from_handle(handle), history=history, history_rows=history_rows)
 
 
 @_write.register_fake
-def _write_fake(kv, cache, slots, handle):
+def _write_fake(kv, cache, slots, handle, history=None, history_rows=None):
     pass
 
 
 class PreparedCompressedCacheWriter:
-    def __init__(self, values, cache, slots, *, page_size, kind, session, name, cache_format="deepseek_v41"):
+    def __init__(self, values, cache, slots, *, page_size, kind, session, name, cache_format="deepseek_v41",
+                 history=None, history_rows=None, snapshot_tokens=0):
+        if bool(snapshot_tokens) != (history is not None and history_rows is not None):
+            raise ValueError("snapshot cache writers require history, row IDs, and a prefix extent")
+        if (history is None) != (history_rows is None):
+            raise ValueError("history and history_rows must be supplied together")
         self.plan = mla.plan_cache_writer(mla.CacheWriterQuery(max_rows=values.shape[0],
             page_size=page_size, cache_kind=kind, cache_format=cache_format,
-            slot_dtype=str(slots.dtype).removeprefix("torch.")),
+            slot_dtype=str(slots.dtype).removeprefix("torch."), snapshot_tokens=snapshot_tokens,
+            max_requests=0 if history_rows is None else history_rows.numel()),
             device=values.device)
         self.cache, self.slots = cache, slots
+        self.history, self.history_rows = history, history_rows
 
         def prepare(state):
             source = torch.zeros_like(values)
-            target = torch.empty_strided((1, cache.shape[1]), cache.stride(), dtype=cache.dtype, device=cache.device)
+            rows = self.plan.query.max_requests or 1
+            target = torch.empty_strided((rows, cache.shape[1]), cache.stride(), dtype=cache.dtype, device=cache.device)
             positions = torch.arange(values.shape[0], dtype=slots.dtype, device=slots.device)
-            positions.masked_fill_(positions >= page_size, -1)
-            return PreparedCall(run=lambda: state.run(source, target, positions))
+            if snapshot_tokens:
+                suffix = page_size - snapshot_tokens
+                positions = positions // suffix * page_size + snapshot_tokens + positions % suffix
+                positions.masked_fill_(positions >= rows * page_size, -1)
+                seed = torch.zeros((rows + 1, snapshot_tokens * 528), dtype=torch.uint8, device=cache.device)
+                selected = torch.arange(1, rows + 1, dtype=torch.int64, device=cache.device)
+            else:
+                positions.masked_fill_(positions >= page_size, -1)
+                seed = selected = None
+            return PreparedCall(run=lambda: state.run(source, target, positions, history=seed, history_rows=selected))
 
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
 
     def __call__(self, values):
-        _write(values, self.cache, self.slots, self.plan.handle)
+        _write(values, self.cache, self.slots, self.plan.handle, self.history, self.history_rows)
 
 
 @torch.library.custom_op("flare::compressed_mla", mutates_args=("out", "scratch"))
