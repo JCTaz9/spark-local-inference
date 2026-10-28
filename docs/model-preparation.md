@@ -634,6 +634,32 @@ Use an ordinary export when first changing either head's weight format.
 `--reuse-weights` trusts the previous package's weight bytes, while
 `--no-weights` requires the exact changed payloads to be cached already.
 
+`--vocabulary-parallel-sampling` keeps DeepSeek V4.1 proposal and verification
+probabilities on their vocabulary-owning GPUs. Only normalization statistics,
+selected-token probabilities, and residual winners cross ranks. The default is
+disabled. The option requires positive learned draft depth and supports BF16 or
+row-scaled FP8 Markov weights; NVFP4 Markov weights are unsupported. Target
+vocabulary weights and logits retain BF16 and FP32 precision. Full softmax and
+greedy targets are supported; top-k, top-p, and min-p filtering must remain
+disabled, as in the recipe's default policy. Raw generation logprobs and grammar
+constraints remain available. Block rejection changes seeded output relative to
+the full-vocabulary serial sampler.
+
+For a TP4, single-request configuration with seven drafts, run:
+
+```sh
+.venv/bin/python -m ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --max-concurrency 1 --mtp-draft-tokens 7 --speculative-token-capacity 8 \
+  --prefill-chunk-size 4096 --mla-compute-mode bf16 \
+  --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
+  --vocabulary-parallel-sampling
+```
+
+Use a fresh weight export when first enabling this option: the Markov head's
+stored vocabulary partition changes. Complete-model serving has been exercised
+at TP4 with one concurrent request; wider serving configurations still need
+model validation.
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

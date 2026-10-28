@@ -171,3 +171,20 @@ def test_packed_rebuild_metadata_rejects_an_unresolved_graph_budget(monkeypatch)
     plan = replace(plan, speculation=replace(plan.speculation, graph_budget=None))
     with pytest.raises(ValueError, match="explicit graph budget"):
         from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+
+
+
+def test_vocabulary_parallel_sampling_is_an_explicit_preparation_choice():
+    from tests.cli.test_planning import derive, gpu
+
+    settings = selected("--vocabulary-parallel-sampling", "--draft-head-quantization", "nvfp4",
+                        "--markov-head-quantization", "fp8")
+    assert settings.vocabulary_parallel_sampling
+    assert not selected().vocabulary_parallel_sampling
+    assert derive(model=resolve("deepseek-v4.1-flash").recipe, gpus=tuple(gpu(i, 140) for i in range(4)),
+                  speculation=settings).to_dict()["speculation"]["vocabulary_parallel_sampling"]
+    for flags in (("--no-mtp",), ("--mtp-draft-tokens", "0")):
+        with pytest.raises((UsageError, ValueError), match="cannot accompany|positive learned"):
+            selected(*flags, "--vocabulary-parallel-sampling")
+    with pytest.raises(UsageError, match="DeepSeek V4.1"):
+        derive(speculation=settings)

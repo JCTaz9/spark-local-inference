@@ -180,6 +180,9 @@ def _preparation_arguments(running):
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
+    advanced.add_argument("--vocabulary-parallel-sampling", action="store_true",
+                          help="prepare vocabulary-sharded DSpark proposals and block rejection sampling"
+                               " (DeepSeek V4.1; default: full-vocabulary sampling)")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
                                " kernel tuning (default: see MODEL --help)")
