@@ -126,7 +126,8 @@ def _rank(rank, checkpoint, root, carry):
                 prefixes=("layers.0.", "embed.weight"),
             ) as loader:
                 weights = loader.load_layer(0)
-                embedding = loader.load_padded_tensor("embed.weight", rows=(1000, 1024))
+                # Catalog restoration samples token IDs across the checkpoint vocabulary.
+                embedding = loader.load_tensor("embed.weight")
                 config = loader.config
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(
