@@ -1,11 +1,14 @@
 """Package-owned TP4 reductions across retained graph variants and native replay."""
 
+from contextlib import contextmanager
 from datetime import timedelta
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -31,8 +34,22 @@ def _operands(rows, columns, step):
 
 
 def _selected_query(operation):
-    query = operation.plan.prepared.state.query
-    return dict(surface=query.surface, call=dict(query.call))
+    """Describe reduction arithmetic using the persistent runtime selector."""
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+
+    state = operation.plan.prepared.state
+    query = state.query
+    call = dict(query.call)
+    if call.get("transport") in JOINT_FAMILIES:
+        encoded = int(state.selector.item())
+        names = {number: name for name, number in JOINT_MODES.items()}
+        mode = names.get(encoded >> 16)
+        assert mode is not None, encoded
+        active = encoded & 0xffff
+        assert selected_profile(call["transport"], call["blocks"], mode, active,
+                                world_size=query.world_size) == encoded
+        call.update(submode=mode, active_blocks=active)
+    return dict(surface=query.surface, call=call)
 
 
 def _expected(values, rank, query):
@@ -44,14 +61,14 @@ def _expected(values, rank, query):
         transport = "bulk_" + transport
     else:
         if transport in ("joint_latency", "joint_bandwidth"):
+            from b12x.comm.pcie._joint_profile import joint_modes
+
             mode = query["call"]["submode"]
-            modes = (("full", "payload_rsag", "pull") if transport == "joint_latency"
-                     else ("payload_rsag", "bulk_push", "bulk_pull", "pull"))
-            assert mode in modes, (transport, mode)
+            assert mode in joint_modes(transport, len(values)), (transport, mode)
             transport = {"full": "remote_push_full", "payload_rsag": "remote_push_rsag"}.get(mode, mode)
         else:
             assert transport in ("pull", "remote_push_full", "remote_push_rsag"), transport
-    bulk = transport in ("bulk_push", "bulk_pull")
+    bulk = transport in ("bulk_push", "bulk_pull", "serial_push")
     if transport in ("remote_push_full", "remote_push_rsag"):
         values = [value.clone() for value in values]
         for value in values:
@@ -83,6 +100,8 @@ def _expected(values, rank, query):
 
 
 def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_transport():
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES, joint_modes
+
     zeros = [torch.zeros((1, 32), dtype=torch.bfloat16) for _ in range(4)]
     for transport, bits in (("pull", 0), ("remote_push_full", -32768), ("remote_push_rsag", -32768)):
         query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=transport))
@@ -91,13 +110,12 @@ def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_tra
     for transport in ("push", "pull"):
         query = dict(surface="PCIeTwoShotBF16.all_reduce", call=dict(transport=transport))
         assert torch.all(_expected(negative, 0, query).view(torch.int16) == 0)
-    for family, modes in (("joint_latency", ("full", "payload_rsag", "pull")),
-                          ("joint_bandwidth", ("payload_rsag", "bulk_push", "bulk_pull", "pull"))):
-        for mode in modes:
+    for family in JOINT_FAMILIES:
+        for mode in joint_modes(family, 4):
             query = dict(surface="OneshotAllReduce.all_reduce", call=dict(transport=family, submode=mode))
             bits = -32768 if mode in ("full", "payload_rsag") else 0
             assert torch.all(_expected(zeros, 0, query).view(torch.int16) == bits)
-            bits = 0 if mode.startswith("bulk_") else -32768
+            bits = 0 if mode in ("bulk_push", "bulk_pull", "serial_push") else -32768
             assert torch.all(_expected(negative, 0, query).view(torch.int16) == bits)
         with pytest.raises(AssertionError):
             _expected(zeros, 0, dict(surface="OneshotAllReduce.all_reduce",
@@ -112,14 +130,14 @@ def test_collective_oracle_preserves_transport_zero_bits_and_rejects_unknown_tra
 
 
 @pytest.mark.parametrize("elements", (8, 40, 72))
-@pytest.mark.parametrize("mode", ("payload_rsag", "bulk_push", "bulk_pull"))
+@pytest.mark.parametrize("mode", ("payload_rsag", "bulk_push", "bulk_pull", "serial_push"))
 def test_collective_oracle_preserves_pack_owners_and_cancellation_order(elements, mode):
     values = [torch.full((elements,), value, dtype=torch.bfloat16)
               for value in (1e8, 1, -1e8, 1)]
     query = dict(surface="OneshotAllReduce.all_reduce",
                  call=dict(transport="joint_bandwidth", submode=mode))
     packs = elements // 8
-    shard = (packs + 3) // 4 if mode.startswith("bulk_") else packs // 4
+    shard = packs // 4 if mode == "payload_rsag" else (packs + 3) // 4
     owners = [min(pack // shard, 3) if shard else 3 for pack in range(packs)]
     for rank in range(4):
         expected = torch.tensor([1 if owner % 2 == 0 else 0 for owner in owners], dtype=torch.bfloat16)
@@ -131,13 +149,35 @@ def test_collective_oracle_preserves_pack_owners_and_cancellation_order(elements
                            expected.repeat_interleave(8).view(torch.int16))
 
 
-def _rank(rank, rendezvous, directory, widths):
+@pytest.mark.parametrize("family", ("joint_latency", "joint_bandwidth"))
+def test_collective_oracle_reads_the_device_selector_instead_of_prepared_submode(family):
+    from b12x.comm.pcie._joint_profile import JOINT_FAMILIES, JOINT_MODES
+
+    call = dict(transport=family, threads=256, blocks=64,
+                submode=JOINT_FAMILIES[family][0], active_blocks=16)
+    selector = torch.tensor([(JOINT_MODES["serial_push"] << 16) | 1], dtype=torch.uint32)
+    state = SimpleNamespace(query=SimpleNamespace(surface="OneshotAllReduce.all_reduce",
+                            call=call, world_size=4), selector=selector)
+    operation = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=state)))
+    selected = _selected_query(operation)["call"]
+    assert selected["submode"] == "serial_push" and selected["active_blocks"] == 1
+    selector.fill_((JOINT_MODES["pull"] << 16) | 8)
+    selected = _selected_query(operation)["call"]
+    assert selected["submode"] == "pull" and selected["active_blocks"] == 8
+    assert call["submode"] == JOINT_FAMILIES[family][0] and call["active_blocks"] == 16
+    selector.zero_()
+    with pytest.raises(ValueError, match="CTA"):
+        _selected_query(operation)
+
+
+def _rank(rank, rendezvous, directory, widths, collective_tuning):
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.module_images import ModuleImages
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.runtime_package import export_model
+    from ignition.preparation.startup_tuning import capture_consumers
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -146,15 +186,49 @@ def _rank(rank, rendezvous, directory, widths):
                             timeout=timedelta(minutes=5))
     max_rows = max((2 << 20) // (width * 2) + 1 for width in widths)
     runtime = worker = None
-    graphs = {}
+    graphs, tuners = {}, {}
+
+    @contextmanager
+    def execution_lifetime():
+        """Drain native work before releasing either graph catalog."""
+        nonlocal runtime, worker
+        try:
+            yield
+        finally:
+            error = None
+            if worker is not None:
+                try:
+                    worker.close()
+                except BaseException as failure:
+                    error = failure
+                if not worker.drained:
+                    # Process exit must reclaim owners that CUDA may still access.
+                    print(f"native collective test executor did not drain: {error!r}",
+                          file=sys.stderr, flush=True)
+                    os._exit(1)
+                worker = None
+            torch.cuda.synchronize(device)
+            for graph in (*graphs.values(), *(tuner.graph for tuner in tuners.values())):
+                graph.reset()
+            graphs.clear()
+            tuners.clear()
+            if runtime is not None:
+                runtime.close()
+                runtime = None
+            if error is not None:
+                active = sys.exception()
+                if active is None:
+                    raise error
+                active.add_note(f"native collective cleanup failed after drain: {error!r}")
+
     try:
         with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=max_rows,
-                hidden_size=max(widths), ipc=storage.peer_storage)
+                hidden_size=max(widths), ipc=storage.peer_storage, collective_tuning=collective_tuning)
             with RecordedPreparationSession(device=device, checkpoint="tp4-collectives",
                     workload_schema="bf16-hidden-reduction", numerical_policy="fp32-single-rounding",
-                    coordinator=coordinator) as session:
+                    coordinator=coordinator, collective_tuning=collective_tuning) as session, execution_lifetime():
                 # Hidden widths share one runtime, which
                 # transports flat BF16 packs independently of tensor row geometry.
                 sources = {width: torch.empty((max_rows, width), dtype=torch.bfloat16, device=device)
@@ -169,7 +243,6 @@ def _rank(rank, rendezvous, directory, widths):
                         operations[key] = PreparedAllReduce(source[:rows], outputs[key], runtime=runtime,
                             session=session, coordinator=coordinator, name=f"reduce-{width}-{rows}")
                 session.tune(show_progress=False)
-                queries = {key: _selected_query(operation) for key, operation in operations.items()}
                 stream = torch.cuda.Stream(device=device)
                 for epoch in range(2):
                     for (width, rows), operation in operations.items():
@@ -179,11 +252,19 @@ def _rank(rank, rendezvous, directory, widths):
                         dist.barrier()
                         graph = torch.cuda.CUDAGraph(keep_graph=True)
                         stream.wait_stream(torch.cuda.current_stream(device))
-                        with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
+                        with capture_consumers(session, graph), runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
                                 graph, stream=stream, pool=storage.graph_pool.id):
                             operation(sources[width][:rows])
                         graph.instantiate()
                         graphs[f"reduce-{width}-{rows}-{epoch}"] = graph
+                registry = getattr(session, "_startup_collectives", None)
+                tuning_buffers, bindings, startup_owners = {}, {}, ()
+                if collective_tuning == "runtime":
+                    assert registry is not None and registry.groups
+                    tuning_buffers, tuners, bindings, startup_owners = registry.catalog(graphs)
+                    assert tuners and set(bindings) == set(graphs)
+                else:
+                    assert registry is None
                 session.freeze()
 
                 # Both transports must use the same explicit VMM ownership path
@@ -208,9 +289,11 @@ def _rank(rank, rendezvous, directory, widths):
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{width}-{rows}": value
                                 for (width, rows), value in outputs.items()})
+                buffers.update(tuning_buffers)
                 bundle = PreparedExecution(device=rank, graphs=graphs, buffers=buffers,
                     signatures={name: GraphSignature("decode", 1, 1) for name in graphs}, max_active=1,
-                    resources=(runtime, session, stream, storage, operations, sources, outputs))
+                    tuning_graphs=tuners, tuned_bindings=bindings,
+                    resources=(runtime, session, stream, storage, operations, sources, outputs, *startup_owners))
                 bundle.server_config = {}
                 bundle.package_data = None
                 torch.cuda.synchronize(device)
@@ -225,7 +308,22 @@ def _rank(rank, rendezvous, directory, widths):
                 exported = {(allocation.address, allocation.nbytes) for allocation in package.allocations
                             if allocation.memory == "peer"}
                 assert exported == set(peer.imported.items())
+                del package
+                selectors = {name: buffers[name] for tuner in tuners.values() for name in tuner.outputs}
+                for selector in selectors.values():
+                    selector.zero_()
+                for tuner in tuners.values():
+                    buffers[tuner.status_buffer].fill_(99)
+                torch.cuda.synchronize(device)
+                dist.barrier()
+                bundle_ref = weakref.ref(bundle)
+                startup_refs = tuple(weakref.ref(owner) for owner in startup_owners)
                 worker = bundle.start_executor()
+                del bundle, startup_owners, registry
+                selected = {name: int(selector.item()) for name, selector in selectors.items()}
+                assert coordinator.same_on_every_rank(tuple(selected.items()))
+                assert all(buffers[tuner.status_buffer].item() == 0 for tuner in tuners.values())
+                queries = {key: _selected_query(operation) for key, operation in operations.items()}
                 names = list(graphs)
                 # Retain both capture epochs while interleaving all capacities.
                 for step in range(3):
@@ -253,22 +351,19 @@ def _rank(rank, rendezvous, directory, widths):
                         for key in ("allocation.all.allocated", "allocation.all.freed",
                                     "segment.all.allocated", "segment.all.freed"):
                             assert before[key] == after[key]
+                        assert bundle_ref() is not None and all(reference() is not None for reference in startup_refs)
+                        assert {name: int(selector.item()) for name, selector in selectors.items()} == selected
+                        assert all(buffers[tuner.status_buffer].item() == 0 for tuner in tuners.values())
                         assert torch.equal(sources[width].view(torch.uint8), expected_source.view(torch.uint8))
                         expected = _expected([value[:rows] for value in values], rank, queries[width, rows])
                         assert torch.equal(outputs[width, rows].cpu().view(torch.uint8), expected.view(torch.uint8))
-                worker.close()
-                assert worker.drained
-                worker = None
-                for graph in graphs.values():
-                    graph.reset()
-                graphs.clear()
-                runtime.close()
-                runtime = None
-                assert not peer.owned and not peer.imported and not peer.imported_mappings
+                dist.barrier()
+            assert bundle_ref() is None
+            assert not peer.owned and not peer.imported and not peer.imported_mappings
     finally:
         if worker is not None:
             worker.close()
-        for graph in graphs.values():
+        for graph in (*graphs.values(), *(tuner.graph for tuner in tuners.values())):
             graph.reset()
         if runtime is not None:
             runtime.close()
@@ -276,11 +371,12 @@ def _rank(rank, rendezvous, directory, widths):
 
 
 @pytest.mark.parametrize("widths", [(4096, 5120), (2560,)], ids=["4096-5120", "qwen-2560"])
+@pytest.mark.parametrize("collective_tuning", ("static", "runtime"))
 @_gpu_only
-def test_package_owned_tp4_collective_graph_variants(tmp_path, widths):
+def test_package_owned_tp4_collective_graph_variants(tmp_path, widths, collective_tuning):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
-    mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths), nprocs=4, join=True)
+    mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths, collective_tuning), nprocs=4, join=True)
 
 
 @_gpu_only
