@@ -307,7 +307,57 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
                 assert package.export_counts["modules"] > 0
                 exported = {(allocation.address, allocation.nbytes) for allocation in package.allocations
                             if allocation.memory == "peer"}
-                assert exported == set(peer.imported.items())
+                expected_peers = set(peer.imported.items())
+                required, unused = expected_peers, set()
+                if collective_tuning == "runtime":
+                    def imports(shared_buffers):
+                        return {(pointer, peer.imported[pointer])
+                                for shared in shared_buffers for pointer in shared.remote_ptrs}
+
+                    states = [operation.plan.prepared.state for operation in operations.values()]
+                    channels = {id(state.runtime): state.runtime for state in states}
+                    required = imports([state.workspace.shared for state in states])
+                    required.update(imports(owner.shared for owner in startup_owners))
+                    roots = list(buffers.values())
+                    for state in states:
+                        roots.extend((state.workspace.peer_table, state.workspace.signal_table))
+                    for owner in startup_owners:
+                        roots.extend((owner.peers, owner.samples, owner.profiles, owner.mismatch,
+                            owner.invalid, owner.eviction, owner.eviction_sum, owner.inputs.source,
+                            owner.inputs.out, *owner.inputs.reference.seeds, *owner.inputs.reference.expected))
+                    available = imports(shared for channel in channels.values() for shared in channel._owned_buffers)
+                    expected_peers = required.copy()
+                    for channel in channels.values():
+                        # A captured tensor roots its complete allocator backing. A
+                        # coallocated oneshot pointer table retains its imports even
+                        # though joint kernels use their workspace's pointer tables.
+                        address = channel.rank_data.data_ptr()
+                        backing = next(mapping for mapping in storage.mappings.values()
+                                       if mapping.address <= address < mapping.address + mapping.nbytes)
+                        if any(tensor is not None and backing.address <= tensor.data_ptr() < backing.address + backing.nbytes
+                               for tensor in roots):
+                            pointers = (*channel.signal_ptrs, *(pointer for slot in channel._eager_ptrs for pointer in slot))
+                            expected_peers.update((address, nbytes) for pointer in pointers
+                                for address, nbytes in available if address <= pointer < address + nbytes)
+                    twoshot = getattr(runtime, "_bf16_twoshot", None)
+                    # The separately allocated two-shot channel has no captured consumer.
+                    unused_twoshot = set() if twoshot is None else imports(twoshot._owned_buffers)
+                    registered = available | unused_twoshot
+                    assert registered == set(peer.imported.items()), dict(
+                        imported_count=len(peer.imported), registered_count=len(registered),
+                        missing=sorted(set(peer.imported.items()) - registered),
+                        extra=sorted(registered - set(peer.imported.items())))
+                    assert expected_peers <= available and not expected_peers.intersection(unused_twoshot), dict(
+                        required_count=len(required), expected_count=len(expected_peers), available_count=len(available),
+                        unregistered=sorted(expected_peers - available),
+                        used_twoshot=sorted(expected_peers.intersection(unused_twoshot)))
+                    unused = (available - expected_peers) | unused_twoshot
+                difference = dict(imported_count=len(peer.imported), required_count=len(required),
+                    expected_count=len(expected_peers), exported_count=len(exported), unused_count=len(unused),
+                    missing=sorted(expected_peers - exported), extra=sorted(exported - expected_peers),
+                    retained_unused=sorted(exported.intersection(unused)))
+                assert not exported.intersection(unused), difference
+                assert exported == expected_peers, difference
                 del package
                 selectors = {name: buffers[name] for tuner in tuners.values() for name in tuner.outputs}
                 for selector in selectors.values():
@@ -327,11 +377,12 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
                 names = list(graphs)
                 # Retain both capture epochs while interleaving all capacities.
                 for step in range(3):
+                    operands = {width: _operands(max_rows, width, step) for width in widths}
                     for index in (list(range(len(names))) if step % 2 == 0
                                   else list(reversed(range(len(names))))):
                         _, width, rows, _ = names[index].split("-")
                         width, rows = int(width), int(rows)
-                        values = _operands(max_rows, width, step)
+                        values = operands[width]
                         sources[width].copy_(values[rank])
                         for output in outputs.values():
                             output.fill_(float("nan"))
