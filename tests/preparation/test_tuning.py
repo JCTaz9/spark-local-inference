@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
+import gc
 from threading import Event
 from types import SimpleNamespace
 import weakref
@@ -773,6 +774,54 @@ def test_close_retries_restoration_after_base_session_has_closed(backend, monkey
     session.close()
     assert attempts == ["restore", "restore"]
     assert session._tune_status == "closed" and not session._benchmark_restorers
+
+
+@pytest.mark.parametrize("failed_reclamation", [False, True])
+def test_close_collects_preparation_cycles_once_before_restoring_borrowed_state(monkeypatch, failed_reclamation):
+    from b12x.preparation import DetectedDevice
+    from b12x.preparation import session as preparation
+
+    class Temporary:
+        def __init__(self):
+            self.cycle = self
+
+    session = make_session(device=DetectedDevice(None, None), checkpoint="release-cycles")
+    temporary = Temporary()
+    reference = weakref.ref(temporary)
+    restored, collections = [], []
+    session.register_benchmark_resource("state", temporary,
+        restore=lambda: restored.append(reference() is None))
+    del temporary
+    session._reclaim_programs()
+    assert reference() is not None and not restored
+
+    if failed_reclamation:
+        def fail(keep):
+            raise RuntimeError("program cache eviction failed")
+
+        monkeypatch.setattr(preparation, "evict_unretained", fail)
+
+    def collected(phase, info):
+        if phase == "stop" and info["generation"] == 2:
+            collections.append(reference() is None)
+
+    automatic = gc.isenabled()
+    gc.disable()
+    gc.callbacks.append(collected)
+    try:
+        if failed_reclamation:
+            with pytest.raises(RuntimeError, match="program cache eviction failed"):
+                session.close()
+        else:
+            session.close()
+        session.close()
+    finally:
+        gc.callbacks.remove(collected)
+        if automatic:
+            gc.enable()
+    assert restored == [True]
+    assert collections == [True]
+    assert reference() is None
 
 
 
