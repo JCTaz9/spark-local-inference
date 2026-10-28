@@ -236,7 +236,10 @@ class CatalogLayerFixture:
             raise RuntimeError("joint tuning has no active input case")
         scratch = layer.scratch
         output = scratch.residual if layer.post is not None else scratch.mlp_output
-        if not bool(torch.isfinite(output).all()) or not bool(torch.isfinite(scratch.attention.output).all()):
+        # A persistent tail consumes attended values and keeps WO inside the fused kernel.
+        attention_output = (scratch.attention.attended if getattr(layer, "persistent_tail", None) is not None
+                            else scratch.attention.output)
+        if not bool(torch.isfinite(output).all()) or not bool(torch.isfinite(attention_output).all()):
             raise AssertionError("joint tuning produced nonfinite layer output")
         expected = case.window.clone().view(self.batch, 128, 528)
         if layer.attention.mode in ("decode", "prefill"):

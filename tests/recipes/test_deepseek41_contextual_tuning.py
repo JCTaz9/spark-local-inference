@@ -182,3 +182,22 @@ def test_persistent_compositions_reuse_catalog_restoration_and_partial_occupancy
     fixture.close()
     with pytest.raises(ValueError, match="eight-row batch-one"):
         _target_context({"decode": forward}, {"decode": GraphSignature("decode", 1, 1)})
+
+
+def test_fused_tail_validates_consumed_attention_values_and_final_output():
+    decoder, signature, _ = catalog_layer(1, 8, 8, "verify")
+    fixture = CatalogLayerFixture("packed", signature, decoder, 0)
+    fixture.initialize()
+    layer = decoder.layers[0]
+    layer.persistent_tail = object()
+    layer.scratch.attention.attended = torch.zeros((8, 1, 512), dtype=torch.bfloat16)
+    fixture.restore_tune(layer)
+    assert layer.scratch.attention.output.isnan().all()
+    fixture.validate_result(layer)
+    layer.scratch.attention.attended[0, 0, 0] = float("nan")
+    with pytest.raises(AssertionError, match="nonfinite layer output"):
+        fixture.validate_result(layer)
+    layer.scratch.attention.attended.zero_()
+    layer.scratch.residual[0, 0, 0] = float("nan")
+    with pytest.raises(AssertionError, match="nonfinite layer output"):
+        fixture.validate_result(layer)
