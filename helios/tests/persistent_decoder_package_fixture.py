@@ -69,6 +69,13 @@ def fixture_io(source, device):
         z(rows, 4, dtype=torch.float32),
         z(rows, 4, 4, dtype=torch.float32),
         z(rows, 4, dtype=torch.float32),
+        z(rows, 384, dtype=torch.float32),
+        z(rows, 6, dtype=torch.int32),
+        z(rows, 6, dtype=torch.float32),
+        z(rows, 5120),
+        z(rows, 5120),
+        z(rows, 1152),
+        z(rows, 576),
     ]
 
 

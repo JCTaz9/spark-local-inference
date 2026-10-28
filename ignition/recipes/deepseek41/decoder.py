@@ -142,6 +142,8 @@ class PreparedLayer:
                  window_metadata=None):
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
+        self.index, self.weights, self.mode = index, weights, mode
+        self.persistent_tail = self.persistent_prologue = self.persistent_angles = None
         self.metadata = metadata
         buffers = scratch.buffers if buffers is None else buffers
         self.image_mask = (buffers.zeros(metadata.token_ids.shape, torch.bool)
@@ -202,11 +204,24 @@ class PreparedLayer:
             source = s.residual
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
-        if self.boundary is None:
+        if self.persistent_prologue is not None:
+            if self.attention.owns_window_metadata:
+                self.attention.window_metadata()
+            self.persistent_angles()
+            self.persistent_prologue()
+        elif self.boundary is None:
             self.attention_hc(*incoming)
         else:
             self.boundary(self.attention.selectors[0])
-        self.attention_reduce(self.attention(s.attention_hc.normalized))
+        values = self.attention(s.attention_hc.normalized,
+            prepared_prologue=self.persistent_prologue is not None,
+            project_output=self.persistent_tail is None)
+        if self.persistent_tail is not None:
+            self.persistent_tail()
+            if self.post is not None:
+                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
+            return
+        self.attention_reduce(values)
         self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(s.ffn_hc.normalized)

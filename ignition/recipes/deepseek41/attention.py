@@ -394,26 +394,28 @@ class PreparedAttention:
             self.concurrent_query = ConcurrentProjectionChain((self.projections["q_b"],),
                 parallel_plans=parallel_plans, session=session, workspace=workspace)
 
-    def __call__(self, source):
+    def __call__(self, source, *, prepared_prologue=False, project_output=True):
         m, s = self.metadata, self.scratch
-        if self.owns_window_metadata:
+        if self.owns_window_metadata and not prepared_prologue:
             self.window_metadata()
         position = self.window_metadata.position
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
-        self.projections["qkv_a"](source)
-        if self.norm_quant is None:
-            self.query_norm(s.projected[:, :1280])
-        else:
-            self.norm_quant(s.projected)
-        if self.concurrent_query is not None:
-            self.concurrent_query.start(s.query_low)
-        if self.window_norm is not None:
-            self.window_norm(s.projected[:, 1280:])
-        if self.concurrent_query is None:
-            self.projections["q_b"](s.query_low)
-            self.rotary.apply(s.query, position, compressed=bool(self.ratio))
-        self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
+        query_chain = None if prepared_prologue else self.concurrent_query
+        if not prepared_prologue:
+            self.projections["qkv_a"](source)
+            if self.norm_quant is None:
+                self.query_norm(s.projected[:, :1280])
+            else:
+                self.norm_quant(s.projected)
+            if query_chain is not None:
+                query_chain.start(s.query_low)
+            if self.window_norm is not None:
+                self.window_norm(s.projected[:, 1280:])
+            if query_chain is None:
+                self.projections["q_b"](s.query_low)
+                self.rotary.apply(s.query, position, compressed=bool(self.ratio))
+            self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
         self.window_writer(s.window_values)
         dependency = self.window_cache
         if self.ratio:
@@ -426,17 +428,18 @@ class PreparedAttention:
                 s.index_weights.mul_(128 ** -.5 * 32 ** -.5)
                 for selector in self.selectors:
                     dependency = selector()
-        if self.concurrent_query is not None:
+        if query_chain is not None:
             # The indexer only reads query_low. Its output and all main-stream
             # scratch uses must complete before the query branch rejoins.
-            self.concurrent_query.finish(s.query_low, dependency)
+            query_chain.finish(s.query_low, dependency)
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.attention()
         self.rotary.apply(s.attended, position, compressed=bool(self.ratio), inverse=True)
-        self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
+        if project_output:
+            self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
         if self.mode == "prefill":
             self.commit(m.lengths)
-        return s.output
+        return s.output if project_output else s.attended
 
     def commit(self, counts):
         m = self.metadata

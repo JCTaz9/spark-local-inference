@@ -6,52 +6,44 @@ rank. Attention, prefix state and vocabulary projection retain their existing
 components. All CUDA allocations belong to the package peer-storage provider.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import itertools
+from math import prod
+import weakref
 
 import torch
-from b12x.preparation import (
-    CollectiveRequirement,
-    MemoryRequirements,
-    PersistentMemory,
-    Plan,
-    PreparedCall,
-)
-
-from ignition.components.native_operator import native_contract
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.rebuild_manifest import declare_container_fields
+
+_OWNERS = weakref.WeakValueDictionary()
+_HANDLES = itertools.count()
 
 
 @dataclass(frozen=True)
 class PersistentDecoderQuery:
     rows: int
+    kernel_source: str
+    torch_version: str
+    compiler_identity: str
+    cuda_version: str
+    storage_contract: str = "peer-owned-flags-epoch-scratch-v1"
     shared_a16: int = 0
     world_size: int = 4
     hidden_size: int = 5120
     expert_features: int = 576
 
 
-def _tactics(query):
-    if (
-        not 0 < query.rows <= 128
-        or query.world_size != 4
-        or query.hidden_size != 5120
-        or query.expert_features != 576
-        or query.shared_a16 not in (0, 1, 2, 3)
-        or query.shared_a16
-        and query.rows > 8
-    ):
-        raise ValueError(
-            "persistent decoder requires TP4, 1..128 rows, H5120 and expert width576"
-        )
-    return (1, 2)
+def decoder_query(*, rows, shared_a16=0):
+    from flashinfer.jit.persistent_decoder import source_identity, toolchain_identity
 
-
-CONTRACT = native_contract(
-    component_id="flare.persistent_decoder.tp4",
-    query_type=PersistentDecoderQuery,
-    tactics=_tactics,
-)
+    return PersistentDecoderQuery(
+        rows=rows,
+        shared_a16=shared_a16,
+        kernel_source=source_identity(),
+        compiler_identity=toolchain_identity(),
+        torch_version=str(torch.__version__),
+        cuda_version=str(torch.version.cuda),
+    )
 
 
 def _stages(weight):
@@ -118,6 +110,8 @@ class PersistentDecoderWeights:
         rep = experts.experts._impl.representation_for("w4a8_mx")
         if (
             rep is None
+            or rep.source_format != "fp4_e8m0_k32"
+            or rep.w13_layout != "w13"
             or not rep.n64_repack
             or rep.intermediate_size != 576
             or rep.num_experts != 384
@@ -161,18 +155,6 @@ class PersistentDecoderWeights:
         return cls(tensors, sum(tensor.nbytes for tensor in (*dense, *tail)), rep)
 
 
-@dataclass(frozen=True)
-class _State:
-    channel: object
-    blocks_per_sm: int
-    shared_a16: int
-
-    def run(self, io, weights):
-        self.channel.run(
-            io, weights, blocks_per_sm=self.blocks_per_sm, shared_a16=self.shared_a16
-        )
-
-
 @torch.library.custom_op(
     "flare::persistent_decoder", mutates_args=("io", "scratch", "peers")
 )
@@ -181,101 +163,112 @@ def _execute(
     weights: list[torch.Tensor],
     scratch: list[torch.Tensor],
     peers: list[torch.Tensor],
-    rank: int,
-    ctas: int,
-    shared_a16: int = 0,
+    handle: int,
 ) -> None:
-    from flashinfer.experimental.persistent_decoder import module
-
-    module().run(io, weights, scratch, peers, rank, ctas, shared_a16)
+    owner = _OWNERS[handle]
+    owner.channel.module.run(
+        io, weights, scratch, peers, owner.channel.rank, owner.ctas, owner.shared_a16
+    )
 
 
 @_execute.register_fake
-def _fake(io, weights, scratch, peers, rank, ctas, shared_a16=0):
+def _fake(io, weights, scratch, peers, handle):
     pass
 
 
-class PreparedPersistentDecoder:
-    """Declare one complete decoder candidate and bind selected resident workers.
+def _validate_operands(io, shapes, *, operation):
+    if len(io) != len(shapes):
+        raise ValueError(
+            f"{operation} requires {len(shapes)} tensor operands, got {len(io)}"
+        )
+    device = io[0].device
+    if device.type != "cuda":
+        raise ValueError(f"{operation} requires CUDA tensors")
+    for tensor, (shape, dtype, role) in zip(io, shapes, strict=True):
+        expected = tensor.numel() if shape is None else prod(shape)
+        if (
+            tensor.device != device
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+            or tensor.numel() != expected
+            or (shape is not None and tuple(tensor.shape) != shape)
+        ):
+            raise ValueError(
+                f"{operation} {role} must be contiguous {dtype} {shape} on {device}"
+            )
 
-    ``channel_factory`` creates or returns the rank's shared channel during
-    plan materialization, after the caller has entered collective preparation.
-    ``benchmark_call`` must supply the complete layer's real input-production
-    and correctness contract when racing this candidate against separated work.
-    """
 
-    def __init__(
-        self,
+def _validate_tail(io):
+    if len(io) != 20:
+        raise ValueError("persistent decoder tail requires twenty tensor operands")
+    rows = io[4].shape[0]
+    if not 0 < rows <= 128 or io[0].numel() != rows * 8192:
+        raise ValueError(
+            "persistent decoder tail requires one through 128 rows with sixteen 512-wide heads"
+        )
+    bf, fp, integer, long = torch.bfloat16, torch.float32, torch.int32, torch.int64
+    _validate_operands(
         io,
-        weights,
-        *,
-        channel_factory,
-        session,
-        coordinator,
-        group,
-        name,
-        benchmark_call=None,
-        shared_a16=0,
-    ):
-        import torch.distributed as dist
+        (
+            (None, bf, "attended values"),
+            ((rows,), long, "positions"),
+            ((rows,), long, "token IDs"),
+            (None, fp, "rotary angles"),
+            ((rows, 4, 5120), bf, "attention residual"),
+            ((rows, 4), fp, "attention output gates"),
+            ((rows, 4, 4), fp, "attention residual map"),
+            ((rows, 4), fp, "attention input gates"),
+            ((rows, 5120), bf, "FFN output"),
+            ((rows, 4, 5120), bf, "FFN residual"),
+            ((rows, 4), fp, "FFN output gates"),
+            ((rows, 4, 4), fp, "FFN residual map"),
+            ((rows, 4), fp, "FFN input gates"),
+            ((rows, 384), fp, "router logits"),
+            ((rows, 6), integer, "expert IDs"),
+            ((rows, 6), fp, "route weights"),
+            ((rows, 5120), bf, "routed output"),
+            ((rows, 5120), bf, "shared output"),
+            ((rows, 1152), bf, "shared gate/up boundary"),
+            ((rows, 576), bf, "shared activation boundary"),
+        ),
+        operation="persistent decoder",
+    )
 
-        self.io, self.weights = list(io), list(weights.tensors)
-        query = PersistentDecoderQuery(rows=io[4].shape[0], shared_a16=shared_a16)
-        self.shared_a16 = shared_a16
-        self.plan = Plan(
-            contract=CONTRACT,
-            query=query,
-            _compile_jobs=lambda config, device: (),
-            _memory_requirements=lambda config, device: MemoryRequirements(
-                persistent=(
-                    PersistentMemory(
-                        ("persistent_decoder_channel", channel_factory), 39795456
-                    ),
-                    PersistentMemory(
-                        ("persistent_decoder_dense", id(weights)),
-                        weights.dense_nbytes,
-                        weights.dense_nbytes,
-                    ),
-                )
-            ),
-            _materialize=lambda selection, device: _State(
-                channel_factory(), selection.config.tactic, shared_a16
-            ),
-        )
-        ranks = tuple(dist.get_process_group_ranks(group))
-        request = self.plan.request(
-            name=name,
-            prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(self.io, self.weights),
-                output=tuple(self.io[8:]),
-                owners=(state.channel, weights, *self.io),
-            ),
-            benchmark_call=benchmark_call,
-            collective=CollectiveRequirement(key=name, ranks=ranks),
-        )
-        declare(session, (request,), coordinator=coordinator)
-        register_finalizer(session, self.rebind)
 
-    def rebind(self):
-        state = self.plan.prepared.state
-        self.channel = state.channel
-        self.scratch, self.peers, self.rank = (
-            self.channel.scratch,
-            self.channel.peers,
-            self.channel.rank,
+@dataclass(eq=False)
+class PersistentDecoderCall:
+    """A bound persistent tail whose explicit tensor owners survive capture."""
+
+    io: list
+    weights: list
+    scratch: list
+    peers: list
+    channel: object
+    ctas: int
+    shared_a16: int
+    owners: tuple
+    handle: int = field(init=False)
+
+    def __post_init__(self):
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    @classmethod
+    def bind(cls, io, weights, channel, *, workers, shared_a16):
+        _validate_tail(io)
+        return cls(
+            list(io),
+            list(weights.tensors),
+            channel.scratch,
+            channel.peers,
+            channel,
+            channel.ctas[workers],
+            shared_a16,
+            (weights, channel),
         )
-        self.ctas = self.channel.ctas[state.blocks_per_sm]
 
     def __call__(self):
-        _execute(
-            self.io,
-            self.weights,
-            self.scratch,
-            self.peers,
-            self.rank,
-            self.ctas,
-            self.shared_a16,
-        )
+        _execute(self.io, self.weights, self.scratch, self.peers, self.handle)
         return self.io[8]
 
 
@@ -335,86 +328,49 @@ def _prologue(
     io: list[torch.Tensor],
     weights: list[torch.Tensor],
     scratch: list[torch.Tensor],
-    ctas: int,
+    handle: int,
 ) -> None:
-    from flashinfer.experimental.persistent_decoder import module
-
-    module().prologue(io, weights, scratch, ctas)
+    owner = _OWNERS[handle]
+    owner.channel.module.prologue(io, weights, scratch, owner.ctas)
 
 
 @_prologue.register_fake
-def _fake_prologue(io, weights, scratch, ctas):
+def _fake_prologue(io, weights, scratch, handle):
     pass
 
 
-class PreparedPersistentPrologue:
-    """Fuse lagged mHC, input/query projections, normalization and rotary work.
+@dataclass(eq=False)
+class PersistentPrologueCall:
+    """A bound prologue using the channel's explicitly retained scratch."""
 
-    Input angles are per-row interleaved FP32 cosine/sine pairs from the
-    existing prepared rotary-angle producer. KV cache writes retain their
-    existing component; this operator produces the rotated BF16 KV values.
-    The recipe must exclude Engram-bearing layers and initial residual-only
-    boundaries, which require their existing preparation composition.
-    """
+    io: list
+    weights: list
+    scratch: list
+    ctas: int
+    owners: tuple
+    channel: object
+    handle: int = field(init=False)
 
-    def __init__(
-        self, io, weights, *, channel_factory, session, name, coordinator, group
-    ):
-        import torch.distributed as dist
+    def __post_init__(self):
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
 
-        self.io, self.weights = list(io), list(weights.tensors)
-        rows = io[1].shape[0]
-        if not 0 < rows <= 8:
-            raise ValueError("persistent prologue requires one through eight rows")
-        contract = native_contract(
-            component_id="flare.persistent_decoder.prologue",
-            query_type=PersistentDecoderQuery,
-            tactics=lambda query: (0,),
-        )
-        self.plan = Plan(
-            contract=contract,
-            query=PersistentDecoderQuery(rows=rows),
-            _compile_jobs=lambda config, device: (),
-            _memory_requirements=lambda config, device: MemoryRequirements(
-                persistent=(
-                    PersistentMemory(
-                        ("persistent_decoder_channel", channel_factory), 39795456
-                    ),
-                    PersistentMemory(
-                        ("persistent_prologue_weights", id(weights)),
-                        weights.packed_nbytes,
-                        weights.packed_nbytes,
-                    ),
-                )
-            ),
-            _materialize=lambda selection, device: channel_factory(),
-        )
-        ranks = tuple(dist.get_process_group_ranks(group))
-        declare(
-            session,
-            (
-                self.plan.request(
-                    name=name,
-                    prepare_call=lambda channel: PreparedCall(
-                        run=lambda: channel.prologue(self.io, self.weights),
-                        output=tuple(self.io[7:]),
-                        owners=(channel, weights, *self.io),
-                    ),
-                    collective=CollectiveRequirement(key=name, ranks=ranks),
-                ),
-            ),
-            coordinator=coordinator,
-        )
-        register_finalizer(session, self.rebind)
-
-    def rebind(self):
-        channel = self.plan.prepared.state
-        self.channel, self.scratch, self.ctas = (
-            channel,
+    @classmethod
+    def bind(cls, io, weights, channel):
+        return cls(
+            list(io),
+            list(weights.tensors),
             channel.scratch,
             channel.prologue_ctas,
+            (weights, channel),
+            channel,
         )
 
     def __call__(self):
-        _prologue(self.io, self.weights, self.scratch, self.ctas)
+        _prologue(self.io, self.weights, self.scratch, self.handle)
         return self.io[8]
+
+
+# Prepared native operation owners contain runtime state as well as weight views.
+declare_container_fields(__name__ + ".PersistentDecoderWeights", ("tensors",))
+declare_container_fields(__name__ + ".PersistentPrologueWeights", ("tensors",))

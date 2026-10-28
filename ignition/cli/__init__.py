@@ -146,7 +146,7 @@ def _preparation_arguments(running):
                                " (default: see MODEL --help)")
     capacity.add_argument("--persistent-decoder", action="store_true",
                           help="compare persistent decoder fusion against separated layers during preparation"
-                               " (DeepSeek V4.1, four SM120 GPUs, native expert scales; default: disabled)")
+                               " (DeepSeek V4.1, TP4 SM120, seven drafts, native expert scales; default: disabled)")
     capacity.add_argument("--prompt-logprobs", action="store_true",
                           help="capture dedicated prefill graphs for raw prompt token logprobs")
     capacity.add_argument("--mixed-prefill", action="store_true",

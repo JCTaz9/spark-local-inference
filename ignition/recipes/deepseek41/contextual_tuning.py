@@ -490,7 +490,7 @@ class CatalogCompressedLayerFixture(CatalogLayer0Fixture):
         window = self.pool.window(self.layer_index)[self.state_row]
         latent = self.pool.pages[f"layer{self.source_layer}.latent_page"][:self.required_pages]
         index_keys = indexer.cache[:self.required_pages]
-        count = self.start + self.TARGET_TOKENS
+        count = (self.start + self.TARGET_TOKENS) // layer.attention.ratio
         cases = []
         for seed in (*self.tune_seeds, self.holdout_seed):
             generator = torch.Generator(device="cpu").manual_seed(seed)

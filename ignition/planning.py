@@ -34,7 +34,7 @@ _GIB = 1 << 30
 # Forty target layers retain dense repacks beside prefill weights. The bound
 # includes prologue scale layouts; one resettable peer/scratch slab is shared.
 _PERSISTENT_DENSE_RANK_BYTES = 40 * (36 << 20)
-_PERSISTENT_CHANNEL_RANK_BYTES = 40 << 20
+_PERSISTENT_CHANNEL_RANK_BYTES = 48 << 20
 
 
 @dataclass(frozen=True)
@@ -353,6 +353,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if expert_scale_compression == "native":
         expert_scale_compression = None
     if persistent_decoder:
+        if speculation is None or speculation.draft_tokens!=7 or not speculation.packed_verification:
+            raise UsageError("--persistent-decoder requires seven learned draft tokens and packed eight-row target verification")
         if recipe.name != "deepseek41" or len(gpus) != 4 or any(gpu.capability != (12,0) for gpu in gpus):
             raise UsageError("--persistent-decoder requires DeepSeek V4.1 and four SM120 GPUs")
         if expert_scale_compression is not None:

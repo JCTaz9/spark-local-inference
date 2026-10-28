@@ -420,6 +420,22 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 `--expert-scale-compression native` preserves native scales. MLA arithmetic defaults
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
+`--persistent-decoder` enables complete-layer comparison of separated execution,
+fused attention prologues, and persistent WO/MoE/mHC execution. It defaults to
+disabled and requires four local SM120 GPUs, seven learned draft tokens, native
+expert scales, and enabled tuning. Preparation compares the batch-one target
+graph with eight physical rows; other capacities, vision, Engram, and KV-source
+boundaries use their standard components. The tuner keeps the fastest qualified
+composition per compared layer, including separated execution. Planning reserves
+about 1.5 GiB per rank for alternatives; exported packages retain only weight
+layouts used by their selected graphs.
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --max-concurrency 1 --mtp-draft-tokens 7 \
+  --expert-scale-compression native --persistent-decoder
+```
+
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

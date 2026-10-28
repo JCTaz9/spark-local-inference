@@ -564,13 +564,26 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 graph_pool=package_storage.graph_pool.id, cache_root=config.kernel_cache,
                 compile_decoder=config.compile_decoder, warmup_storage=package_storage,
                 progress=progress)
+        if config.persistent_decoder:
+            if contextual is None:
+                raise ValueError("--persistent-decoder requires tuning and an eight-row batch-one DSpark target catalog")
+            from .persistent_selection import PersistentSelection
+            contextual=PersistentSelection(forwards,signatures,ordinary=contextual,arena=arena,
+                coordinator=coordinator,collective=collective,device=device,
+                graph_pool=package_storage.graph_pool.id,cache_root=config.kernel_cache,
+                compile_decoder=config.compile_decoder,warmup_storage=package_storage,progress=progress)
         with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
             tuning = session.tune(show_progress=progress is not None and rank == 0,
                                   console=stage.console, contextual=contextual)
         if contextual is not None and progress is not None:
             from .contextual_selection import contextual_summary
 
-            summary = contextual_summary(tuning["contextual_tuning"])
+            context_report=tuning["contextual_tuning"]
+            summary = contextual_summary(context_report["attention"] if config.persistent_decoder else context_report)
+            if config.persistent_decoder:
+                selected=context_report["persistent_decoder"]["selected_layers"]
+                progress("Persistent decoder selected at eight target rows for layers: " +
+                    (", ".join(map(str,selected)) if selected else "none; separated layers won"))
             if hasattr(progress, "console"):
                 progress.console.print(summary, markup=False)
             else:
@@ -654,7 +667,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    weight_roots={'weights':weights}
+    if config.persistent_decoder:
+        weight_roots['persistent']=contextual.weight_catalog(len(weights.layers))
+        memory['persistent_decoder_storage']=contextual.memory_report()
+    model = PreparedModel(rebuild_weights=declare_weights(weight_roots, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),
@@ -665,9 +682,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
             collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
             vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
-            scratch_pool, feature_pool),
+            scratch_pool, feature_pool, contextual if config.persistent_decoder else None),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (contextual if config.persistent_decoder else None, scoring, sampling_collective, logprob_collective,
+             result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model
