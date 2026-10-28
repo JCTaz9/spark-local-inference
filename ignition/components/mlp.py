@@ -8,7 +8,8 @@ from b12x.preparation import PreparedCall
 
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.components.weights import MLPWeights
-from ignition.preparation.tuning import declare
+from ignition.preparation.fixtures.hyperconnection import swiglu_benchmark_call
+from ignition.preparation.tuning import declare, races_candidates
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,9 @@ class PreparedMLP:
                 run=lambda: state.launch(gate_up, gate_up, intermediate),
                 owners=(gate_up, intermediate),
             ),
+            benchmark_call=(lambda state: swiglu_benchmark_call(
+                state, gate_up, intermediate, session=session, name=f"{name}.swiglu"))
+            if races_candidates(self.activation_plan, source.device) else None,
         ),))
 
     def __call__(self, source):
