@@ -113,7 +113,7 @@ class Speculation:
     markov_head_quantization: str | None = None
 
     def __post_init__(self):
-        for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4",))):
+        for head, choices in (("draft", ("nvfp4", "mxfp8")), ("markov", ("nvfp4", "fp8"))):
             value = getattr(self, f"{head}_head_quantization")
             if value is not None and value not in choices:
                 raise ValueError(f"{head} head quantization must be omitted or one of: {', '.join(choices)}")

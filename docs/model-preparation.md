@@ -614,6 +614,26 @@ when changing this preparation option.
   --draft-head-quantization mxfp8
 ```
 
+DeepSeek V4.1 also accepts `--markov-head-quantization fp8`. It stores the draft
+Markov output weights as E4M3 values with one FP32 reconstruction scale per
+vocabulary row. The flag is independent of `--draft-head-quantization`; omit it
+to retain checkpoint precision. Both the fused batch-one and wider prepared
+Markov paths form FP32 transition scores, and the proposal draw and retained
+rejection distribution use those same scores. Target vocabulary weights remain
+BF16 and target logits remain FP32. Row-scaled FP8 is lossy draft arithmetic,
+so seeded text and acceptance may change. To prepare NVFP4 draft vocabulary
+weights together with FP8 Markov weights while retaining the recipe's other
+defaults, run from the repository root:
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --draft-head-quantization nvfp4 --markov-head-quantization fp8
+```
+
+Use an ordinary export when first changing either head's weight format.
+`--reuse-weights` trusts the previous package's weight bytes, while
+`--no-weights` requires the exact changed payloads to be cached already.
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

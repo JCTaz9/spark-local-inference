@@ -27,3 +27,12 @@ def test_native_full_proposals_preserve_filtered_target_laws(tmp_path):
     records = run(tmp_path / "laws.json")
     assert len(records) == 6
     assert all(record["samples"] == 131072 for record in records)
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an explicitly assigned CUDA device")
+def test_row_scaled_fp8_proposal_preserves_filtered_target_law(tmp_path):
+    from tests.components.markov_law_support import run
+
+    records = run(tmp_path / "fp8-law.json", fp8=True, policy_names=("top_k_2",))
+    assert len(records) == 1
+    assert records[0]["samples"] == 131072

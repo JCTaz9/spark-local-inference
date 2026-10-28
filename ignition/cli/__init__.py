@@ -177,9 +177,9 @@ def _preparation_arguments(running):
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
                                " MXFP8: DeepSeek V4.1; default: checkpoint precision)")
-    advanced.add_argument("--markov-head-quantization", choices=("nvfp4",),
+    advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
-                               " (DeepSeek V4/V4.1; default: checkpoint precision)")
+                               " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
                                " kernel tuning (default: see MODEL --help)")

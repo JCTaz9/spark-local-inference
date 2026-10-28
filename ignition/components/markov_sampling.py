@@ -14,18 +14,65 @@ independent of vocabulary size. The proposal distribution is full softmax; targe
 remain the responsibility of stochastic verification.
 """
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 from ignition.preparation.scratch import bind_scratch
+from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.triton import prepare_triton
+from ignition.preparation.tuning import register_finalizer
 from .draft_sampling import _selected_row
 from .speculation import _geometry, _metadata, _tensor
 
 # Counter word three separates token-wise noise from scalar proposal draws.
 GUMBEL_COUNTER_DOMAIN = tl.constexpr(0x47554D42)
+
+
+@dataclass(frozen=True)
+class RowScaledFP8MarkovWeight:
+    """E4M3 transition values with one FP32 reconstruction scale per vocabulary row."""
+
+    values: torch.Tensor
+    scale: torch.Tensor
+
+    def __post_init__(self):
+        values, scale = self.values, self.scale
+        if (values.ndim != 2 or values.dtype != torch.float8_e4m3fn or not values.is_contiguous()
+                or values.shape[0] < 1 or values.shape[1] < 64 or values.shape[1] % 64
+                or scale.shape != (values.shape[0],) or scale.dtype != torch.float32
+                or not scale.is_contiguous() or values.device != scale.device):
+            raise ValueError("row-scaled FP8 Markov weights require contiguous E4M3 values and FP32 row scales")
+
+    @property
+    def out_features(self):
+        return self.values.shape[0]
+
+    @property
+    def in_features(self):
+        return self.values.shape[1]
+
+
+@torch.no_grad()
+def fp8_markov_head(weight: torch.Tensor, *, rows_per_chunk=4096) -> RowScaledFP8MarkovWeight:
+    """Quantize each BF16 row to E4M3 using its amax divided by 448."""
+    if (weight.ndim != 2 or weight.dtype != torch.bfloat16 or not weight.is_contiguous()
+            or weight.shape[0] < 1 or weight.shape[1] < 64 or weight.shape[1] % 64
+            or type(rows_per_chunk) is not int or rows_per_chunk < 1):
+        raise ValueError("FP8 Markov conversion requires contiguous BF16 [vocabulary, rank] weights")
+    if not bool(torch.isfinite(weight).all()):
+        raise ValueError("FP8 Markov conversion requires finite checkpoint weights")
+    values = torch.empty(weight.shape, dtype=torch.float8_e4m3fn, device=weight.device)
+    scales = torch.empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
+    for start in range(0, weight.shape[0], rows_per_chunk):
+        block = weight[start:start + rows_per_chunk].float()
+        scale = block.abs().amax(dim=1).clamp_min(1e-12) / 448.0
+        values[start:start + rows_per_chunk] = (block / scale[:, None]).to(torch.float8_e4m3fn)
+        scales[start:start + rows_per_chunk] = scale
+    return RowScaledFP8MarkovWeight(values, scales)
 
 
 @triton.jit
@@ -84,10 +131,70 @@ def _row_live(
 
 
 @triton.jit
+def _transition_bias(Embed, Head, HeadScale, row, token, inside,
+                     RANK: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
+                     FP8: tl.constexpr):
+    bias = tl.full((BLOCK,), 0.0, tl.float32)
+    for start in tl.static_range(0, RANK, CHUNK):
+        column = start + tl.arange(0, CHUNK)
+        weights = tl.load(Head + token[:, None].to(tl.int64) * RANK + column[None, :],
+                          inside[:, None], other=0.0).to(tl.float32)
+        embedding = tl.load(Embed + row.to(tl.int64) * RANK + column).to(tl.float32)
+        bias += tl.sum(weights * embedding[None, :], 1)
+    if FP8:
+        bias *= tl.load(HeadScale + token, inside, other=0.0).to(tl.float32)
+    return bias
+
+
+@triton.jit
+def _row_scaled_projection(Source, Head, HeadScale, Output, V: tl.constexpr,
+                           RANK: tl.constexpr, BLOCK: tl.constexpr, CHUNK: tl.constexpr):
+    block, row = tl.program_id(0), tl.program_id(1)
+    token = block * BLOCK + tl.arange(0, BLOCK)
+    inside = token < V
+    bias = _transition_bias(Source, Head, HeadScale, row, token, inside,
+                            RANK, CHUNK, BLOCK, True)
+    tl.store(Output + row * V + token, bias, inside)
+
+
+class PreparedRowScaledFP8MarkovProjection:
+    """Write FP32 transition bias from BF16 embeddings and row-scaled E4M3 weights."""
+
+    def __init__(self, source, weight: RowScaledFP8MarkovWeight, output, *, session, name):
+        if (not isinstance(weight, RowScaledFP8MarkovWeight)
+                or source.ndim != 2 or source.dtype != torch.bfloat16 or not source.is_contiguous()
+                or source.shape[1] != weight.in_features or source.device != weight.values.device
+                or output.shape != (source.shape[0], weight.out_features)
+                or output.dtype != torch.float32 or not output.is_contiguous()
+                or output.device != source.device):
+            raise ValueError("row-scaled FP8 Markov projection requires BF16 rows and caller-owned FP32 logits")
+        self.source, self.weight, self.output = source, weight, output
+        self.kernel = None
+        record_numeric_tensor(weight.values)
+        record_numeric_tensor(weight.scale)
+        register_finalizer(session, self.prepare)
+
+    def prepare(self):
+        weight = self.weight
+        self.kernel = prepare_triton(_row_scaled_projection,
+            (self.source, weight.values, weight.scale, self.output),
+            (triton.cdiv(weight.out_features, 256), self.source.shape[0], 1),
+            V=weight.out_features, RANK=weight.in_features, BLOCK=256, CHUNK=64,
+            num_warps=4, enable_fp_fusion=False)
+
+    def __call__(self):
+        if self.kernel is None:
+            raise RuntimeError("row-scaled FP8 Markov projection requires preparation")
+        self.kernel()
+        return self.output
+
+
+@triton.jit
 def _markov_step(
     Base,
     Embed,
     Head,
+    HeadScale,
     Pending,
     Tokens,
     Scores,
@@ -124,6 +231,7 @@ def _markov_step(
     RUNNING: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     block, row = tl.program_id(0), tl.program_id(1)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -148,14 +256,8 @@ def _markov_step(
         if block == 0:
             tl.store(Tokens + row * DEPTH + STEP - 1, previous)
     previous = tl.minimum(tl.maximum(previous, 0), V - 1)
-    bias = tl.full((BLOCK,), 0.0, tl.float32)
-    for start in tl.static_range(0, RANK, CHUNK):
-        column = start + tl.arange(0, CHUNK)
-        weights = tl.load(Head + token[:, None].to(tl.int64) * RANK + column[None, :], inside[:, None], other=0.0).to(
-            tl.float32
-        )
-        embedding = tl.load(Embed + previous.to(tl.int64) * RANK + column).to(tl.float32)
-        bias += tl.sum(weights * embedding[None, :], 1)
+    bias = _transition_bias(Embed, Head, HeadScale, previous, token, inside,
+                            RANK, CHUNK, BLOCK, FP8)
     score = (
         tl.load(Base + row * base_row_stride + STEP * base_step_stride + token, inside, other=0.0).to(tl.float32) + bias
     )
@@ -251,9 +353,9 @@ def _normalize(
 class PreparedMarkovProposals:
     """Generate a conditional proposal block and retain full FP32 rejection probabilities.
 
-    Base logits retain BF16/FP32 storage and transition weights remain BF16.
-    Transition arithmetic, logits addition and retained proposal probabilities
-    are FP32. The proposal softmax intentionally omits target top-k/top-p/min-p
+    Base logits retain BF16/FP32 storage. Transition arithmetic, logits addition
+    and retained proposal probabilities are FP32 for BF16 or row-scaled E4M3
+    weights. The proposal softmax intentionally omits target top-k/top-p/min-p
     filters; verification applies the actual target policy and its positive
     residual distribution.
     """
@@ -291,24 +393,28 @@ class PreparedMarkovProposals:
             raise ValueError("fused Markov logits require request, draft and vocabulary dimensions")
         batch, depth, vocab = base.shape
         _geometry(batch, depth + 1)
+        fp8 = isinstance(head, RowScaledFP8MarkovWeight)
+        values = head.values if fp8 else head
+        scale = head.scale if fp8 else None
         if (
             base.dtype not in (torch.bfloat16, torch.float32)
             or base.stride(-1) != 1
             or not 1 <= depth <= 7
-            or embedding.shape != head.shape
-            or head.shape[0] != vocab
-            or head.shape[1] % 64
-            or head.dtype != torch.bfloat16
+            or not isinstance(values, torch.Tensor)
+            or embedding.shape != values.shape
+            or values.shape[0] != vocab
+            or values.shape[1] % 64
+            or values.dtype != (torch.float8_e4m3fn if fp8 else torch.bfloat16)
             or embedding.dtype != torch.bfloat16
-            or not head.is_contiguous()
+            or not values.is_contiguous()
             or not embedding.is_contiguous()
-            or head.device != base.device
+            or values.device != base.device
             or embedding.device != base.device
             or base.stride(1) < vocab
             or base.stride(0) < depth * base.stride(1)
         ):
             raise ValueError(
-                "fused Markov proposals require strided BF16/FP32 logits and contiguous BF16 transition tables"
+                "fused Markov proposals require strided BF16/FP32 logits and contiguous BF16 or row-scaled E4M3 tables"
             )
         if requests.vocab_size != vocab:
             raise ValueError("fused Markov vocabulary must match request state")
@@ -323,6 +429,10 @@ class PreparedMarkovProposals:
         ):
             _tensor(tensor, shape, dtype, base.device, name)
         self.base, self.embedding, self.head, self.pending = (base, embedding, head, pending)
+        self.head_values, self.head_scale = values, scale
+        if fp8:
+            record_numeric_tensor(values)
+            record_numeric_tensor(scale)
         self.tokens, self.probabilities, self.valid = tokens, probabilities, valid
         self.state, self.slots, self.generations, self.live_rows = (requests, slots, generations, live_rows)
         self.seeds, self.offsets = seeds, offsets
@@ -337,7 +447,7 @@ class PreparedMarkovProposals:
         n = triton.cdiv(v, block)
         common = dict(
             V=v,
-            RANK=self.head.shape[1],
+            RANK=self.head_values.shape[1],
             DEPTH=d,
             BLOCKS=n,
             PAD=triton.next_power_of_2(n),
@@ -346,6 +456,7 @@ class PreparedMarkovProposals:
             RUNNING=RUNNING,
             BLOCK=block,
             CHUNK=64,
+            FP8=self.head_scale is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -359,7 +470,8 @@ class PreparedMarkovProposals:
                     (
                         self.base,
                         self.embedding,
-                        self.head,
+                        self.head_values,
+                        self.head_values if self.head_scale is None else self.head_scale,
                         self.pending,
                         self.tokens,
                         self.probabilities,

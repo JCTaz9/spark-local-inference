@@ -206,12 +206,15 @@ class PreparedParallelDraftRound:
             workspace=self.sampling_scratch.get("target")
         )
         head = getattr(getattr(o.weights, "draft", None), "markov_head", None)
+        from .markov_sampling import RowScaledFP8MarkovWeight
+
         # Full-vocabulary transition fusion improves one-row proposals. Wider
         # rows retain the bounded sampler because transition-weight reuse wins.
         fuse_markov = (b == 1 and w > 1 and self.generate_proposals and self.argmax is None
             and getattr(o, "block_proposal_broadcast", False) and o.markov_runtime is None
             and self.selector is None and self.markov is not None
-            and isinstance(head, torch.Tensor) and head.dtype == torch.bfloat16 and head.is_contiguous())
+            and ((isinstance(head, torch.Tensor) and head.dtype == torch.bfloat16 and head.is_contiguous())
+                 or isinstance(head, RowScaledFP8MarkovWeight)))
         proposals = tuple(
             PreparedDraftDistribution(
                 self.logits,
