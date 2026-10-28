@@ -82,3 +82,24 @@ def test_rebuild_switch_has_an_explicit_false_default():
     assert proto.RebuildManifest.FromString(
         prepared.SerializeToString()
     ).persistent_decoder
+
+
+def test_upstream_joint_tuning_wire_tag_does_not_enable_persistent_decoder():
+    # Upstream preparation metadata uses field 23 for joint attention-plan
+    # tuning. Its bool payload must not select a persistent decoder here.
+    upstream = bytes.fromhex("08 01 b8 01 01")
+    decoded = proto.RebuildManifest.FromString(upstream)
+    assert decoded.version == 1 and not decoded.persistent_decoder
+    assert decoded.SerializeToString() == upstream
+
+
+def test_persistent_decoder_uses_wire_tag26_and_preserves_vocabulary_sampling_tag11():
+    encoded = bytes.fromhex("08 01 92 01 02 58 01 d0 01 01")
+    decoded = proto.RebuildManifest.FromString(encoded)
+    assert decoded.version == 1 and decoded.persistent_decoder
+    assert decoded.speculation.vocabulary_parallel_sampling
+    assert decoded.SerializeToString() == encoded
+    prepared = proto.RebuildManifest(version=1, persistent_decoder=True,
+        speculation=proto.RebuildSpeculation(vocabulary_parallel_sampling=True))
+    assert prepared.SerializeToString() == encoded
+    assert prepared.speculation.SerializeToString() == bytes.fromhex("58 01")

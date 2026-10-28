@@ -488,6 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_wire_tags_keep_upstream_joint_tuning_separate_from_persistent_decoder() {
+        // Upstream field 23 selects joint attention-plan tuning, which this
+        // runtime leaves uninterpreted.
+        let upstream = [0x08, 0x01, 0xb8, 0x01, 0x01];
+        let decoded = wire::RebuildManifest::decode(upstream.as_slice()).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert!(!decoded.persistent_decoder);
+
+        // Persistent decoder uses field 26, and vocabulary sampling retains
+        // speculation field 11 inside the existing field 18 message.
+        let encoded = [0x08, 0x01, 0x92, 0x01, 0x02, 0x58, 0x01, 0xd0, 0x01, 0x01];
+        let decoded = wire::RebuildManifest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert!(decoded.persistent_decoder);
+        assert!(decoded.speculation.as_ref().unwrap().vocabulary_parallel_sampling);
+        assert_eq!(decoded.encode_to_vec(), encoded);
+        let prepared = wire::RebuildManifest {
+            version: 1,
+            persistent_decoder: true,
+            speculation: Some(wire::RebuildSpeculation {
+                vocabulary_parallel_sampling: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(prepared.encode_to_vec(), encoded);
+    }
+
+    #[test]
     fn summary_and_detail_sections_preserve_optional_values_and_selected_ranks() {
         let index = wire::ModelIndex {
             contract: Some(wire::ServingContract {
