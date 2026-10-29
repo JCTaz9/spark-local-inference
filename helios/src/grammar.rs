@@ -65,6 +65,7 @@ pub struct GrammarCompiler {
     tokenizer_vocab: usize,
     eos_ids: Arc<[u32]>,
     delimiters: Arc<[(u32, String)]>,
+    special_tokens: Vec<(u32, String)>,
 }
 
 impl GrammarCompiler {
@@ -136,6 +137,11 @@ impl GrammarCompiler {
                 "grammar EOS IDs must be distinct checkpoint special tokens",
             ));
         }
+        let added = tokenizer.get_added_vocabulary();
+        let special_tokens = added.get_vocab().iter()
+            .filter(|(name, _)| added.is_special_token(name))
+            .map(|(name, &id)| (id, name.clone()))
+            .collect();
         let tokenizer_vocab = bytes.len();
         let trie = TokTrie::from(&TokRxInfo::new(tokenizer_vocab as u32, eos_ids[0]), &bytes)
             .with_eos_tokens(eos_ids);
@@ -165,6 +171,7 @@ impl GrammarCompiler {
             factory,
             model_vocab,
             tokenizer_vocab,
+            special_tokens,
             eos_ids: eos_ids.into(),
             delimiters: delimiters.into(),
         })
@@ -245,13 +252,13 @@ impl GrammarCompiler {
             if let Some((function_open, function_close)) = envelope.function {
                 rules.push_str(&format!(
                     "tool_after_open: ws {} tool_body (ws {})?\ntool: {} tool_after_open | tool_after_open\n",
-                    self.marker(function_open), self.marker(close), self.marker(open)
+                    self.marker(function_open), self.marker(close), self.compound_marker(open)
                 ));
                 rules.push_str(&self.region("tool_body", function_close));
             } else {
                 rules.push_str(&format!(
                     "tool_after_open: tool_body\ntool: {} tool_after_open\n",
-                    self.marker(open)
+                    self.compound_marker(open)
                 ));
                 rules.push_str(&self.region("tool_body", close));
             }
@@ -343,12 +350,39 @@ impl GrammarCompiler {
 
     fn marker(&self, text: &str) -> String {
         if text.is_empty() {
+            String::new()
+        } else {
+            self.token_id(text).map_or_else(
+                || serde_json::to_string(text).unwrap(),
+                |id| format!("<[{id}]>"),
+            )
+        }
+    }
+
+    fn compound_marker(&self, text: &str) -> String {
+        if text.is_empty() {
             return String::new();
         }
-        match self.token_id(text) {
-            Some(id) => format!("<[{id}]>"),
-            None => serde_json::to_string(text).unwrap(),
+        if let Some(id) = self.token_id(text) {
+            return format!("<[{id}]>");
         }
+        let mut rest = text;
+        let mut pieces = Vec::new();
+        while let Some((at, spelling, id)) = self.special_tokens.iter()
+            .filter(|(_, spelling)| !spelling.is_empty())
+            .filter_map(|(id, spelling)| rest.find(spelling).map(|at| (at, spelling.as_str(), *id)))
+            .min_by_key(|(at, spelling, _)| (*at, std::cmp::Reverse(spelling.len())))
+        {
+            if at > 0 {
+                pieces.push(serde_json::to_string(&rest[..at]).unwrap());
+            }
+            pieces.push(format!("<[{id}]>"));
+            rest = &rest[at + spelling.len()..];
+        }
+        if !rest.is_empty() {
+            pieces.push(serde_json::to_string(rest).unwrap());
+        }
+        pieces.join(" ")
     }
 
     /// The ID of a declared delimiter or special token, which grammars match only as
@@ -362,13 +396,10 @@ impl GrammarCompiler {
     }
 
     fn region(&self, name: &str, close: &str) -> String {
-        let trie = self.factory.tok_env().tok_trie();
         if let Some(end) = self.token_id(close) {
-            let specials: Vec<_> = trie
-                .get_special_tokens()
-                .into_iter()
-                .filter(|id| *id != end && !self.eos_ids.contains(id))
-                .map(|id| id.to_string())
+            let specials: Vec<_> = self.special_tokens.iter()
+                .filter(|(id, _)| *id != end && !self.eos_ids.contains(id))
+                .map(|(id, _)| id.to_string())
                 .collect();
             let body = if specials.is_empty() {
                 "/(?s:.*)/".into()
@@ -376,6 +407,22 @@ impl GrammarCompiler {
                 format!("(/(?s:.+)/ | <[{}]>)*", specials.join(","))
             };
             format!("{name}: {body} <[{end}]>\n")
+        } else if let Some((at, spelling, id)) = self.special_tokens.iter()
+            .filter(|(id, spelling)| !spelling.is_empty() && !self.eos_ids.contains(id))
+            .filter_map(|(id, spelling)| close.find(spelling)
+                .filter(|&at| &close[..at] == "</" && at + spelling.len() < close.len())
+                .map(|at| (at, spelling.as_str(), *id)))
+            .min_by_key(|(at, spelling, _)| (*at, std::cmp::Reverse(spelling.len())))
+        {
+            let before = &close[..at];
+            let after = &close[at + spelling.len()..];
+            let specials = self.special_tokens.iter()
+                .filter(|(id, _)| !self.eos_ids.contains(id))
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let tail = format!("{}_TAIL", name.to_uppercase());
+            format!("{tail}: (/[^<]+/ & ~({} /(?s:.*)/))\n{name}: (/[^<]+/ | \"<\" | <[{specials}]> | {} <[{id}]> {tail})* {} <[{id}]> {}\n", serde_json::to_string(after).unwrap(), serde_json::to_string(before).unwrap(), serde_json::to_string(before).unwrap(), serde_json::to_string(after).unwrap())
         } else {
             // Lazy suffixes consume the delimiter without token backtracking.
             format!(
@@ -386,7 +433,6 @@ impl GrammarCompiler {
     }
 
     fn delimited_region(&self, name: &str, close: &str, ends: &[&str]) -> String {
-        let trie = self.factory.tok_env().tok_trie();
         let literals: Vec<_> = ends
             .iter()
             .filter(|end| self.token_id(end).is_none())
@@ -401,11 +447,9 @@ impl GrammarCompiler {
             )
         };
         let excluded: Vec<_> = ends.iter().filter_map(|end| self.token_id(end)).collect();
-        let specials: Vec<_> = trie
-            .get_special_tokens()
-            .into_iter()
-            .filter(|id| !excluded.contains(id) && !self.eos_ids.contains(id))
-            .map(|id| id.to_string())
+        let specials: Vec<_> = self.special_tokens.iter()
+            .filter(|(id, _)| !excluded.contains(id) && !self.eos_ids.contains(id))
+            .map(|(id, _)| id.to_string())
             .collect();
         let terminal = format!("{}_TEXT", name.to_uppercase());
         let ending = if let Some(id) = self.token_id(close) {

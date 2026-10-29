@@ -517,7 +517,12 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if chunk % 64 or not 64 <= chunk <= recipe.context:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
-    sizes = " or ".join(map(str, recipe.tensor_parallel))
+    world_sizes = recipe.tensor_parallel
+    if speculation is not None and speculation.vocabulary_parallel_sampling:
+        if recipe.name != "deepseek41":
+            raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
+        world_sizes = tuple(size for size in world_sizes if size != 3)
+    sizes = " or ".join(map(str, world_sizes))
     supported = [gpu for gpu in gpus if gpu.supported]
     chosen = None
     if selected is not None:
@@ -525,15 +530,17 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
             raise UsageError(f"--gpus {format_gpus(selected)} names a GPU this host does not have;"
                              f" it has {len(gpus)}")
         chosen = tuple(gpus[index] for index in selected)
-        if len(chosen) not in recipe.tensor_parallel:
-            size = min(recipe.tensor_parallel, key=lambda size: (size < len(chosen), size))
+        if speculation is not None and speculation.vocabulary_parallel_sampling and len(chosen) == 3:
+            raise UsageError("--vocabulary-parallel-sampling has no TP3 gather; select four GPUs")
+        if len(chosen) not in world_sizes:
+            size = min(world_sizes, key=lambda size: (size < len(chosen), size))
             first = max(0, min(selected[0], len(gpus) - size))
             example = format_gpus(range(first, first + size))
             raise CapacityError(f"{checkpoint.alias} needs {sizes} GPUs; {len(chosen)} selected; use --gpus {example}")
         for gpu in chosen:
             if not gpu.supported:
                 raise CapacityError(f"GPU {gpu.index} ({gpu.name}) is not an {SUPPORTED_ARCHITECTURES} device")
-    elif len(supported) < recipe.tensor_parallel[0]:
+    elif len(supported) < world_sizes[0]:
         raise CapacityError(f"{checkpoint.alias} needs {sizes} {SUPPORTED_ARCHITECTURES} GPUs; this host has {len(supported)}")
 
     def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
@@ -557,7 +564,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     def candidates(**settings):
         if chosen is not None:
             return [fitted(chosen, **settings)]
-        return [automatic(size, **settings) for size in recipe.tensor_parallel if size <= len(supported)]
+        return [automatic(size, **settings) for size in world_sizes if size <= len(supported)]
 
     def attempt(**settings):
         return next((candidate for candidate in candidates(**settings) if candidate.fits), None)
@@ -584,7 +591,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if speculation is not None and attempt(speculation=None) is not None:
         options.append("--no-mtp")
     if chosen is not None:
-        for size in recipe.tensor_parallel:
+        for size in world_sizes:
             if len(chosen) < size <= len(supported) and (larger := automatic(size)).fits:
                 options.append(f"--gpus {format_gpus(gpu.index for gpu in larger.gpus)}")
                 break

@@ -44,7 +44,9 @@ class PackageStorage:
         self.local_ranks = world if local_ranks is None else local_ranks
         if type(self.local_ranks) is not int or not 1 <= self.local_ranks <= world:
             raise ValueError("local preparation ranks must be positive and fit the rank group")
-        self.integrated = torch.cuda.get_device_properties(device).is_integrated
+        properties = torch.cuda.get_device_properties(device)
+        self.integrated = properties.is_integrated
+        self._retention_scope = False
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
         from flare_heliopause import flare_heliopause as native
@@ -71,6 +73,8 @@ class PackageStorage:
         allocator = torch.cuda.memory.CUDAPluggableAllocator(
             native.__file__, "flare_package_allocate", "flare_package_free")
         self._allocator = allocator
+        self._transient_allocator = torch.cuda.memory.CUDAPluggableAllocator(
+            native.__file__, "flare_package_allocate", "flare_package_transient_free")
         self.pool = torch.cuda.MemPool(allocator.allocator())
         self.graph_pool = torch.cuda.MemPool(allocator.allocator())
         self._preparation_pools = {self.pool.id}
@@ -166,6 +170,27 @@ class PackageStorage:
         return None if message is None else RuntimeError(message.decode())
 
     @contextmanager
+    def retain_transient_backing(self):
+        """Keep transient physical allocations alive across compiled-forward warming."""
+        if self._retention_scope:
+            raise RuntimeError("nested transient physical retention scope")
+        self._retention_scope = True
+        try:
+            if self.library.flare_package_retention_begin():
+                raise self.error or RuntimeError("cannot begin transient physical retention")
+            try:
+                yield
+                if self.error is not None:
+                    raise self.error
+                if self.library.flare_package_retention_finish():
+                    raise self.error or RuntimeError("cannot release transient physical backing")
+            except BaseException:
+                self.library.flare_package_retention_abort()
+                raise
+        finally:
+            self._retention_scope = False
+
+    @contextmanager
     def transient(self):
         """Route allocations to a package-backed pool whose free segments return to the device on exit.
 
@@ -176,7 +201,9 @@ class PackageStorage:
         """
         import torch
 
-        pool = torch.cuda.MemPool(self._allocator.allocator())
+        allocator = (self._transient_allocator if self._retention_scope
+                     else self._allocator)
+        pool = torch.cuda.MemPool(allocator.allocator())
         self._preparation_pools.add(pool.id)
         try:
             with torch.cuda.use_mem_pool(pool, device=self.device):

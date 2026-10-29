@@ -26,9 +26,9 @@ rdma = ["flare-selene/rdma"]
 
 [dependencies]
 flare-eos = { path = "../eos" }
-deepseek-recipe = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
-deepseek-recipe-core = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
-deepseek-recipe-encoding = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
+deepseek-recipe = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270", optional = true }
+deepseek-recipe-core = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270", optional = true }
+deepseek-recipe-encoding = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6d09e9be68dbf4ae488f6b22ee9114dcf9ea6270", optional = true }
 httpdate = { version = "1.0", optional = true }
 futures-util = { version = "0.3", optional = true }
 flate2 = { version = "1", optional = true }

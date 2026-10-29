@@ -78,10 +78,10 @@ impl OutputPipeline {
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
             Some((ToolParserKind::Dsml, _, " ")) => {
-                Self::SpacedDsml(super::dsml::DsmlOutput::new(config.content))
+                Self::SpacedDsml(super::dsml::DsmlOutput::new(config.content).with_special_tokens(config.control_tokens))
             }
             Some((ToolParserKind::Dsml, _, _)) => {
-                Self::Dsml(super::dsml::DsmlOutput::new(config.content))
+                Self::Dsml(super::dsml::DsmlOutput::new(config.content).with_special_tokens(config.control_tokens))
             }
             Some((ToolParserKind::Xtml, _, _)) => Self::Xtml(super::xtml::XtmlOutput::new(
                 config.content,
@@ -100,13 +100,13 @@ impl OutputPipeline {
     }
 
     /// Whether the parser `new` selects gates reasoning delimiters by token identity.
-    /// DSML recognizes its markup in the recipe crate's text state machine, and XTML
-    /// and recipient-header framing carry their own control tokens.
+    /// XTML and recipient-header framing carry their own control tokens.
     pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
         match syntax.tools.as_ref().map(|t| t.kind) {
-            Some(ToolParserKind::Dsml | ToolParserKind::Xtml | ToolParserKind::Atem) => false,
+            Some(ToolParserKind::Xtml | ToolParserKind::Atem) => false,
             Some(
-                ToolParserKind::QwenCoder
+                ToolParserKind::Dsml
+                | ToolParserKind::QwenCoder
                 | ToolParserKind::GlmArgumentTags
                 | ToolParserKind::MiniMaxXml
                 | ToolParserKind::GemmaCall,

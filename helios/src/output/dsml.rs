@@ -5,8 +5,9 @@ use super::{
     tagged::{OutputConfig, OutputStart},
 };
 use crate::Result;
-use deepseek_recipe::stream::state_machine::{
-    OutputAction, OutputActionSegment, ParsingOptions, ReasoningStage, StateMachine,
+use deepseek_recipe::stream::{
+    ParsingOptions, ThinkingInitialStage,
+    output_parser::{ChunkKind, OutputAction, OutputActionSegment, OutputParser},
 };
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
@@ -23,20 +24,22 @@ struct Call {
 pub struct DsmlOutput<const SPACED: bool> {
     consumed: usize,
     spans: Vec<Option<std::ops::Range<usize>>>,
-    machine: Option<StateMachine>,
+    machine: Option<OutputParser>,
     pending: String,
     last_action: OutputAction,
     call: Option<Call>,
     calls: usize,
     structured: bool,
     verbatim: bool,
+    special_tokens: Vec<(u32, String)>,
+    last_token: Option<u32>,
 }
 
 impl<const SPACED: bool> DsmlOutput<SPACED> {
     fn apply(&mut self, actions: Vec<OutputActionSegment>, events: &mut Vec<Event>) -> Result<()> {
         let mut consumed = 0;
         for segment in actions {
-            let end = consumed + segment.len;
+            let end = consumed + segment.byte_len;
             let source = self
                 .pending
                 .get(consumed..end)
@@ -44,9 +47,10 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
             let repeated = self.last_action == segment.action;
             self.last_action = segment.action;
             match segment.action {
-                OutputAction::Raw => {
+                OutputAction::Content => {
                     if !source.is_empty() {
-                        self.spans.push(Some(self.consumed + consumed..self.consumed + end));
+                        self.spans
+                            .push(Some(self.consumed + consumed..self.consumed + end));
                         events.push(Event::Content(source.to_owned()));
                         self.verbatim = self.structured && !source.trim().is_empty();
                     }
@@ -82,14 +86,16 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         return Err("tool function name is empty".into());
                     }
                 }
-                OutputAction::LabelToolCallArguments { label, .. } if !repeated => {
+                OutputAction::LabelToolCallArguments(label) if !repeated => {
                     self.call
                         .as_mut()
                         .ok_or("DeepSeek tool arguments have no call")?
                         .arguments
-                        .push_str(label);
+                        .push_str(label.as_str());
                 }
-                OutputAction::RawToolCallArguments { string } => {
+                OutputAction::ToolCallArgumentsText {
+                    is_string_value: string,
+                } => {
                     let arguments = &mut self
                         .call
                         .as_mut()
@@ -103,12 +109,12 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                         arguments.push_str(source);
                     }
                 }
-                OutputAction::ToolCallArgumentsEnd { output } if !repeated => {
+                OutputAction::ToolCallArgumentsEnd { closing_text } if !repeated => {
                     let mut call = self
                         .call
                         .take()
                         .ok_or("DeepSeek tool arguments have no call")?;
-                    call.arguments.push_str(output.unwrap_or_default());
+                    call.arguments.push_str(closing_text);
                     validate_arguments(&call.arguments)?;
                     let index = self.calls;
                     events.extend([
@@ -130,9 +136,10 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
                     events.push(Event::Content(label.into()))
                 }
                 OutputAction::ToSpace => {
-                    self.spans.push(Some(self.consumed + consumed..self.consumed + end));
+                    self.spans
+                        .push(Some(self.consumed + consumed..self.consumed + end));
                     events.push(Event::Content(" ".into()));
-                },
+                }
                 _ => {}
             }
             if self.call.as_ref().is_some_and(|call| {
@@ -148,7 +155,8 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         self.pending.drain(..consumed);
         self.consumed += consumed;
         if self.verbatim && !self.pending.is_empty() {
-            self.spans.push(Some(self.consumed..self.consumed + self.pending.len()));
+            self.spans
+                .push(Some(self.consumed..self.consumed + self.pending.len()));
             self.consumed += self.pending.len();
             events.push(Event::Content(std::mem::take(&mut self.pending)));
         }
@@ -158,9 +166,38 @@ impl<const SPACED: bool> DsmlOutput<SPACED> {
         Ok(())
     }
 
-    fn feed(&mut self, text: &str, events: &mut Vec<Event>) -> Result<()> {
+    pub fn with_special_tokens(mut self, tokens: Vec<(u32, String)>) -> Self {
+        self.special_tokens = tokens;
+        self
+    }
+
+    fn present(&mut self, text: &str, kind: ChunkKind, events: &mut Vec<Event>) -> Result<()> {
+        let mut rest = text;
+        while self.structured
+            && !self.verbatim
+            && !rest.is_empty()
+            && kind != ChunkKind::SpecialToken
+        {
+            let length = rest.chars().next().unwrap().len_utf8();
+            self.feed(&rest[..length], kind, events)?;
+            rest = &rest[length..];
+        }
+        if !rest.is_empty() {
+            if self.verbatim {
+                self.spans
+                    .push(Some(self.consumed..self.consumed + rest.len()));
+                self.consumed += rest.len();
+                events.push(Event::Content(rest.to_owned()));
+            } else {
+                self.feed(rest, kind, events)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn feed(&mut self, text: &str, kind: ChunkKind, events: &mut Vec<Event>) -> Result<()> {
         self.pending.push_str(text);
-        let actions = self.machine.as_mut().unwrap().feed(text);
+        let actions = self.machine.as_mut().unwrap().feed(text, kind);
         self.apply(actions, events)
     }
 }
@@ -172,14 +209,14 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
         Self {
             consumed: 0,
             spans: vec![],
-            machine: Some(StateMachine::new(ParsingOptions {
+            machine: Some(OutputParser::new(ParsingOptions {
                 parse_tool_calls: !config.tools.is_empty(),
-                tool_call_initial_stage: config.start == OutputStart::ToolBody,
+                starts_in_tool_calls: config.start == OutputStart::ToolBody,
                 // Helios grammars also support scalar JSON and non-JSON languages.
                 parse_json_output: false,
-                reasoning_initial_stage: (config.start == OutputStart::Reasoning)
-                    .then_some(ReasoningStage::Start),
-                stop_sequences: vec![],
+                thinking_initial_stage: (config.start == OutputStart::Reasoning)
+                    .then_some(ThinkingInitialStage::ReasoningStart),
+                ..ParsingOptions::default()
             })),
             pending: String::new(),
             last_action: OutputAction::Skip,
@@ -187,6 +224,8 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             calls: 0,
             structured: config.structured,
             verbatim: false,
+            special_tokens: Vec::new(),
+            last_token: None,
         }
     }
 
@@ -217,25 +256,35 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
         if self.machine.is_none() {
             return Err("output presentation is finished".into());
         }
-        let Input::Text(text) = input else {
-            return Ok(vec![]);
+        let text = match input {
+            Input::Token(token) => {
+                self.last_token = Some(token);
+                return Ok(vec![]);
+            }
+            Input::Text(text) => text,
+        };
+        // A completed control token ends its decoded span; clipped stop spans carry no token ID.
+        let special = self.last_token.take().and_then(|token| {
+            self.special_tokens
+                .iter()
+                .find(|(id, _)| *id == token)
+                .map(|(_, text)| text.clone())
+        });
+        let plain_kind = if self.special_tokens.is_empty() {
+            ChunkKind::Text
+        } else {
+            ChunkKind::PlainTokens
         };
         let mut events = Vec::new();
-        let mut rest = text;
-        // Stop interpreting markup as soon as a grammar-constrained answer begins.
-        while self.structured && !self.verbatim && !rest.is_empty() {
-            let length = rest.chars().next().unwrap().len_utf8();
-            self.feed(&rest[..length], &mut events)?;
-            rest = &rest[length..];
-        }
-        if !rest.is_empty() {
-            if self.verbatim {
-                self.spans.push(Some(self.consumed..self.consumed + rest.len()));
-                self.consumed += rest.len();
-                events.push(Event::Content(rest.to_owned()));
-            } else {
-                self.feed(rest, &mut events)?;
+        if let Some(marker) = special {
+            if !text.ends_with(&marker) {
+                return Err("DeepSeek control token does not match decoded text".into());
             }
+            let end = text.len() - marker.len();
+            self.present(&text[..end], plain_kind, &mut events)?;
+            self.present(&text[end..], ChunkKind::SpecialToken, &mut events)?;
+        } else {
+            self.present(text, plain_kind, &mut events)?;
         }
         Ok(events)
     }

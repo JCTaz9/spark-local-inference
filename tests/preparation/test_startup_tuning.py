@@ -140,8 +140,9 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
         yield
         events.append("device-exit")
     @contextmanager
-    def capture(graph, *, stream):
+    def capture(graph, *, stream, pool):
         assert isinstance(stream, Stream)
+        assert pool == (1, 7)
         events.append("capture-enter")
         yield
         events.append("capture-exit")
@@ -155,7 +156,8 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
     producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
         status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
-    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext))
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
     serving = object()
     registry.owners = [owner]
     registry.groups = {"key": producer}

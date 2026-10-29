@@ -775,6 +775,65 @@ def test_close_retries_restoration_after_base_session_has_closed(backend, monkey
     assert session._tune_status == "closed" and not session._benchmark_restorers
 
 
+@pytest.mark.parametrize("failure", [None, "eviction", "restoration"])
+def test_terminal_collection_reclaims_tuning_owners_before_restoration(monkeypatch, failure):
+    import gc
+    from b12x.preparation import DetectedDevice
+    from b12x.preparation import session as preparation
+
+    class Owner:
+        def __init__(self):
+            self.cycle = self
+
+    session = make_session(device=DetectedDevice(None, None), checkpoint="terminal-collection")
+    owner = Owner()
+    reference = weakref.ref(owner)
+    events = []
+    attempts = 0
+
+    def restore():
+        nonlocal attempts
+        attempts += 1
+        events.append(("restore", reference() is None))
+        if failure == "restoration" and attempts == 1:
+            raise RuntimeError("restoration failed")
+
+    session.register_benchmark_resource("borrowed", owner, restore=restore)
+    del owner
+    session._reclaim_programs()
+    assert reference() is not None
+
+    if failure == "eviction":
+        def fail_eviction(keep):
+            raise RuntimeError("eviction failed")
+        monkeypatch.setattr(preparation, "evict_unretained", fail_eviction)
+
+    def observe(phase, info):
+        if phase == "stop" and info["generation"] == 2:
+            events.append(("collect", reference() is None))
+
+    automatic = gc.isenabled()
+    gc.disable()
+    gc.callbacks.append(observe)
+    try:
+        if failure is None:
+            session.close()
+        else:
+            with pytest.raises(RuntimeError, match=f"{failure} failed"):
+                session.close()
+        session.close()
+        session.close()
+    finally:
+        gc.callbacks.remove(observe)
+        if automatic:
+            gc.enable()
+    expected = [("collect", True), ("restore", True)]
+    if failure == "restoration":
+        expected.append(("restore", True))
+    assert events == expected
+    assert session._tune_status == "closed" and not session._benchmark_restorers
+
+
 
 
 

@@ -32,6 +32,87 @@ fn host_base(device_base: u64, world: u32) -> u64 {
     }
 }
 
+#[derive(Default)]
+struct RetainedBacking {
+    active: bool,
+    aborted: bool,
+    finished: bool,
+    bytes: usize,
+    handles: Vec<(u64, usize)>,
+}
+
+impl RetainedBacking {
+    fn begin(&mut self) -> Result<()> {
+        if self.active || self.aborted || !self.handles.is_empty() {
+            return Err(invalid(
+                "physical retention scope is already active or abandoned",
+            ));
+        }
+        self.active = true;
+        self.finished = false;
+        Ok(())
+    }
+
+    fn defer_free(&self) -> Result<bool> {
+        if self.aborted || (!self.active && !self.finished) {
+            return Err(invalid(
+                "transient free outside a healthy physical retention scope",
+            ));
+        }
+        Ok(self.active)
+    }
+
+    fn retain(&mut self, size: usize, acquire: impl FnOnce() -> Result<u64>) -> Result<()> {
+        if !self.active || self.aborted {
+            return Err(invalid(
+                "transient free outside an active physical retention scope",
+            ));
+        }
+        let bytes = self
+            .bytes
+            .checked_add(size)
+            .ok_or_else(|| invalid("retained physical byte count overflow"))?;
+        self.handles
+            .try_reserve(1)
+            .map_err(|e| invalid(format!("retained handle storage: {e}")))?;
+        let handle = acquire()?;
+        self.handles.push((handle, size));
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn finish(&mut self, mut release: impl FnMut(u64) -> Result<()>) -> Result<()> {
+        if !self.active || self.aborted {
+            return Err(invalid("physical retention scope is not active"));
+        }
+        while let Some(&(handle, size)) = self.handles.last() {
+            release(handle)?;
+            self.handles.pop();
+            self.bytes -= size;
+        }
+        self.active = false;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn abort_on_free_error(&mut self, error: Error) -> Option<Error> {
+        if self.aborted {
+            return None;
+        }
+        self.abort();
+        Some(invalid(format!(
+            "{error}; retained bytes={}, handles={}",
+            self.bytes,
+            self.handles.len()
+        )))
+    }
+
+    fn abort(&mut self) {
+        self.active = false;
+        self.aborted = true;
+    }
+}
+
 struct Arena {
     driver: Driver,
     device: i32,
@@ -40,6 +121,7 @@ struct Arena {
     host_base: u64,
     free: Vec<(u64, usize)>,
     mappings: BTreeMap<u64, usize>,
+    retained: RetainedBacking,
 }
 static ARENA: Mutex<Option<Arena>> = Mutex::new(None);
 static ERROR: Mutex<Option<CString>> = Mutex::new(None);
@@ -158,6 +240,7 @@ extern "C" fn flare_package_initialize(rank: u32, world: u32, device: i32) -> i3
             host_base: host_base + u64::from(rank) * EXTENT as u64,
             free: vec![(BASE + u64::from(rank) * EXTENT as u64, EXTENT / 2)],
             mappings: BTreeMap::new(),
+            retained: RetainedBacking::default(),
         });
         Ok(())
     };
@@ -249,6 +332,20 @@ extern "C" fn flare_package_free(
     _device: i32,
     _stream: *mut c_void,
 ) {
+    package_free(pointer, false);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn flare_package_transient_free(
+    pointer: *mut c_void,
+    _size: usize,
+    _device: i32,
+    _stream: *mut c_void,
+) {
+    package_free(pointer, true);
+}
+
+fn package_free(pointer: *mut c_void, transient: bool) {
     let release = || -> Result<()> {
         let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         let a = guard
@@ -259,6 +356,19 @@ extern "C" fn flare_package_free(
             .mappings
             .get(&address)
             .ok_or_else(|| invalid("unknown native package allocation"))?;
+        if transient && a.retained.defer_free()? {
+            let driver = &a.driver;
+            a.retained.retain(size, || {
+                let mut handle = 0;
+                unsafe {
+                    driver.check(
+                        "cuMemRetainAllocationHandle",
+                        (driver.physical_retain)(&mut handle, pointer),
+                    )?;
+                }
+                Ok(handle)
+            })?;
+        }
         unsafe {
             a.driver
                 .check("cuMemUnmap", (a.driver.unmap)(address, size))?;
@@ -278,8 +388,59 @@ extern "C" fn flare_package_free(
         Ok(())
     };
     if let Err(error) = release() {
+        if transient {
+            let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(a) = arena.as_mut() {
+                if let Some(error) = a.retained.abort_on_free_error(error) {
+                    failure(error);
+                }
+                return;
+            }
+        }
         failure(error);
     }
+}
+
+fn retention_operation(operation: impl FnOnce(&mut Arena) -> Result<()>) -> i32 {
+    let mut guard = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(a) = guard.as_mut() else {
+        failure(invalid("native package allocator is uninitialized"));
+        return -1;
+    };
+    match operation(a) {
+        Ok(()) => 0,
+        Err(error) => {
+            failure(invalid(format!(
+                "{error}; retained bytes={}, handles={}",
+                a.retained.bytes,
+                a.retained.handles.len()
+            )));
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn flare_package_retention_begin() -> i32 {
+    retention_operation(|a| a.retained.begin())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn flare_package_retention_finish() -> i32 {
+    retention_operation(|a| {
+        let driver = &a.driver;
+        a.retained.finish(|handle| unsafe {
+            driver.check("cuMemRelease", (driver.physical_release)(handle))
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn flare_package_retention_abort() -> i32 {
+    retention_operation(|a| {
+        a.retained.abort();
+        Ok(())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -290,6 +451,7 @@ extern "C" fn flare_package_snapshot() -> *mut c_char {
     };
     let value = serde_json::json!({
         "granularity": a.granularity, "mappings": a.mappings, "host_base": a.host_base,
+        "retained_bytes": a.retained.bytes, "retained_handles": a.retained.handles.len(),
     });
     CString::new(value.to_string()).unwrap().into_raw()
 }
@@ -315,6 +477,86 @@ extern "C" fn flare_package_error() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_aborted_free_preserves_first_driver_error() {
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.retain(4096, || Ok(7)).unwrap();
+        let mut published = retained
+            .abort_on_free_error(invalid("cuMemUnmap returned CUDA error 715"))
+            .unwrap()
+            .to_string();
+        let first = published.clone();
+        let secondary = retained.defer_free().unwrap_err();
+        if let Some(error) = retained.abort_on_free_error(secondary) {
+            published = error.to_string();
+        }
+        assert_eq!(published, first);
+        assert!(published.contains("cuMemUnmap returned CUDA error 715"));
+        assert!(published.contains("retained bytes=4096, handles=1"));
+        assert_eq!(retained.handles, vec![(7, 4096)]);
+    }
+
+    #[test]
+    fn physical_references_preserve_duplicates_and_release_once() {
+        let mut retained = RetainedBacking::default();
+        assert!(retained.retain(4, || Ok(7)).is_err());
+        retained.begin().unwrap();
+        assert!(retained.begin().is_err());
+        retained.retain(4, || Ok(7)).unwrap();
+        retained.retain(8, || Ok(7)).unwrap();
+        assert_eq!(retained.bytes, 12);
+        let mut released = Vec::new();
+        retained
+            .finish(|handle| {
+                released.push(handle);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(released, vec![7, 7]);
+        assert_eq!(retained.bytes, 0);
+        assert!(retained.handles.is_empty());
+        assert!(retained.retain(4, || Ok(8)).is_err());
+        assert!(!retained.defer_free().unwrap());
+    }
+
+    #[test]
+    fn physical_reference_errors_preserve_accounting_and_abort_never_releases() {
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        assert!(
+            retained
+                .retain(4, || Err(invalid("retain failed")))
+                .is_err()
+        );
+        assert_eq!(retained.bytes, 0);
+        retained.retain(4, || Ok(7)).unwrap();
+        assert!(retained.finish(|_| Err(invalid("release failed"))).is_err());
+        assert_eq!(retained.handles, vec![(7, 4)]);
+        assert_eq!(retained.bytes, 4);
+        retained.abort();
+        assert!(retained.defer_free().is_err());
+        assert!(
+            retained
+                .finish(|_| panic!("must not call CUDA after abort"))
+                .is_err()
+        );
+        assert!(retained.begin().is_err());
+        assert_eq!(retained.handles, vec![(7, 4)]);
+    }
+
+    #[test]
+    fn retained_byte_overflow_precedes_driver_call() {
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.bytes = usize::MAX;
+        assert!(
+            retained
+                .retain(1, || panic!("overflow must precede retain"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn small_linux_exports_keep_every_host_range_within_windows_addresses() {

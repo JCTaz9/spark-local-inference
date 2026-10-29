@@ -57,17 +57,19 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                    for name, forward in forwards.items()):
                 raise ValueError("grouped forwards require one type and graph signature")
         stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
-            if compile_group is None:
-                compiled = cache.prepare_many(forwards, signatures, progress=progress,
-                                              coordinator=coordinator, materialize=materialize, warmup=warmup,
-                                              before_run=before_run)
-            else:
-                representative = {compile_group: forwards[first]}
-                template = cache.prepare_many(representative, {compile_group: signatures[first]},
-                    progress=progress, coordinator=coordinator, materialize=materialize,
-                    warmup=warmup, before_run=None if before_run is None else lambda _: before_run(first))
-        stream.synchronize()
+        retention = nullcontext() if warmup_storage is None else warmup_storage.retain_transient_backing()
+        with retention:
+            with torch.cuda.stream(stream):
+                if compile_group is None:
+                    compiled = cache.prepare_many(forwards, signatures, progress=progress,
+                                                  coordinator=coordinator, materialize=materialize, warmup=warmup,
+                                                  before_run=before_run)
+                else:
+                    representative = {compile_group: forwards[first]}
+                    template = cache.prepare_many(representative, {compile_group: signatures[first]},
+                        progress=progress, coordinator=coordinator, materialize=materialize,
+                        warmup=warmup, before_run=None if before_run is None else lambda _: before_run(first))
+            stream.synchronize()
         if compile_group is not None:
             compiled = cache.bind_group(template[compile_group], forwards,
                                         signature=signatures[first], coordinator=coordinator)

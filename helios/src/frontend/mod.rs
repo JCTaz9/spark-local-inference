@@ -248,9 +248,9 @@ impl Frontend {
         self.prompt_encoder
     }
     pub fn with_template_encoding(mut self, encoding: TemplateEncoding) -> Self {
-        self.ordinary_tokenizer = match encoding {
-            TemplateEncoding::Text => None,
-            TemplateEncoding::TokenSegments => {
+        self.ordinary_tokenizer = match (self.prompt_encoder, encoding) {
+            (PromptEncoder::Jinja, TemplateEncoding::Text) => None,
+            _ => {
                 let mut tokenizer = self.tokenizer.clone();
                 tokenizer.with_added_vocabulary(tokenizers::AddedVocabulary::new());
                 Some(tokenizer)

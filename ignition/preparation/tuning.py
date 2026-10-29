@@ -127,6 +127,7 @@ class RecordedPreparationSession(PreparationSession):
         self._benchmark_restorers = {}
         self._preparation_thread = get_ident()
         self._tune_status = "collecting"
+        self._terminal_collected = False
         self._sharded = False
         self._workload_schema = workload_schema
         self._search_limits = dict(search_limits or {})
@@ -605,13 +606,7 @@ class RecordedPreparationSession(PreparationSession):
                 requests = job = jobs = ()
                 request = None
                 callback = None
-                self._benchmark_resources.clear()
-                self._finalizers.clear()
-                self._recorded_requests.clear()
-                self._context_plan_bindings.clear()
-                self._context_original_requests = None
-                self._context_touched.clear()
-                self._context_scratch_owner = None
+                self._clear_tuning_owners()
                 try:
                     gc.collect()
                     self._restore_benchmark_resources()
@@ -647,6 +642,24 @@ class RecordedPreparationSession(PreparationSession):
             raise RuntimeError("preparation freeze requires completed tuning and binding finalization")
         return super().freeze()
 
+    def _clear_tuning_owners(self):
+        self._benchmark_resources.clear()
+        self._finalizers.clear()
+        self._recorded_requests.clear()
+        self._context_plan_bindings.clear()
+        self._context_original_requests = None
+        self._context_touched.clear()
+        self._context_scratch_owner = None
+
+    def _reclaim_programs(self):
+        terminal = self.state == "CLOSED"
+        if terminal:
+            # Include Ignition's tuning owners in b12x's terminal heap collection.
+            self._clear_tuning_owners()
+        super()._reclaim_programs()
+        if terminal:
+            self._terminal_collected = True
+
     def close(self):
         if get_ident() != self._preparation_thread:
             raise RuntimeError("preparation cleanup requires the owning thread")
@@ -656,14 +669,10 @@ class RecordedPreparationSession(PreparationSession):
             try:
                 super().close()
             finally:
-                self._benchmark_resources.clear()
-                self._finalizers.clear()
-                self._recorded_requests.clear()
-                self._context_plan_bindings.clear()
-                self._context_original_requests = None
-                self._context_touched.clear()
-                self._context_scratch_owner = None
-                gc.collect()
+                self._clear_tuning_owners()
+                if not self._terminal_collected:
+                    gc.collect()
+                    self._terminal_collected = True
                 self._restore_benchmark_resources()
                 self._synchronize()
                 if self._scratch_arena is not None:

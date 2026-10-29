@@ -118,6 +118,9 @@ class CollectiveStartupTuning:
         consumers = {name: self.captures.get(id(graph), set()) for name, graph in graphs.items()}
         needed = {self.owner_groups[owner] for owners in consumers.values() for owner in owners
                   if owner in self.owner_groups}
+        storage = self.session.benchmark_storage
+        if needed and storage is None:
+            raise RuntimeError("collective startup capture requires package storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
         for index, (key, producer) in enumerate(self.groups.items()):
             if key not in needed:
@@ -141,7 +144,7 @@ class CollectiveStartupTuning:
                 stream = torch.cuda.Stream(device=device)
                 stream.wait_stream(torch.cuda.current_stream(device))
                 graph = torch.cuda.CUDAGraph(keep_graph=True)
-                with self.session.capture(), torch.cuda.graph(graph, stream=stream):
+                with self.session.capture(), torch.cuda.graph(graph, pool=storage.graph_pool.id, stream=stream):
                     producer.run()
                 graph.instantiate()
                 stream.synchronize()

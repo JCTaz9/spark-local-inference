@@ -40,7 +40,7 @@ def _rank(rank, directory, readiness):
                     hidden_size=2560, ipc=storage.peer_storage, collective_tuning="runtime")
                 session = RecordedPreparationSession(device=device, checkpoint="collective-startup-export",
                     workload_schema="tp4-bf16-hidden", numerical_policy="fp32-single-rounding",
-                    coordinator=coordinator, collective_tuning="runtime", compile_workers=4,
+                    coordinator=coordinator, collective_tuning="runtime", compile_workers=4, benchmark_storage=storage,
                     collective_ladder=load(Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json"))
                 if readiness:
                     from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings
@@ -95,7 +95,15 @@ def _rank(rank, directory, readiness):
                 assert prepared.buffers[binding.buffer].data_ptr() == operation.plan.prepared.state.selector.data_ptr()
                 assert prepared.buffers[tuner.status_buffer] is producer.status
                 assert set(prepared.graphs) == {*signatures, binding.tuning_graph}
+                from ignition.preparation.startup_tuning import replay_startup_tuning
+
+                replay_startup_tuning(prepared, stream)
+                output.fill_(-1)
                 torch.cuda.synchronize(device)
+                dist.barrier()
+                graphs["decode"].replay()
+                torch.cuda.synchronize(device)
+                torch.testing.assert_close(output, torch.full_like(output, 10), rtol=0, atol=0)
                 dist.barrier()
                 storage.peer_storage.reset()
                 torch.cuda.synchronize(device)
@@ -105,6 +113,17 @@ def _rank(rank, directory, readiness):
                     options={}, bundle_only=True, sources=True)
                 assert package.export_counts["modules"] > 0
                 assert (directory / f"rank-{rank}.json").is_file()
+                from ignition.preparation.package_file import read_sources_record
+                from ignition.preparation import runtime_package_pb2 as proto
+
+                index, _, _ = read_sources_record(directory / f"rank-{rank}.json")
+                allocations = index.ranks[0].allocations
+                outside = [(allocation.name, hex(allocation.address), allocation.nbytes)
+                    for allocation in allocations if allocation.memory == proto.DEVICE
+                    and not (storage.DEVICE_BASE <= allocation.address
+                             and allocation.address + allocation.nbytes
+                             <= storage.DEVICE_BASE + storage.RESERVATION_BYTES)]
+                assert not outside, outside
                 print(f"rank {rank}: automatic startup export complete", flush=True)
                 dist.barrier()
             finally:
