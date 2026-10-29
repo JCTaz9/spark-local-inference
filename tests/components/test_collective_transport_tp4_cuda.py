@@ -1,6 +1,8 @@
 """Package-owned TP4 reductions across retained graph variants and native replay."""
 
 from contextlib import contextmanager
+from copy import deepcopy
+import ctypes
 from datetime import timedelta
 import os
 from pathlib import Path
@@ -170,7 +172,69 @@ def test_collective_oracle_reads_the_device_selector_instead_of_prepared_submode
         _selected_query(operation)
 
 
-def _rank(rank, rendezvous, directory, widths, collective_tuning):
+def _writer_ladder(ladder):
+    """Exercise both writer protocols without depending on a timing winner."""
+    from b12x.comm.pcie._joint_profile import JointMode
+    from ignition.preparation.collective_ladder import validate
+
+    ladder = deepcopy(ladder)
+    ladder["name"] = "tp4-writer-protocol-coverage"
+    boundary = 64 << 10
+    assert any(bucket["max_bytes"] == boundary for bucket in ladder["buckets"])
+    for bucket in ladder["buckets"]:
+        if bucket["max_bytes"] <= boundary:
+            bucket["profiles"] = {JointMode.SERIAL_PUSH.name.lower(): [1]}
+        else:
+            blocks = bucket["blocks"]
+            bucket["profiles"] = {JointMode.QUEUED_PUSH.name.lower(): sorted({min(count, blocks) for count in (8, 32, blocks)})}
+    return validate(ladder)
+
+
+def _writer_observation(state, mode, generation=None):
+    """Read local protocol storage after native completion, outside allocation checks."""
+    from b12x.comm.pcie._joint_cute import _EPOCH_OFFSET
+    from b12x.comm.pcie._joint_profile import (
+        JointMode, JOINT_MAX_RANKS, JOINT_QUEUE_SLOT0_OFFSET, JOINT_QUEUE_SLOT_STRIDE,
+    )
+
+    stream = torch.cuda.current_stream(state.runtime.device)
+    base = state.workspace.shared.local_ptr
+    def read(dtype, count, offset):
+        values = (dtype * count)()
+        state.runtime._ipc.cudaMemcpyAsync(ctypes.addressof(values), base + offset,
+            ctypes.sizeof(values), stream.cuda_stream)
+        stream.synchronize()
+        return tuple(values)
+    result = {"epoch": read(ctypes.c_uint32, 2, _EPOCH_OFFSET)}
+    if mode == JointMode.SERIAL_PUSH:
+        result["barriers"] = read(ctypes.c_uint32, JOINT_MAX_RANKS, 0)
+    elif mode == JointMode.QUEUED_PUSH:
+        if generation is not None:
+            offset = JOINT_QUEUE_SLOT0_OFFSET + (generation % 2) * JOINT_QUEUE_SLOT_STRIDE
+            result["queue_token"] = read(ctypes.c_uint64, 1, offset)[0]
+    else:
+        raise AssertionError(f"native writer observation received {mode!r}")
+    return result
+
+
+def _assert_writer_progress(mode, rank, world, before, after):
+    from b12x.comm.pcie._joint_profile import JointMode, JOINT_QUEUE_FIRST_PHASE
+
+    generation, arrivals = before["epoch"]
+    assert arrivals == 0, before
+    assert after["epoch"] == (ctypes.c_uint32(generation + 1).value, 0), (before, after)
+    if mode == JointMode.SERIAL_PUSH:
+        for peer, (start, end) in enumerate(zip(before["barriers"], after["barriers"], strict=True)):
+            expected = 2 if peer < world and peer != rank else 0
+            assert ctypes.c_uint32(end - start).value == expected, (peer, start, end, expected)
+    elif mode == JointMode.QUEUED_PUSH:
+        epoch_bits = ctypes.sizeof(ctypes.c_uint32) * 8
+        assert after["queue_token"] == ((generation << epoch_bits) | (JOINT_QUEUE_FIRST_PHASE + 2 * world)), (before, after)
+    else:
+        raise AssertionError(f"native writer progress received {mode!r}")
+
+
+def _rank(rank, rendezvous, directory, widths, collective_tuning, writer_protocols=False):
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.collective_ladder import load
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
@@ -190,6 +254,9 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
     graphs, tuners = {}, {}
     ladder = (load(Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json")
               if collective_tuning == "runtime" else None)
+    if writer_protocols:
+        assert collective_tuning == "runtime"
+        ladder = _writer_ladder(ladder)
 
     @contextmanager
     def execution_lifetime():
@@ -381,6 +448,12 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
                 assert coordinator.same_on_every_rank(tuple(selected.items()))
                 assert all(status.item() == 0 for status in statuses.values())
                 queries = {key: _selected_query(operation) for key, operation in operations.items()}
+                if writer_protocols:
+                    from b12x.comm.pcie._joint_profile import JointMode, JOINT_MODES
+
+                    writers = {JointMode.SERIAL_PUSH, JointMode.QUEUED_PUSH}
+                    modes = {key: JointMode(JOINT_MODES[query["call"]["submode"]]) for key, query in queries.items()}
+                    assert set(modes.values()) == writers
                 names = list(graphs)
                 # Retain both capture epochs while interleaving all capacities.
                 for step in range(3):
@@ -396,6 +469,10 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
                         expected_source = sources[width].clone()
                         torch.cuda.synchronize(device)
                         dist.barrier()
+                        if writer_protocols:
+                            state = operations[width, rows].plan.prepared.state
+                            mode = modes[width, rows]
+                            protocol_before = _writer_observation(state, mode)
                         before = torch.cuda.memory_stats(device)
                         ticket = worker.submit(index, [])
                         assert ticket is not None
@@ -409,6 +486,9 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning):
                         for key in ("allocation.all.allocated", "allocation.all.freed",
                                     "segment.all.allocated", "segment.all.freed"):
                             assert before[key] == after[key]
+                        if writer_protocols:
+                            protocol_after = _writer_observation(state, mode, protocol_before["epoch"][0])
+                            _assert_writer_progress(mode, rank, state.query.world_size, protocol_before, protocol_after)
                         assert bundle_ref() is not None and all(reference() is not None for reference in startup_refs)
                         assert {name: int(selector.item()) for name, selector in selectors.items()} == selected
                         assert all(status.item() == 0 for status in statuses.values())
@@ -435,6 +515,53 @@ def test_package_owned_tp4_collective_graph_variants(tmp_path, widths, collectiv
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
     mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths, collective_tuning), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize("widths", [(4096, 5120), (2560,)], ids=["4096-5120", "qwen-2560"])
+@_gpu_only
+def test_package_owned_tp4_writer_graph_variants(tmp_path, widths):
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
+    assert torch.cuda.device_count() == 4
+    mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths, "runtime", True), nprocs=4, join=True)
+
+
+def test_writer_ladder_keeps_geometry_and_covers_both_protocols():
+    from b12x.comm.pcie._joint_profile import JointMode
+    from ignition.preparation.collective_ladder import load, select
+
+    original = load(Path(__file__).resolve().parents[2] / "ignition/preparation/ladders/gb202_pcie_tp4.json")
+    ladder = _writer_ladder(original)
+    for before, after in zip(original["buckets"], ladder["buckets"], strict=True):
+        assert {key: value for key, value in before.items() if key != "profiles"} == {
+            key: value for key, value in after.items() if key != "profiles"}
+    conditions = dict(world_size=4, capability=(12, 0), inplace=False)
+    assert select(ladder, 12 * 2560 * 2, **conditions)["profiles"] == {JointMode.SERIAL_PUSH.name.lower(): [1]}
+    assert set(select(ladder, 13 * 2560 * 2, **conditions)["profiles"]) == {JointMode.QUEUED_PUSH.name.lower()}
+    assert original["name"] != ladder["name"]
+    for blocks, expected in ((1, [1]), (4, [4]), (16, [8, 16]), (32, [8, 32])):
+        limited = deepcopy(original)
+        for bucket in limited["buckets"]:
+            bucket["blocks"] = blocks
+        selected = select(_writer_ladder(limited), 13 * 2560 * 2, **conditions)
+        assert selected["profiles"] == {JointMode.QUEUED_PUSH.name.lower(): expected}
+
+
+def test_writer_progress_rejects_self_barriers_and_stale_queue_completion():
+    from b12x.comm.pcie._joint_profile import JointMode, JOINT_MAX_RANKS, JOINT_QUEUE_FIRST_PHASE
+
+    before = dict(epoch=(17, 0), barriers=(100, 200, 300, 400, *(0 for _ in range(JOINT_MAX_RANKS - 4))))
+    after = dict(epoch=(18, 0), barriers=(100, 202, 302, 402, *(0 for _ in range(JOINT_MAX_RANKS - 4))))
+    _assert_writer_progress(JointMode.SERIAL_PUSH, 0, 4, before, after)
+    with pytest.raises(AssertionError):
+        _assert_writer_progress(JointMode.SERIAL_PUSH, 0, 4, before,
+            after | {"barriers": (102, *after["barriers"][1:])})
+    with pytest.raises(AssertionError):
+        _assert_writer_progress(JointMode.SERIAL_PUSH, 0, 4, before, after | {"barriers": before["barriers"]})
+    token = (17 << (ctypes.sizeof(ctypes.c_uint32) * 8)) | (JOINT_QUEUE_FIRST_PHASE + 8)
+    _assert_writer_progress(JointMode.QUEUED_PUSH, 0, 4, before, dict(epoch=(18, 0), queue_token=token))
+    for invalid in (token - 1, token - (1 << (ctypes.sizeof(ctypes.c_uint32) * 8))):
+        with pytest.raises(AssertionError):
+            _assert_writer_progress(JointMode.QUEUED_PUSH, 0, 4, before, dict(epoch=(18, 0), queue_token=invalid))
 
 
 @_gpu_only
