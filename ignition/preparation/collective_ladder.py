@@ -6,8 +6,8 @@ from pathlib import Path
 from ignition.errors import UsageError
 
 MODES = {
-    "joint_latency": ("full", "payload_rsag", "pull"),
-    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
+    "joint_latency": ("full", "payload_rsag", "pull", "full_phased", "payload_rsag_phased"),
+    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull", "payload_rsag_phased", "bulk_push_phased"),
 }
 
 

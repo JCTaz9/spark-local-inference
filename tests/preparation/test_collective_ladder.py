@@ -29,6 +29,19 @@ def test_supplied_ladder_covers_every_interval():
         lower = row["max_bytes"] + 16
 
 
+def test_forced_hostbridge_ladder_has_one_write_only_profile_per_interval():
+    data = load(LADDER.with_name("frank2_hostbridge_tp4_forced.json"))
+    assert data["min_bytes"] == 16
+    assert data["buckets"][-1]["max_bytes"] == 8 << 20
+    lower = data["min_bytes"]
+    for row in data["buckets"]:
+        assert choose(data, lower) is row
+        assert choose(data, row["max_bytes"]) is row
+        assert sum(map(len, row["profiles"].values())) == 1
+        assert not {"pull", "bulk_pull"} & set(row["profiles"])
+        lower = row["max_bytes"] + 16
+
+
 @pytest.mark.parametrize("size", [0, 8, 1025, (8 << 20) + 16, True])
 def test_no_extrapolation_or_unaligned_payload(size):
     with pytest.raises(UsageError, match="no bucket"):
@@ -82,13 +95,15 @@ def test_preparation_cli_accepts_ladder(command):
     assert args.collective_ladder == LADDER
 
 
+@pytest.mark.parametrize("ladder", [LADDER, LADDER.with_name("frank2_hostbridge_tp4_forced.json")],
+                         ids=["gb202", "frank2-forced"])
 @pytest.mark.parametrize("effort", ["off", "default", "audit"])
-def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort):
+def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort, ladder):
     from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery, TUNING
     from b12x.comm.pcie._joint_profile import selected_profile
     from b12x.preparation import FrozenMapping, autotune_effort
 
-    data = load(LADDER)
+    data = load(ladder)
     lower = data["min_bytes"]
     with autotune_effort(effort):
         for row in data["buckets"]:

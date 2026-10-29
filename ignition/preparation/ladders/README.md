@@ -91,3 +91,14 @@ require that kernel implementation; the JSON file only selects geometry and
 runtime profiles. Frank2 measurements use division-based ownership. The combined
 menus have not had independent replay verification, and bucket interiors and
 unmeasured topologies have no measured performance bound.
+
+## Host-bridge PoC ladder (not for merge)
+
+`frank2_hostbridge_tp4_forced.json` is a proof of concept for TP4 groups whose GPUs sit behind
+different CPU IO-die quadrants (frank2 GPUs 0,4,8,12). Each of its 255 buckets (16 bytes through
+8 MiB) lists exactly one profile, so the captured startup race has a single candidate and the choice
+is forced. The profiles come from a write-only `b12x.tools.collective_ladder` sweep on those GPUs:
+peer-read submodes (`pull`, `bulk_pull`) were excluded, and each bucket keeps the lowest-mean profile
+among those within 3% of the best median. It requires the phased joint submodes from the FlashInfer
+branch `claude/poc-hostbridge-phased` (`full_phased`, `payload_rsag_phased`, `bulk_push_phased`).
+See `scripts/poc_hostbridge_collectives/README.md` for the measurements and reproduction steps.
