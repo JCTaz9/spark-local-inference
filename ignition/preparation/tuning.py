@@ -127,7 +127,7 @@ class RecordedPreparationSession(PreparationSession):
         self._benchmark_restorers = {}
         self._preparation_thread = get_ident()
         self._tune_status = "collecting"
-        self._close_collected = False
+        self._terminal_collected = False
         self._sharded = False
         self._workload_schema = workload_schema
         self._search_limits = dict(search_limits or {})
@@ -606,7 +606,7 @@ class RecordedPreparationSession(PreparationSession):
                 requests = job = jobs = ()
                 request = None
                 callback = None
-                self._release_tuning_resources()
+                self._clear_tuning_owners()
                 try:
                     gc.collect()
                     self._restore_benchmark_resources()
@@ -642,7 +642,7 @@ class RecordedPreparationSession(PreparationSession):
             raise RuntimeError("preparation freeze requires completed tuning and binding finalization")
         return super().freeze()
 
-    def _release_tuning_resources(self):
+    def _clear_tuning_owners(self):
         self._benchmark_resources.clear()
         self._finalizers.clear()
         self._recorded_requests.clear()
@@ -652,14 +652,13 @@ class RecordedPreparationSession(PreparationSession):
         self._context_scratch_owner = None
 
     def _reclaim_programs(self):
-        closing = self.state == "CLOSED"
-        if closing:
-            # Include tuning-only owners in the terminal collection, after the
-            # base session's plan cleanup, so one heap scan reclaims both layers.
-            self._release_tuning_resources()
+        terminal = self.state == "CLOSED"
+        if terminal:
+            # Include Ignition's tuning owners in b12x's terminal heap collection.
+            self._clear_tuning_owners()
         super()._reclaim_programs()
-        if closing:
-            self._close_collected = True
+        if terminal:
+            self._terminal_collected = True
 
     def close(self):
         if get_ident() != self._preparation_thread:
@@ -670,10 +669,10 @@ class RecordedPreparationSession(PreparationSession):
             try:
                 super().close()
             finally:
-                self._release_tuning_resources()
-                if not self._close_collected:
+                self._clear_tuning_owners()
+                if not self._terminal_collected:
                     gc.collect()
-                    self._close_collected = True
+                    self._terminal_collected = True
                 self._restore_benchmark_resources()
                 self._synchronize()
                 if self._scratch_arena is not None:

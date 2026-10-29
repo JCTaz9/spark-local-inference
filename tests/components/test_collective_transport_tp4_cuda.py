@@ -298,7 +298,7 @@ def _rank(rank, rendezvous, directory, widths, collective_tuning, writer_protoco
                 hidden_size=max(widths), ipc=storage.peer_storage, collective_tuning=collective_tuning)
             with RecordedPreparationSession(device=device, checkpoint="tp4-collectives",
                     workload_schema="bf16-hidden-reduction", numerical_policy="fp32-single-rounding",
-                    coordinator=coordinator, collective_tuning=collective_tuning,
+                    coordinator=coordinator, benchmark_storage=storage, collective_tuning=collective_tuning,
                     collective_ladder=ladder) as session, execution_lifetime():
                 # Hidden widths share one runtime, which
                 # transports flat BF16 packs independently of tensor row geometry.

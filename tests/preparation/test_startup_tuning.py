@@ -142,8 +142,9 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
         yield
         events.append("device-exit")
     @contextmanager
-    def capture(graph, *, stream):
+    def capture(graph, *, stream, pool):
         assert isinstance(stream, Stream)
+        assert pool == (1, 7)
         events.append("capture-enter")
         yield
         events.append("capture-exit")
@@ -158,7 +159,8 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
     producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
         status=torch.ones(1, dtype=torch.int32), run=lambda: events.append("run"))
-    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext))
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=2), capture=nullcontext,
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
     serving = object()
     registry.owners = [owner]
     registry.groups = {"key": producer}
@@ -270,10 +272,11 @@ def test_catalog_prunes_unused_groups_and_preserves_individual_consumer_fields(m
     monkeypatch.setattr(torch.cuda, "Stream", Stream)
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
-    monkeypatch.setattr(torch.cuda, "graph", lambda graph, stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph, stream, pool: nullcontext())
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     monkeypatch.setattr(pcie, "run_joint_startup_tuners", lambda producers: launched.append(tuple(producers)))
-    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=0), capture=nullcontext))
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=0), capture=nullcontext,
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
     owners, producers = [], []
     for index in range(3):
         selector = torch.tensor([index + 1], dtype=torch.uint32)
@@ -297,6 +300,9 @@ def test_catalog_prunes_unused_groups_and_preserves_individual_consumer_fields(m
     assert "collective-tuning-1-status" not in buffers
     assert buffers["collective-tuning-0-status"] is producers[0].status
     assert buffers["collective-tuning-2-status"] is producers[2].status
+    registry.session.benchmark_storage = None
+    with pytest.raises(RuntimeError, match="requires package storage"):
+        registry.catalog(dict(decode=decode))
     captures.clear()
     assert registry.catalog({"unrecorded": object()}) == ({}, {}, {}, ())
     assert not captures

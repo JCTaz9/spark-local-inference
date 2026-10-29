@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
-import gc
 from threading import Event
 from types import SimpleNamespace
 import weakref
@@ -776,52 +775,63 @@ def test_close_retries_restoration_after_base_session_has_closed(backend, monkey
     assert session._tune_status == "closed" and not session._benchmark_restorers
 
 
-@pytest.mark.parametrize("failed_reclamation", [False, True])
-def test_close_collects_preparation_cycles_once_before_restoring_borrowed_state(monkeypatch, failed_reclamation):
+@pytest.mark.parametrize("failure", [None, "eviction", "restoration"])
+def test_terminal_collection_reclaims_tuning_owners_before_restoration(monkeypatch, failure):
+    import gc
     from b12x.preparation import DetectedDevice
     from b12x.preparation import session as preparation
 
-    class Temporary:
+    class Owner:
         def __init__(self):
             self.cycle = self
 
-    session = make_session(device=DetectedDevice(None, None), checkpoint="release-cycles")
-    temporary = Temporary()
-    reference = weakref.ref(temporary)
-    restored, collections = [], []
-    session.register_benchmark_resource("state", temporary,
-        restore=lambda: restored.append(reference() is None))
-    del temporary
+    session = make_session(device=DetectedDevice(None, None), checkpoint="terminal-collection")
+    owner = Owner()
+    reference = weakref.ref(owner)
+    events = []
+    attempts = 0
+
+    def restore():
+        nonlocal attempts
+        attempts += 1
+        events.append(("restore", reference() is None))
+        if failure == "restoration" and attempts == 1:
+            raise RuntimeError("restoration failed")
+
+    session.register_benchmark_resource("borrowed", owner, restore=restore)
+    del owner
     session._reclaim_programs()
-    assert reference() is not None and not restored
+    assert reference() is not None
 
-    if failed_reclamation:
-        def fail(keep):
-            raise RuntimeError("program cache eviction failed")
+    if failure == "eviction":
+        def fail_eviction(keep):
+            raise RuntimeError("eviction failed")
+        monkeypatch.setattr(preparation, "evict_unretained", fail_eviction)
 
-        monkeypatch.setattr(preparation, "evict_unretained", fail)
-
-    def collected(phase, info):
+    def observe(phase, info):
         if phase == "stop" and info["generation"] == 2:
-            collections.append(reference() is None)
+            events.append(("collect", reference() is None))
 
     automatic = gc.isenabled()
     gc.disable()
-    gc.callbacks.append(collected)
+    gc.callbacks.append(observe)
     try:
-        if failed_reclamation:
-            with pytest.raises(RuntimeError, match="program cache eviction failed"):
-                session.close()
-        else:
+        if failure is None:
             session.close()
+        else:
+            with pytest.raises(RuntimeError, match=f"{failure} failed"):
+                session.close()
+        session.close()
         session.close()
     finally:
-        gc.callbacks.remove(collected)
+        gc.callbacks.remove(observe)
         if automatic:
             gc.enable()
-    assert restored == [True]
-    assert collections == [True]
-    assert reference() is None
+    expected = [("collect", True), ("restore", True)]
+    if failure == "restoration":
+        expected.append(("restore", True))
+    assert events == expected
+    assert session._tune_status == "closed" and not session._benchmark_restorers
 
 
 
