@@ -292,8 +292,7 @@ fn configure_package_devices(
             flare_helios::runtime_package::rank_needs(package).len()
         };
         args.serving.select_gpus(local_ranks);
-        progress.finish_animation();
-        environment::configure(&args.gpus)?;
+        progress.with_animation_paused(|| environment::configure(&args.gpus))?;
     }
     Ok(())
 }

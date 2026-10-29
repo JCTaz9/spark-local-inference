@@ -351,16 +351,23 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
     def warmup():
         previous = storage._preparation_pools.copy()
         with storage.transient():
+            temporary = torch.empty(4 << 20, dtype=torch.uint8, device="cuda")
+            temporary.zero_()
+            del temporary
             yield
         pools = storage._preparation_pools - previous
         assert pools
         assert not [segment for segment in torch.cuda.memory_snapshot()
                     if tuple(segment["segment_pool_id"]) in pools]
+        assert storage._snapshot()["retained_handles"] > 0
         warmed.append(pools)
 
     cache = ForwardCache(namespace={"model": "warmup-storage"}, device="cuda:0", root=tmp_path)
-    compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
-    assert len(warmed) == len(functions)
+    with storage.retain_transient_backing():
+        compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
+    assert storage._snapshot()["retained_handles"] == 0
+    assert storage._snapshot()["retained_bytes"] == 0
+    assert len(warmed) == 2 * len(functions)
     graph = torch.cuda.CUDAGraph()
     for name, forward in functions.items():
         with torch.cuda.graph(graph, pool=storage.graph_pool.id):

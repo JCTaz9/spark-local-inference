@@ -85,7 +85,34 @@ def test_pages_take_all_remaining_supply():
     assert whole.supply_bytes - whole.page_bytes - whole.fixed_bytes < 2 * MIB
 
 
-@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"), ("nvfp4", "nvfp4"), ("mxfp8", None)])
+def test_vocabulary_sampling_rejects_tp3_before_weight_loading():
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    speculation = replace(RECIPE.speculation, vocabulary_parallel_sampling=True)
+    with pytest.raises(UsageError, match="no TP3 gather"):
+        planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(gpu(i, 95) for i in range(3)),
+                     concurrency=1, reserve_bytes=0, speculation=speculation)
+
+
+def test_vocabulary_sampling_rejects_unsupported_transition_storage():
+    with pytest.raises(ValueError, match="BF16 or row-scaled FP8"):
+        replace(DRAFTING, vocabulary_parallel_sampling=True, markov_head_quantization="nvfp4")
+
+
+def test_vocabulary_sampling_selects_tp4_and_rejects_tp3_hosts():
+    from ignition.recipes.deepseek41.recipe import RECIPE
+
+    speculation = replace(RECIPE.speculation, vocabulary_parallel_sampling=True)
+    gpus = tuple(gpu(i, 140) for i in range(4))
+    assert derive(model=RECIPE, gpus=gpus, speculation=speculation).world_size == 4
+    with pytest.raises(UsageError, match="no TP3 gather"):
+        derive(model=RECIPE, gpus=gpus, selected=(0, 1, 2), speculation=speculation)
+    with pytest.raises(CapacityError, match="needs 4"):
+        derive(model=RECIPE, gpus=gpus[:3], speculation=speculation)
+
+
+@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"),
+                                         ("nvfp4", "nvfp4"), ("mxfp8", None), ("nvfp4", "fp8")])
 def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypatch):
     from types import SimpleNamespace
     from ignition.cli import display
@@ -94,14 +121,14 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
     # Source identity needs the native export extension; the record's precision keys do not.
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
 
-    model = replace(SOLO, draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4",))
+    model = replace(SOLO, draft_head_quantizations=("nvfp4", "mxfp8"), markov_head_quantizations=("nvfp4", "fp8"))
     spec = replace(DRAFTING, draft_head_quantization=draft, markov_head_quantization=markov)
     result = derive(model=model, speculation=spec)
     assert result.to_dict()["speculation"]["draft_head_quantization"] == draft
     assert result.to_dict()["speculation"]["markov_head_quantization"] == markov
     summary = display.speculation(spec)
     assert (f"draft head {(draft or '').upper()}" in summary) == bool(draft)
-    assert ("markov head NVFP4" in summary) == bool(markov)
+    assert (f"markov head {(markov or '').upper()}" in summary) == bool(markov)
     from google.protobuf import json_format
     from ignition.preparation import runtime_package_pb2 as proto
 
@@ -129,6 +156,27 @@ def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
     assert (auto.pages, auto.cache_states, auto.fixed_bytes) == (bf16.pages, bf16.cache_states, bf16.fixed_bytes)
     with pytest.raises(UsageError, match="mla-compute-mode"):
         planning.fit(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), mla_compute_mode="bf16", **options)
+
+
+def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="deepseek41"))
+    assert not ordinary.joint_tuning
+    joint = replace(ordinary, joint_tuning=True)
+    assert joint.to_dict()["joint_tuning"] is True
+    assert replace(joint, joint_tuning=False) == ordinary
+    for plan in (ordinary, joint):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).joint_tuning == plan.joint_tuning
+    with pytest.raises(UsageError, match="DeepSeek V4.1"):
+        replace(derive(), joint_tuning=True)
+    with pytest.raises(UsageError, match="autotune-effort"):
+        replace(joint, autotune_effort="off")
 
 
 def test_image_concurrency_defaults_and_explicit_capacity():
@@ -209,7 +257,8 @@ def test_speculation_settings_are_validated_and_described():
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
     assert record == {"draft_tokens": 5, "adaptive": True,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
-                      "draft_head_quantization": None, "markov_head_quantization": None}
+                      "draft_head_quantization": None, "markov_head_quantization": None,
+                      "vocabulary_parallel_sampling": False}
     assert derive(speculation=Speculation(5, packed_verification=True)).to_dict()["speculation"]["packed_verification"]
     assert display.speculation(None) == "off"
     assert display.speculation(DRAFTING) == "up to 3 draft tokens per round · MTP module"
@@ -262,7 +311,8 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     path.write_text(configuration_text.format(alias=model.checkpoint.alias))
     configuration = Configuration.load(path)
     if expected is None:
-        expected = (4, 4096, 6) if model.recipe.name == "gemma4" else (32, 4096, 128)
+        expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
+                    (4, 4096, 32) if model.recipe.name == "muse_spark" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
@@ -271,6 +321,11 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
     if model.recipe.name != "mimo_v2":
         devices = tuple(replace(device, total_bytes=256 * GIB, free_bytes=255 * GIB) for device in devices)
     host = preparation.Host(devices, None)
+    if expected[0] > model.recipe.max_concurrency:
+        with pytest.raises(UsageError, match="concurrency"):
+            preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
+                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
+        return
     plan = preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                               speculation=selected, prefill_chunk=args.prefill_chunk_size)
     assert plan.world_size == world_size
@@ -562,3 +617,103 @@ def test_recipe_b12x_settings_name_b12x_variables():
         replace(RECIPE, b12x_environment={"CUDA_VISIBLE_DEVICES": "0"})
     with pytest.raises(ValueError, match="B12X_"):
         replace(RECIPE, b12x_environment={"B12X_PCIE_DCP_THREADS": 512})
+
+
+def test_sharded_hyperconnections_require_qwen_tp_and_survive_rebuild_serialization(monkeypatch):
+    from types import SimpleNamespace
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    ordinary = derive(model=replace(SOLO, name="qwen38"), gpus=(gpu(0, 95), gpu(1, 95)), selected=(0, 1))
+    assert not ordinary.shard_hyperconnections
+    sharded = replace(ordinary, shard_hyperconnections=True)
+    assert sharded.to_dict()["shard_hyperconnections"] is True
+    assert replace(sharded, shard_hyperconnections=False) == ordinary
+    for plan in (ordinary, sharded):
+        manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+        encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+        assert proto.RebuildManifest.FromString(encoded.SerializeToString()).shard_hyperconnections == plan.shard_hyperconnections
+    with pytest.raises(UsageError, match="Qwen3.8 Flash"):
+        replace(derive(), shard_hyperconnections=True)
+    with pytest.raises(UsageError, match="tensor parallelism"):
+        replace(derive(model=replace(SOLO, name="qwen38")), shard_hyperconnections=True)
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_collective_tuning_plan_recipe_default_and_override(mode):
+    default = derive(model=replace(SOLO, collective_tuning=mode))
+    assert default.collective_tuning == mode
+    assert default.to_dict()["collective_tuning"] == mode
+    other = "static" if mode == "runtime" else "runtime"
+    assert replace(default, collective_tuning=other).collective_tuning == other
+    with pytest.raises(UsageError, match="collective-tuning"):
+        replace(default, collective_tuning="unknown")
+
+
+@pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_every_recipe_passes_collective_policy_to_preparation(monkeypatch, tmp_path, recipe, mode):
+    from importlib import import_module
+
+    bootstrap = import_module(f"ignition.recipes.{recipe.name}.bootstrap")
+    assert recipe.collective_tuning == "static"
+    assert bootstrap.PreparationConfig.__dataclass_fields__["collective_tuning"].default == "static"
+    from ignition.preparation.collective_ladder import load
+
+    world = min((size for size in recipe.tensor_parallel if size > 1), default=1)
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") | {"world_size": world} if mode == "runtime" and world in (2, 3, 4, 6, 8, 10) else None
+    devices = tuple(replace(gpu(i, 4096), total_bytes=4096 * GIB) for i in range(world))
+    plan = replace(derive(model=recipe, gpus=devices, selected=tuple(range(world)), speculation=None), collective_tuning=mode, collective_ladder=ladder)
+    original = bootstrap.PreparationConfig
+
+    class Captured(Exception):
+        pass
+
+    def config(**kwargs):
+        assert kwargs["collective_tuning"] == mode
+        assert original(**kwargs).collective_tuning == mode
+        assert kwargs["collective_ladder"] is ladder
+        assert original(**kwargs).collective_ladder is ladder
+        raise Captured
+
+    monkeypatch.setattr(bootstrap, "PreparationConfig", config)
+    with pytest.raises(Captured):
+        recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
+
+
+@pytest.mark.parametrize("configured,flag,expected", [(None, None, "runtime"), ("static", None, "static"),
+                                                      ("runtime", "static", "static"), ("static", "runtime", "runtime")])
+def test_cli_derive_carries_resolved_collective_policy(tmp_path, configured, flag, expected):
+    from ignition.cli.config import Configuration, Setting
+    from ignition.cli.preparation import Host, derive as cli_derive
+
+    values = {} if configured is None else {"preparation": {"collective_tuning": configured}}
+    config = Configuration(tmp_path / "config.toml", values, False)
+    model = ResolvedModel(replace(SOLO, collective_tuning="runtime"), SOLO.checkpoints[0])
+    plan = cli_derive(config, model, Host(tuple(gpu(i, 95) for i in range(4)), None), gpus="0-3",
+                      concurrency=Setting(4, "flag"), speculation=None, collective_tuning=flag,
+                      collective_ladder="ignition/preparation/ladders/gb202_pcie_tp4.json" if expected == "runtime" else None)
+    assert plan.collective_tuning == expected
+
+
+def test_collective_ladder_plan_and_rebuild_round_trip():
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation.collective_ladder import load
+
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
+    base = derive(gpus=tuple(gpu(i, 95) for i in range(4)), selected=(0, 1, 2, 3))
+    plan = replace(base, collective_tuning="runtime", collective_ladder=ladder)
+    assert plan.to_dict()["collective_ladder"] == ladder
+    manifest = rebuild_manifest.from_plan(ResolvedModel(SOLO, SOLO.checkpoints[0]), plan, compiled_forwards=True)
+    encoded = json_format.ParseDict(manifest, proto.RebuildManifest())
+    decoded = proto.RebuildManifest.FromString(encoded.SerializeToString())
+    assert json.loads(decoded.collective_ladder_json) == ladder
+    with pytest.raises(UsageError, match="runtime"):
+        replace(plan, collective_tuning="static")
+    with pytest.raises(UsageError, match="TP size"):
+        replace(derive(), collective_tuning="runtime", collective_ladder=ladder)
+    with pytest.raises(UsageError, match="compute capability"):
+        replace(base, gpus=tuple(replace(g, capability=(12, 1)) for g in base.gpus),
+                collective_tuning="runtime", collective_ladder=ladder)

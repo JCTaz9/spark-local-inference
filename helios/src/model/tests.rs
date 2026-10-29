@@ -188,6 +188,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
 }
 
 #[test]
+#[cfg(any(feature = "runtime-package", feature = "frontend"))]
 fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_padding() {
     let mut config = config();
     let image_contract: PreparedContract =
@@ -1058,7 +1059,7 @@ fn mixed_manifest(config: &mut ModelConfig, width: usize) -> crate::execution::E
             -1,
         ));
         config.contract.graphs.push(semantics);
-        manifest.graphs.push(GraphDescriptor { confidence_width: 0, draft_tokens: 0,
+        manifest.graphs.push(GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0,
             packed_token_capacity: 0,
             name,
             kind: GraphKind::Mixed,
@@ -1521,6 +1522,7 @@ fn grammar_mask_cache_discards_unsubmitted_rows_after_pack_error() {
 }
 
 #[test]
+#[cfg(any(feature = "runtime-package", feature = "frontend"))]
 fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata() {
     let mut config = config();
     let image_contract: PreparedContract =

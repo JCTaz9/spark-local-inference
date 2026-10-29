@@ -58,15 +58,6 @@ impl Default for Limits {
     }
 }
 
-impl Limits {
-    fn buffer(&self) -> Result<Vec<u8>> {
-        if self.chunk == 0 {
-            return Err(invalid("derivation copy buffer must not be empty"));
-        }
-        Ok(vec![0u8; self.chunk])
-    }
-}
-
 /// One strided outer axis of a copy. `count` runs are spaced by the strides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Axis {

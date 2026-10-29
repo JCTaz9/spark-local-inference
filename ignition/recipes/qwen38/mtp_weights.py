@@ -15,7 +15,7 @@ from ignition.preparation.checkpoint import CheckpointError, CheckpointManifest
 from ignition.preparation.qwen38 import TRANSFORMERS_REVISION
 
 from .moe import QwenMoeWeights, SharedExpertWeights
-from .hyperconnection import packed_down_projection
+from .hyperconnection import packed_down_projection, hyperconnection_extents
 from .weights import QwenWeightLoader, _expert_ids, _expert_scale_vectors
 
 
@@ -123,7 +123,9 @@ class MTPWeights:
     draft_head: object | None = None
 
     @classmethod
-    def load(cls, manifest: CheckpointManifest, device, *, embedding_weight, lm_head_weight, progress=None, shard: TensorParallelShard = TensorParallelShard(0, 1)):
+    def load(cls, manifest: CheckpointManifest, device, *, embedding_weight, lm_head_weight, progress=None,
+             shard: TensorParallelShard = TensorParallelShard(0, 1),
+             shard_hyperconnections: bool = False):
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("MTP weights require a CUDA device")
@@ -145,6 +147,9 @@ class MTPWeights:
                 "layers.0.self_attn.v_proj.weight": slice(*kv),
                 "layers.0.self_attn.o_proj.weight": (slice(None), slice(*shard.partition(6144))),
             }
+            for prefix in ("layers.0.attn_hyper_connection", "layers.0.mlp_hyper_connection", "hyper_connection_mixer"):
+                extents.update({f"{prefix}.{name}": extent
+                                for name, extent in hyperconnection_extents(shard, shard_hyperconnections).items()})
             values = loader.load_tensors(tuple(f"mtp.{name}" for name in names),
                                         extents=tuple(extents.get(name) for name in names))
             for name, value in zip(names, values, strict=True):

@@ -89,10 +89,10 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setattr(module_images, "ModuleImages", Scope)
     monkeypatch.setattr(package_storage, "PackageStorage", Scope)
 
-    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs, package_storage):
-        assert retain_graphs and isinstance(package_storage, Scope)
+    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage):
+        assert isinstance(package_storage, Scope)
         calls.update(snapshot=snapshot, plan=plan, compile_forwards=compile_forwards,
-                     kernel_cache=kernel_cache, storage=package_storage)
+                     kernel_cache=kernel_cache, storage=package_storage, retain_graphs=retain_graphs)
         behavior = dict(calls["behavior"])
         if "raises" in behavior:
             raise behavior["raises"]
@@ -140,6 +140,7 @@ def export(*arguments):
 def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert export("qwen3.8-flash", "--no-compile") == 0
     assert host["compile_forwards"] is False and host["exports"] == 1
+    assert host["retain_graphs"]
     assert [gpu.index for gpu in host["gpus"]] == [0]
     assert host["plan"].speculation == host["plan"].recipe.speculation
     assert not host["plan"].mixed_prefill and host["plan"].mixed_shapes == ()
@@ -235,6 +236,7 @@ def test_diagnostic_serving_retains_storage_until_native_shutdown(host, monkeypa
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0",
                  "--port", str(free_port())]) == 0
     assert host["exports"] == 0 and closed == [True]
+    assert not host["retain_graphs"]
 
 
 def test_diagnostic_startup_failure_retains_undrained_host_storage(host, monkeypatch):
@@ -449,6 +451,7 @@ def test_uncached_checkpoint_downloads_before_export(host, monkeypatch):
 def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_path):
     from ignition.cli.config import Configuration
 
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE"):
@@ -469,6 +472,7 @@ def test_environment_selects_gpus_by_uuid_and_places_caches(monkeypatch, tmp_pat
 @pytest.mark.parametrize("configured", (False, True))
 @pytest.mark.parametrize("inherited_cuda", (None, "/system/cuda"))
 def test_environment_leaves_pip_cuda_toolchain_selection_to_cutile(monkeypatch, tmp_path, configured, inherited_cuda):
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     package = tmp_path / "site-packages" / "nvidia"
     compiler = package / "cu13" / "bin" / "nvcc"
     compiler.parent.mkdir(parents=True)
@@ -499,6 +503,7 @@ def test_environment_sets_the_recipe_b12x_settings_over_inherited_values(monkeyp
     from ignition.cli.config import Configuration
     from ignition.recipes.kimi3.recipe import RECIPE
 
+    monkeypatch.setattr(environment.patches, "apply", lambda: ())
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in ("CUDA_VISIBLE_DEVICES", "CUDA_HOME", "B12X_COMPILE_CACHE_DIR", "TRITON_CACHE_DIR",
                  "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_CACHE", "FLASHINFER_WORKSPACE_BASE", *RECIPE.b12x_environment):
@@ -657,3 +662,10 @@ def test_lock_gpu_clocks_reaches_preparation_plan(host):
     assert export("qwen3.8-flash", "--lock-gpu-clocks") == 0
     assert host["plan"].lock_gpu_clocks is True
     assert host["plan"].to_dict()["lock_gpu_clocks"] is True
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_runtime_collective_policy_requires_ladder_before_preparation(host, capsys, command):
+    assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
+    assert "requires --collective-ladder PATH" in capsys.readouterr().err
+    assert "prepared" not in host and host["exports"] == 0

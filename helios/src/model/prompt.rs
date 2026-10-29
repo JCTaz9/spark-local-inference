@@ -273,14 +273,16 @@ pub fn prepare_output(
     let mut control_tokens = if syntax
         .tools
         .as_ref()
-        .is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Xtml)
+        .is_some_and(|tool| matches!(tool.kind, super::contract::ToolParserKind::Xtml | super::contract::ToolParserKind::Atem))
     {
-        ["<|open|>", "<|close|>", "<|sep|>"]
-            .into_iter()
+        let markers = if syntax.tools.as_ref().unwrap().kind == super::contract::ToolParserKind::Atem {
+            vec!["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+        } else { vec!["<|open|>", "<|close|>", "<|sep|>"] };
+        markers.into_iter()
             .map(|marker| {
                 let ids = frontend.encode(marker, false)?;
                 if ids.len() != 1 {
-                    return Err("XTML delimiters must each occupy one tokenizer token".into());
+                    return Err("output envelope delimiters must each occupy one tokenizer token".into());
                 }
                 Ok((ids[0], marker.to_owned()))
             })
@@ -288,8 +290,32 @@ pub fn prepare_output(
     } else {
         vec![]
     };
+    if syntax.tools.as_ref().is_some_and(|tool| tool.kind == super::contract::ToolParserKind::Dsml) {
+        let tokenizer = frontend.tokenizer();
+        for token in [deepseek_recipe_core::special_tokens::SpecialToken::ThinkingEnd,
+                      deepseek_recipe_core::special_tokens::SpecialToken::Dsml] {
+            let name = token.default_str();
+            if let Some(&id) = tokenizer.get_added_vocabulary().get_vocab().get(name) {
+                if !delimiters.iter().any(|(existing, _)| *existing == id) {
+                    control_tokens.push((id, name.to_owned()));
+                }
+            }
+        }
+    }
     control_tokens.extend_from_slice(delimiters);
-    let start = if !tools.is_empty()
+    let recipient = syntax.tools.as_ref().is_some_and(|t| t.kind == super::contract::ToolParserKind::Atem);
+    if recipient {
+        reasoning = prefix.is_some_and(|p| p.starts_with(" to=self<|message|>"));
+    }
+    let start = if recipient && !open_assistant {
+        crate::output::tagged::OutputStart::RecipientFrame
+    } else if recipient && prefix.is_some_and(|p| !p.contains("<|message|>")) {
+        crate::output::tagged::OutputStart::RecipientHeader
+    } else if recipient && prefix.is_some_and(|p| {
+        p.starts_with(" to=") && ![" to=self<|message|>", " to=user<|message|>", " to=commentary<|message|>"].iter().any(|m|p.starts_with(m))
+    }) {
+        crate::output::tagged::OutputStart::ToolBody
+    } else if !tools.is_empty()
         && syntax.tools.as_ref().is_some_and(|tool| {
             tool.kind == super::contract::ToolParserKind::Dsml
                 && prefix.is_some_and(|suffix| {
@@ -649,11 +675,8 @@ mod tests {
         .unwrap()
         .frontend
         .tools;
-        assert!(
-            reasoning_delimiter_tokens(&frontend, &dsml)
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(reasoning_delimiter_tokens(&frontend, &dsml).unwrap(),
+            [(128, "<think>".to_owned()), (129, "</think>".to_owned())]);
         let spelled = |text: &str| text.bytes().map(u32::from).collect::<Vec<_>>();
         let tokens = [
             spelled("Quote </think> here.\n"),

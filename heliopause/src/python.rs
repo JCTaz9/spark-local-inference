@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::execution::{
-    BufferDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
+    BufferDescriptor, TunedBinding, TuningGraphDescriptor, Dtype, ExecutionManifest, ExecutionWorker, GraphDescriptor, GraphKind,
     InputBinding, OwnedUpload, SamplingMode,
 };
 use crate::lifetime::OwnerLease;
@@ -203,6 +203,14 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
                 nbytes: field!(binding, "nbytes", usize),
             });
         }
+        let mut tuned_bindings = Vec::new();
+        for binding in graph.get_item("tuned_bindings")?.try_iter()? {
+            let binding = binding?;
+            tuned_bindings.push(TunedBinding {
+                buffer: field!(binding, "buffer", String),
+                tuning_graph: field!(binding, "tuning_graph", String),
+            });
+        }
         graphs.push(GraphDescriptor {
             confidence_width: field!(graph, "confidence_width", usize),
             draft_tokens: if field!(graph, "kind", String) == "speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
@@ -219,6 +227,17 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             prefill_capacity: field!(graph, "prefill_capacity", usize),
             estimated_duration_ns: field!(graph, "estimated_duration_ns", u64),
             input_bindings,
+            tuned_bindings,
+        });
+    }
+    let mut tuning_graphs = Vec::new();
+    for graph in value.get_item("tuning_graphs")?.try_iter()? {
+        let graph = graph?;
+        tuning_graphs.push(TuningGraphDescriptor {
+            name: field!(graph, "name", String),
+            handle: field!(graph, "handle", usize),
+            outputs: field!(graph, "outputs", Vec<String>),
+            status_buffer: field!(graph, "status_buffer", String),
         });
     }
     Ok(ExecutionManifest {
@@ -233,6 +252,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         input_frame_bytes: field!(value, "input_frame_bytes", usize),
         buffers,
         graphs,
+        tuning_graphs,
     })
 }
 

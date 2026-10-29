@@ -1,5 +1,7 @@
 //! Convert reference checkpoint configuration for native frontend tests.
 
+#![allow(dead_code)]
+
 use crate::frontend::{Asset, TokenizerSettings};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

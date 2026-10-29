@@ -123,7 +123,7 @@ pub fn select_deployments(
     publishers: &[flare_helios::runtime_package::Publisher],
     sizes: &[u32],
 ) -> Result<Vec<flare_helios::package::protection::Selection>, Failure> {
-    use flare_helios::package::{protection, reader};
+    use flare_helios::package::protection;
 
     let catalog = protection::verify(
         &metadata.envelope,

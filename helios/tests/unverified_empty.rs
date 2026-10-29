@@ -4,7 +4,6 @@
 
 use std::{
     fs,
-    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 

@@ -66,6 +66,8 @@ from .vision import PreparedVision, VisionScratch
 
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
@@ -96,6 +98,7 @@ class PreparationConfig:
     # Run shared experts, small-batch attention projections and selection, and GDN input projections
     # on an auxiliary stream; without overlap every branch runs serially on the main stream.
     stream_overlap: bool = True
+    shard_hyperconnections: bool = False
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -114,6 +117,8 @@ class PreparationConfig:
             raise ValueError("tensor parallelism requires one, two or four distinct CUDA devices")
         if self.hosts is not None and self.devices is None:
             raise ValueError("ranks on separate hosts require their devices")
+        if self.shard_hyperconnections and len(self.devices or (self.device,)) < 2:
+            raise ValueError("--shard-hyperconnections requires tensor parallelism")
         request_capacity(self.max_active)
         for name in ("device", "context", "prefill_chunk_size", "snapshot_budget_bytes", "headroom_bytes"):
             if type(getattr(self, name)) is not int:
@@ -256,7 +261,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     # that memory to the device once tuning completes, before compiled forwards are bound.
     if package_storage is not None:
         transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, progress=progress, shard=shard)
+    weights = ModelWeights.load(manifest, device, progress=progress, shard=shard,
+        shard_hyperconnections=config.shard_hyperconnections)
     if torch.cuda.get_device_properties(device).is_integrated:
         from ignition.preparation.host_memory import release_page_cache
 
@@ -268,7 +274,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
 
         mtp_weights = MTPWeights.load(manifest, device,
             embedding_weight=weights.tree.model.language_model.embed_tokens.weight,
-            lm_head_weight=weights.tree.lm_head.weight, progress=progress, shard=shard)
+            lm_head_weight=weights.tree.lm_head.weight, progress=progress, shard=shard,
+            shard_hyperconnections=config.shard_hyperconnections)
     host_storage = {} if package_storage is None else {"host_allocator": package_storage.host_allocate}
     table = PLETable.load(manifest, device, tokens=config.token_capacity, progress=progress, **host_storage)
     sample_rows = max(batch * width for batch, width in config.speculative_shapes) if config.mtp else config.request_capacity
@@ -276,21 +283,23 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     coordinator = CollectivePreparation(group) if group is not None else None
     ipc = None if package_storage is None else package_storage.peer_storage
     collective = vocabulary_collective = None
+    reduction_width = 10240 if config.shard_hyperconnections else 2560
     if coordinator is not None and coordinator.spans_hosts:
         # Ranks on separate Sparks reduce and gather through one RoCEnante runtime: decode rows
         # one-shot, prefill chunks through the pipelined two-shot path.
         collective = vocabulary_collective = create_roce_runtime(group, device,
-            max_tokens=max(config.request_capacity, sample_rows), pipe_tokens=config.token_capacity, hidden_size=2560,
+            max_tokens=max(config.request_capacity, sample_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring, ring_open=config.roce_chain)
     elif group is not None:
-        collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity, hidden_size=2560, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity, hidden_size=reduction_width, ipc=ipc)
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=sample_rows, columns=248320, ipc=ipc)
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
-        compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
         device=device, checkpoint=REVISION, coordinator=coordinator,
-        namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size},
+        namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,
+                   "shard_hyperconnections": config.shard_hyperconnections},
         headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
     session.__enter__()
     graphs = {}
@@ -316,7 +325,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             inputs = DecoderInputs.allocate(device, context=config.context, tokens=config.token_capacity, capacity=slots)
             graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
             scratch = DecoderScratch.allocate(config.token_capacity, device, sample_rows=sample_rows,
-                world_size=shard.world_size, buffers=graph_buffers.cursor())
+                world_size=shard.world_size, buffers=graph_buffers.cursor(),
+                hyperconnection_lowrank=320 // shard.world_size if config.shard_hyperconnections else 320)
             workspaces = ScratchArena(device, overlap=config.stream_overlap)
             rotary = RotaryTables.allocate(weights.tree.config.text_config, config.context, device)
             cache = {index: QSAState.allocate(pages=1, slots=slots + 1, device=device, draft_tokens=speculative_tokens, kv_heads=max(1, 2 // shard.world_size))
@@ -549,7 +559,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             "prefill_chunk_size": config.prefill_chunk_size, "prefill_capacities": config.prefill_capacities,
             "mixed_shapes": config.mixed_shapes,
             "mixed_prefill": config.mixed_prefill,
-            "compiled_decoder": compile_decoder, "rank": rank, "world_size": shard.world_size}
+            "compiled_decoder": compile_decoder, "rank": rank, "world_size": shard.world_size,
+            "shard_hyperconnections": config.shard_hyperconnections}
         if scoring is not None:
             memory.update(scoring.memory_report())
         if speculation is not None:

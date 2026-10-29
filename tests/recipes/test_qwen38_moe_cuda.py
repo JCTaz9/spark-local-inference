@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, Route
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation import inspect_qwen38_checkpoint
 from ignition.preparation.graphs import PreparedGraphBundle
-from ignition.preparation.qwen38 import TEXT_PREFIX
+from ignition.preparation.qwen38 import REVISION, TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 from ignition.recipes.qwen38.moe import (
     PreparedQwenMoe,
@@ -29,6 +30,7 @@ from ignition.recipes.qwen38.moe import (
     SharedExpertWeights,
 )
 from ignition.recipes.qwen38.weights import QwenWeightLoader, allocate_expert_scale_scratch
+from ignition.recipes.qwen38.tuning import preparation_session
 from ignition.reference.qwen38_quant import (
     CheckpointTensors,
     decode_mxfp8,
@@ -242,13 +244,17 @@ def test_actual_two_expert_component_reduction_graph(manifest, tokens):
 
 
 @pytest.fixture(scope="module")
-def complete_layer(manifest):
+def complete_layer(manifest, request):
     prefix = f"{TEXT_PREFIX}.layers.0.mlp"
-    scratch = allocate_expert_scale_scratch("cuda:0")
-    with torch.no_grad(), QwenWeightLoader(manifest, "cuda:0", prefixes=(prefix + ".",)) as loader:
+    rank, world_size, scale_storage = request.param
+    shard = TensorParallelShard(rank, world_size)
+    scratch = (allocate_expert_scale_scratch("cuda:0", shard=shard)
+               if scale_storage == "compressed" else None)
+    with torch.no_grad(), QwenWeightLoader(manifest, "cuda:0", prefixes=(prefix + ".",), shard=shard) as loader:
         weights = QwenMoeWeights.load(loader, 0, scale_scratch=scratch)
         assert loader._session.torch_copy_bytes == 0
     assert weights.experts.num_experts == 512
+    assert weights.experts.has_csf_blocks == (scale_storage == "compressed")
     with CheckpointTensors(manifest, byte_budget=16 << 20) as reader:
         shared = {
             projection: (reader.read(f"{prefix}.shared_expert.{projection}.weight"),
@@ -256,16 +262,33 @@ def complete_layer(manifest):
             for projection in ("gate_proj", "up_proj", "down_proj")
         }
         shared_gate = reader.read(f"{prefix}.shared_expert_gate.weight")
-    return weights, scratch, shared, shared_gate, QwenMoeScratch.allocate(16, torch.device("cuda:0"))
+    return (weights, () if scratch is None else scratch, shared, shared_gate,
+            QwenMoeScratch.allocate(16, torch.device("cuda:0"), intermediate=640 // shard.world_size), shard)
 
 
-@pytest.mark.parametrize("tokens", [1, 4, 16])
+@pytest.mark.parametrize("complete_layer,tokens", [
+    ((0, 1, "compressed"), 1), ((0, 1, "compressed"), 4), ((0, 1, "compressed"), 16),
+    ((0, 2, "expanded"), 3), ((0, 2, "expanded"), 8),
+    ((0, 2, "compressed"), 3), ((0, 2, "compressed"), 8),
+], indirect=["complete_layer"], scope="module",
+    ids=["tp1-m1", "tp1-m4", "tp1-m16", "tp2-m3", "tp2-m8", "tp2-csf-m3", "tp2-csf-m8"])
 def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, tokens):
-    weights, scale_scratch, shared_weights, shared_gate, moe_scratch = complete_layer
+    weights, scale_scratch, shared_weights, shared_gate, moe_scratch, shard = complete_layer
+    first, last = shard.partition(640)
     workspace = ScratchArena("cuda:0")
     source = torch.zeros((tokens, 2560), dtype=torch.bfloat16, device="cuda")
     prefix = f"{TEXT_PREFIX}.layers.0.mlp.experts"
-    with torch.inference_mode(), PreparationSession(device=source.device, autotune=False, compile_workers=0) as session, ExitStack() as resources:
+    if shard.world_size == 1:
+        session = PreparationSession(device=source.device, autotune=False, compile_workers=0)
+        gradient_mode = torch.inference_mode
+    else:
+        session = preparation_session(device=source.device, checkpoint=REVISION, compile_workers=4,
+            autotune_effort="default", lock_gpu_clocks=True, headroom_bytes=1 << 30,
+            namespace={"config": manifest.metadata_sha256["config.json"],
+                       "headers": manifest.headers_sha256, "world_size": shard.world_size})
+        session.register_scratch(workspace)
+        gradient_mode = torch.no_grad
+    with gradient_mode(), session, ExitStack() as resources:
         prepared = PreparedQwenMoe(source, weights, session=session, name=f"complete_moe:{tokens}",
             scratch=moe_scratch, workspace=workspace, projection_workspace=workspace)
         workspace_bytes = workspace.nbytes
@@ -274,14 +297,24 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
         assert workspace.nbytes == workspace_bytes
         assert repeated.output.data_ptr() == prepared.output.data_ptr() == moe_scratch.output.data_ptr()
         assert repeated.shared.gate_up.data_ptr() == prepared.shared.gate_up.data_ptr()
-        workspace.finalize()
-        workspace.freeze()
+        if shard.world_size == 1:
+            workspace.finalize()
+            workspace.freeze()
+        else:
+            session.tune()
+            if not scale_scratch:
+                assert prepared.experts.binding.implementation == "dynamic"
+                assert repeated.experts.binding.implementation == "dynamic"
         assert prepared.experts.scratch.data_ptr() == repeated.experts.scratch.data_ptr() == workspace.tensor.data_ptr()
         for operator in (prepared, repeated):
             for projection in (operator.shared.up_projection, operator.shared.down_projection):
                 assert projection.workspace.data_ptr() == workspace.tensor.data_ptr()
         first_output = torch.empty_like(source)
         first_shared = torch.empty_like(source)
+        if shard.world_size > 1:
+            prepared(source)
+            repeated(source)
+            torch.cuda.synchronize()
         session.freeze()
         prepared(source)
         graph = torch.cuda.CUDAGraph()
@@ -329,6 +362,13 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
                     rows, slots = (cpu_ids == expert).nonzero(as_tuple=True)
                     projections = tuple(read_nvfp4_projection(reader, f"{prefix}.{expert}.{name}")
                                         for name in ("gate_proj", "up_proj", "down_proj"))
+                    gate, up, down = projections
+                    projections = (
+                        replace(gate, packed=gate.packed[first:last], scales=gate.scales[first:last]),
+                        replace(up, packed=up.packed[first:last], scales=up.scales[first:last]),
+                        replace(down, packed=down.packed[:, first // 2:last // 2],
+                                scales=down.scales[:, first // 16:last // 16]),
+                    )
                     down = nvfp4_expert_reference(cpu_source[rows], *projections,
                         quant_scale_math=_quant_scale_math(prepared.experts)).down
                     probability = cpu_probabilities[rows, slots, None]
@@ -338,7 +378,9 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
             def project(values, name, projection):
                 mode = require_prepared(projection.plan, projection.plan.contract.component_id).config.mode
                 inputs = quantize_mxfp8_activation(values) if mode == "quantized" else values.float()
-                return (inputs @ decode_mxfp8(*shared_weights[name]).T).to(torch.bfloat16)
+                decoded = decode_mxfp8(*shared_weights[name])
+                decoded = decoded[:, first:last] if name == "down_proj" else decoded[first:last]
+                return (inputs @ decoded.T).to(torch.bfloat16)
 
             gate, up = (project(cpu_source, name, prepared.shared.up_projection)
                         for name in ("gate_proj", "up_proj"))
@@ -352,6 +394,10 @@ def test_actual_complete_layer_512_experts_graph(manifest, complete_layer, token
             canonical_metrics = _metrics(prepared.output, expected_canonical)
             assert canonical_metrics["relative_l2_error"] < .015, canonical_metrics
             print(json.dumps({"component": "actual_layer0_512_experts_top10", "tokens": tokens,
+                              "tp_rank": shard.rank, "tp_size": shard.world_size,
+                              "scale_storage": "compressed" if scale_scratch else "expanded",
+                              "expert_config": prepared.experts.plan.contract.config_payload(
+                                  prepared.experts.plan.selection.config).to_dict(),
                               "iteration": iteration, "selected_experts": cpu_ids.unique().numel(),
                               "reference_payload_bytes": read_bytes, "native_reduction": metrics,
                               "canonical_bf16_reduction": canonical_metrics}))

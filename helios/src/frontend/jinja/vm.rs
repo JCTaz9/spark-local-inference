@@ -70,7 +70,7 @@ pub(super) fn render(
         slots: template
             .names
             .iter()
-            .map(|s| context.get(s).map(Value::json).unwrap_or_default())
+            .map(|s| context.get(s).map(Value::json).unwrap_or_else(|| if s == "strftime_now" { Value::Builtin } else { Value::Undefined }))
             .collect(),
         stamps: vec![0; template.names.len()],
         scope: 0,
@@ -701,6 +701,23 @@ fn slice<'a>(
 
 fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Result<Value<'a>> {
     match name {
+        "strftime_now" => {
+            let format = args.first().and_then(Value::as_str).ok_or_else(|| Error::new("strftime_now requires a format string"))?;
+            let format = std::ffi::CString::new(format).map_err(|_| Error::new("strftime_now format contains NUL"))?;
+            let mut output = vec![0u8; 4096];
+            let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+            let now = unsafe { libc::time(std::ptr::null_mut()) };
+            let length = unsafe {
+                #[cfg(not(windows))]
+                if libc::localtime_r(&now, local.as_mut_ptr()).is_null() { return Err(Error::new("local time is unavailable")); }
+                #[cfg(windows)]
+                if libc::localtime_s(local.as_mut_ptr(), &now) != 0 { return Err(Error::new("local time is unavailable")); }
+                libc::strftime(output.as_mut_ptr().cast(), output.len(), format.as_ptr(), local.as_ptr())
+            };
+            if length == 0 && !format.as_bytes().is_empty() { return Err(Error::new("strftime_now output exceeds 4095 bytes")); }
+            output.truncate(length);
+            Ok(Value::string(String::from_utf8(output).map_err(|_| Error::new("strftime_now output is not UTF-8"))?))
+        }
         "namespace" => {
             let mut pairs = if let Some(v) = args.first() {
                 v.pairs()?
@@ -764,6 +781,9 @@ fn test<'a>(name: &str, v: &Value<'a>, args: &[Value<'a>]) -> Result<bool> {
         "number" => v.number().is_some(),
         "integer" => matches!(v, Value::Int(_) | Value::UInt(_)),
         "float" => matches!(v, Value::Float(_)),
+        "sameas" => matches!((v, args.first()),
+            (Value::Bool(true), Some(Value::Bool(true))) | (Value::Bool(false), Some(Value::Bool(false)))
+            | (Value::None, Some(Value::None)) | (Value::Undefined, Some(Value::Undefined))),
         "equalto" | "eq" => args.first().is_some_and(|a| v.equals(a)),
         "odd" => v.integer().is_some_and(|v| v % 2 != 0),
         "even" => v.integer().is_some_and(|v| v % 2 == 0),
@@ -841,13 +861,27 @@ fn filter<'a>(
                 .get(1)
                 .ok_or_else(|| Error::new("replace requires two arguments"))?
                 .text();
-            Ok(Value::string(
-                if let Some(count) = args.get(2).and_then(Value::integer) {
-                    v.text().replacen(&from, &to, count.max(0) as usize)
-                } else {
-                    v.text().replace(&from, &to)
-                },
-            ))
+            let count = args.get(2).and_then(Value::integer).map(|n| n.max(0) as usize);
+            let text = v.text();
+            let output = match count {
+                Some(count) => text.replacen(&from, &to, count),
+                None => text.replace(&from, &to),
+            };
+            if v.hints().is_empty() || from.is_empty() {
+                return Ok(Value::string(output));
+            }
+            let replacements: Vec<_> = text.match_indices(&from).take(count.unwrap_or(usize::MAX)).map(|(at, _)| at).collect();
+            let hints = v.hints().iter().filter_map(|&end| {
+                let mut position = end;
+                for &at in &replacements {
+                    if at < end && end < at + from.len() { return None; }
+                    if at + from.len() <= end {
+                        position = position + to.len() - from.len();
+                    }
+                }
+                Some(position)
+            }).collect();
+            Ok(Value::marked(output, hints))
         }
         "items" => Ok(Value::list(
             v.pairs()?

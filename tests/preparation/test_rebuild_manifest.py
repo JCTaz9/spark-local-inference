@@ -92,3 +92,18 @@ def test_absent_catalog_is_not_inferred_from_allocation_names():
     assert not bundle.HasField('rebuild_weights')
     validate_weights(bundle)
     assert bundle.allocations[0].nbytes == 64
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_rebuild_manifest_records_collective_selection(mode):
+    from dataclasses import replace
+    from google.protobuf.json_format import ParseDict
+    from ignition.preparation.rebuild_manifest import from_plan
+    from ignition.recipes import ResolvedModel
+    from tests.cli.test_planning import derive
+
+    plan = replace(derive(), collective_tuning=mode)
+    model = ResolvedModel(plan.recipe, plan.checkpoint)
+    manifest = ParseDict(from_plan(model, plan, compiled_forwards=True), proto.RebuildManifest())
+    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
+    assert restored.collective_tuning == mode

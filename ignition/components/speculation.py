@@ -88,7 +88,7 @@ class SpeculativeAcceptance:
 
     @classmethod
     def broadcast_layout(cls, batch, width):
-        return {name: layout for name, layout in cls.storage_layout(batch, width).items() if name != "survival"}
+        return cls.storage_layout(batch, width)
 
     @classmethod
     def allocate(cls, batch, width, device):
@@ -292,8 +292,7 @@ class PreparedStochasticVerification:
     def prepare_broadcast(self, **kwargs):
         from .collectives import PreparedBroadcast
 
-        self.broadcast = PreparedBroadcast(tuple(value for name, value in vars(self.output).items()
-                                                 if name != "survival"), **kwargs)
+        self.broadcast = PreparedBroadcast(tuple(vars(self.output).values()), **kwargs)
 
     def prepare(self):
         if self.target_probs.device.type != "cuda":
@@ -382,7 +381,7 @@ class PreparedSpeculativeCommit:
 
     def __init__(self, requests: DeviceRequestState, acceptance: SpeculativeAcceptance,
                  input_ids, slots, generations, live_rows, completion, frame_index,
-                 submission_sequence, *, logits, rng=None, copy_offered_mask=None, draft_context_lag=1, token_limits=None, buffers=None):
+                 submission_sequence, *, logits=None, logprobs=None, rng=None, copy_offered_mask=None, draft_context_lag=1, token_limits=None, buffers=None):
         records = completion.records
         batch, width = input_ids.shape
         _geometry(batch, width)
@@ -394,9 +393,14 @@ class PreparedSpeculativeCommit:
         if token_limits is not None:
             _tensor(token_limits, (batch,), torch.int32, device, "token_limits")
         self.token_limits = token_limits
-        if logits.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("target_logits requires BF16 or FP32 storage")
-        _tensor(logits, (batch, width, requests.vocab_size), logits.dtype, device, "target_logits")
+        if logprobs is None:
+            if logits is None or logits.dtype not in (torch.bfloat16, torch.float32):
+                raise ValueError("target_logits requires BF16 or FP32 storage")
+            _tensor(logits, (batch, width, requests.vocab_size), logits.dtype, device, "target_logits")
+        elif logits is not None:
+            raise ValueError("raw target logits and a prepared logprob reduction are mutually exclusive")
+        elif not callable(logprobs) or not callable(getattr(logprobs, "prepare", None)):
+            raise TypeError("the logprob reduction requires prepare() and captured execution")
         _tensor(input_ids, (batch, width), torch.int64, device, "input_ids")
         _metadata(requests, slots, generations, live_rows, batch, device)
         acceptance.validate(batch, width, device)
@@ -408,7 +412,8 @@ class PreparedSpeculativeCommit:
         if rng is not None:
             for name in ("generation", "target_offset"):
                 _tensor(getattr(rng, name), (requests.capacity,), torch.int64, device, f"rng.{name}")
-        self.logprobs = PreparedLogprobs(logits, completion, slots, generations, live_rows, frame_index)
+        self.logprobs = (PreparedLogprobs(logits, completion, slots, generations, live_rows, frame_index)
+                        if logprobs is None else logprobs)
         self.state, self.acceptance, self.inputs, self.slots = requests, acceptance, input_ids, slots
         self.generations, self.live, self.records, self.frame, self.sequence = generations, live_rows, records, frame_index, submission_sequence
         self.rng = rng

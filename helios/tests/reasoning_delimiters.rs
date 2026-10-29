@@ -123,13 +123,13 @@ fn minimax_m3_think_tags_are_single_tokens() {
 
 #[test]
 #[ignore = "requires FLARE_DEEPSEEK_TEST_SNAPSHOT pointing to the DeepSeek checkpoint"]
-fn deepseek41_dsml_reasoning_stays_text_matched() {
+fn deepseek41_dsml_reasoning_uses_special_tokens() {
     assert_eq!(
         delimiters(
             "FLARE_DEEPSEEK_TEST_SNAPSHOT",
             &support::contract("deepseek41").frontend
         ),
-        []
+        pairs(&[(128821, "<think>"), (128822, "</think>")])
     );
 }
 

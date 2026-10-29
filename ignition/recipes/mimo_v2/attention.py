@@ -8,7 +8,7 @@ from ignition.components.block_fp8 import BlockFP8Projection, BlockFP8Weight
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
-from ignition.components.window_attention import stage_windows
+from ignition.components.window_attention import stage_windows, commit_window
 
 from .pool import PAGE_TOKENS
 
@@ -61,20 +61,6 @@ def stage_window(history, values, output, row, start, length):
     if output.dtype == torch.float8_e4m3fn:
         staged = staged.clamp(-448, 448)
     output.view(-1, *values.shape[1:]).copy_(staged)
-
-
-def commit_window(history, values, row, start, length):
-    """Retain the final window with token positions selecting their circular slots."""
-    offsets = torch.arange(history.shape[1], device=values.device)
-    end = start + length
-    positions = end - 1 - (end - 1 - offsets).remainder(history.shape[1])
-    current = values[(positions - start).clamp(0, values.shape[0] - 1)]
-    rows = row.expand_as(offsets)
-    previous = history[rows, offsets].to(values.dtype)
-    committed = torch.where(((positions >= start) & (positions < end))[:, None, None], current, previous)
-    if history.dtype == torch.float8_e4m3fn:
-        committed = committed.clamp(-448, 448)
-    history[rows, offsets] = committed.to(history.dtype)
 
 
 def partial_rotary(values, positions, inverse):

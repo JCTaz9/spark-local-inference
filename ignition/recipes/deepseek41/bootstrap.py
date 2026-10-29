@@ -68,14 +68,32 @@ def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, visi
                     mla_compute_mode=mla_compute_mode))
 
 
+def _can_race_contextual_plans(config, signatures, device):
+    if not config.joint_tuning:
+        return False
+    if config.autotune_effort == "off":
+        raise ValueError("--joint-tuning requires --autotune-effort default or audit")
+    from b12x.quantization import mla_norm_mxfp8
+
+    if not mla_norm_mxfp8.is_supported(device):
+        raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
+    if not any(signature.kind in ("prefill", "scored_prefill", "decode", "speculative")
+               for signature in signatures.values()):
+        raise ValueError("--joint-tuning requires prepared text graphs")
+    return True
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
+    joint_tuning: bool = False
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
@@ -96,6 +114,7 @@ class PreparationConfig:
     dspark: bool = True
     draft_head_quantization: str | None = None
     markov_head_quantization: str | None = None
+    vocabulary_parallel_sampling: bool = False
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
@@ -115,7 +134,8 @@ class PreparationConfig:
         validate_mla_compute_mode(self.mla_compute_mode)
         from ignition.recipes.declaration import Speculation
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
-                    markov_head_quantization=self.markov_head_quantization)
+                    markov_head_quantization=self.markov_head_quantization,
+                    vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
         drafting = self.dspark and self.draft_tokens > 0
@@ -264,13 +284,13 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
     sample_rows = max(verification_samples, config.request_capacity * config.draft_tokens)
     layouts = ()
     if config.dspark:
-        from ignition.components.draft_sampling import PreparedDraftDistribution
+        from ignition.components.draft_sampling import PreparedDraftBlockBroadcast
         from ignition.components.speculation import SpeculativeAcceptance
 
         batch = max(config.batch_capacities)
         layouts = (SpeculativeAcceptance.broadcast_layout(batch, max(config.speculative_widths)),)
         if config.draft_tokens:
-            layouts += (PreparedDraftDistribution.broadcast_layout(batch),)
+            layouts += (PreparedDraftBlockBroadcast.broadcast_layout(batch, config.draft_tokens),)
     if coordinator.spans_hosts:
         from ignition.components.collectives import packed_broadcast_layout
 
@@ -284,7 +304,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
@@ -313,7 +333,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                     confidence=config.draft_tokens > 0,
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
-                                    markov_head_quantization=config.markov_head_quantization)
+                                    markov_head_quantization=config.markov_head_quantization,
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -353,12 +374,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, package_storage=package_storage,
             verification_samples=verification_samples)
+        sampling_collective = logprob_collective = None
+        if config.vocabulary_parallel_sampling and shard.world_size > 1:
+            sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
+                group, device, max_rows=verification_samples, columns=64 * shard.world_size,
+                ipc=package_storage.peer_storage))
+            logprob_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
+                group, device, max_rows=verification_samples, columns=512 * shard.world_size,
+                ipc=package_storage.peer_storage))
         tables = replace(tables, readiness_runtime=collective)
         identity = hashlib.sha256(json.dumps({"config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
@@ -418,6 +447,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 session=session, workspace=arena,
                 runtime=collective, vocabulary_runtime=vocabulary_collective,
                 markov_runtime=None, coordinator=coordinator, result_runtime=result_collective,
+                block_proposal_broadcast=True,
+                vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
                 buffers=activation_buffers.cursor(),
                 forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
                     draft_factory, PreparedMarkov))
@@ -524,8 +556,26 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if feature_pool is not None:
         feature_pool.release_backing()
     try:
+        contextual = None
+        if _can_race_contextual_plans(config, signatures, device):
+            from .contextual_selection import CatalogContextualSelection
+
+            contextual = CatalogContextualSelection(forwards, signatures, arena=arena,
+                coordinator=coordinator, collective=collective, device=device,
+                graph_pool=package_storage.graph_pool.id, cache_root=config.kernel_cache,
+                compile_decoder=config.compile_decoder, warmup_storage=package_storage,
+                progress=progress)
         with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
-            tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
+            tuning = session.tune(show_progress=progress is not None and rank == 0,
+                                  console=stage.console, contextual=contextual)
+        if contextual is not None and progress is not None:
+            from .contextual_selection import contextual_summary
+
+            summary = contextual_summary(tuning["contextual_tuning"])
+            if hasattr(progress, "console"):
+                progress.console.print(summary, markup=False)
+            else:
+                progress(summary)
         stream, graph_pool = torch.cuda.Stream(device=device), package_storage.graph_pool.id
         arena.allocation_pool = graph_buffers.allocation_pool = activation_buffers.allocation_pool = None
         scratch_pool.retire()
@@ -569,6 +619,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "mla_compute_mode": config.mla_compute_mode,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
+        "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
         "target_logits_dtype": "float32",
         "draft_logits_dtype": "bfloat16" if config.dspark else None,
         "offloaded_bytes": sum(source.nbytes for pair in tables.sources.values() for source in pair),
@@ -612,11 +663,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         package_data=tables if rank == 0 else None,
         resources=(scoring, scored_storage, weights, tables, pool, requests, inputs, admission, commands, arena, forwards,
             prefill_storage, decoder_storage, scratch, metadata, compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
             vision_state, vision_storage, vision_inputs, vision_prefill, graph_buffers, activation_buffers,
             scratch_pool, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

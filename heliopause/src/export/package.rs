@@ -3332,7 +3332,7 @@ mod payload_export_tests {
 
     #[test]
     fn combined_frontend_asset_uses_combined_payload_coordinates() {
-        use helios_core::package::schema::wire as pwire;
+
         let base = std::env::temp_dir().join(format!("flare-asset-shift-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("sources")).unwrap();
@@ -4002,7 +4002,7 @@ mod payload_export_tests {
             vec![(0, 0, 1), (1, 1, 1)]
         );
 
-        let mut read_use = |use_: &pwire::PayloadUse| -> Vec<u8> {
+        let read_use = |use_: &pwire::PayloadUse| -> Vec<u8> {
             assert_eq!(use_.role, pwire::PayloadRole::Weights as i32);
             let slice = use_.slice.as_ref().unwrap();
             let location = metadata
@@ -4490,7 +4490,7 @@ mod payload_export_tests {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let mut publish = |name: &str, ranks: usize, byte: u8| -> std::path::PathBuf {
+        let publish = |name: &str, ranks: usize, byte: u8| -> std::path::PathBuf {
             let sources = base.join(format!("{name}-sources"));
             std::fs::create_dir_all(&sources).unwrap();
             let mut rank = staged_rank(&sources);
@@ -4574,7 +4574,7 @@ mod payload_export_tests {
             key: &key,
         })
         .unwrap();
-        let mut assert_both = |path: &std::path::Path, label: &str| {
+        let assert_both = |path: &std::path::Path, label: &str| {
             let metadata = payload_reader::Metadata::open(path).unwrap();
             let names: Vec<String> = metadata
                 .locations

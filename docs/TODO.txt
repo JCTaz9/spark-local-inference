@@ -1,3 +1,6 @@
+[ ] Expose the selected deployment's rebuild metadata in flare inspect --json.
+    Payload packages report rebuild: null even when DeploymentBody.rebuild is present.
+
 [ ] Validate full-width INT64 expert IDs in b12x W4A16 route packing,
     reductions, and MoE calibration. These paths narrow IDs before range
     checks; add captured replay coverage for IDs outside the INT32 range.
@@ -50,6 +53,11 @@
     callers; prefills of at least 1024 rows use separate DMA channels. Preserve
     MiMo's full-prefill context-gather capacity when separating those bounds.
 
+[ ] Scope TP4 Simple peer-push all-reduce in FlashInfer/b12x: four-rank payload
+    ownership, publication ordering, scratch/epoch reuse, and preparation-time
+    autotuning against existing collectives. Cover graph replay, concurrent
+    channels, rollover, and complete-collective latency on the target topology.
+
 [ ] Review fusion of pooled DeepSeek V4.1 indexer lengths: captured graphs split
     clamp from amax and retain explicit copy kernels. Measure complete GPU steps
     before changing shared storage lowering.
@@ -63,6 +71,13 @@
     fixed memory and KV capacity with full catalogs and tensor parallelism;
     exercise alternating text/image graphs, proposal/verification, and rollback.
     See performance-work.md#cross-model-scratch-planning.
+
+[ ] Validate cooperative Inductor reductions in full vision-enabled exports of
+    kimi-k3-mxfp4-csf, step5-preview-nvfp4, mimo-v2.6-pro-mopd, glm-5.3-flash,
+    and nemotron-bolt-24gb. Exercise every vision capacity, TP kernel agreement,
+    frozen preparation-cache reload, and native image replay. RADIO validation
+    passes single-rank and TP2 tests; full Qwen3.8 export passes. The five listed
+    full-model vision paths remain untested. See model-preparation.md#environment-setup.
 
 [ ] Investigate Qwen vision's canonical-reference accuracy failure in
     test_actual_vision_encoder_native_replay: relative L2 0.078 exceeds 0.03
@@ -136,3 +151,7 @@
     tests/server/test_nemotron.py::test_image_cache_identity: native serving of
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
+
+[ ] Validate native debug-serve asset descriptors for Step-5, MiniMax M3,
+    MiMo V2, Qwen3.8 dense, and DeepSeek V4.1. Their tokenizer descriptors omit
+    sha256 before PreparedModel.start_server; launches remain untested.

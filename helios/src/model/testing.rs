@@ -178,7 +178,7 @@ pub fn metadata() -> PreparedContract {
                         binding("vision_feature_slot", ImageFeatureSlot, Scalar, 0, -1),
                     ]);
                 }
-                graphs.push(GraphContract {
+                graphs.push(GraphContract { tuned_bindings: vec![],
                     graph: format!("{kind:?}-{batch}-{width}"),
                     kind: kind.try_into().unwrap(),
                     inputs,
@@ -205,7 +205,7 @@ pub fn metadata() -> PreparedContract {
         }
     }
     PreparedContract {
-        version: 2,
+        version: 3,
         vocabulary: 248320,
         input_vocabulary: 248320,
         vision: VisionCapabilities::disabled(),
@@ -346,7 +346,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 GraphOperation::Speculative => GraphKind::Speculative,
                 _ => unreachable!(),
             };
-            GraphDescriptor { confidence_width: 0, draft_tokens: if kind == GraphKind::Speculative { fields[2].parse::<usize>().unwrap() - 1 } else { 0 }, packed_token_capacity: if kind == GraphKind::Speculative { fields[1].parse::<usize>().unwrap() * fields[2].parse::<usize>().unwrap() } else { 0 },
+            GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: if kind == GraphKind::Speculative { fields[2].parse::<usize>().unwrap() - 1 } else { 0 }, packed_token_capacity: if kind == GraphKind::Speculative { fields[1].parse::<usize>().unwrap() * fields[2].parse::<usize>().unwrap() } else { 0 },
                 name: g.graph.clone(),
                 kind,
                 sampling_mode: SamplingMode::General,
@@ -372,7 +372,8 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         })
         .collect();
     ExecutionManifest {
-        abi_version: 4,
+        tuning_graphs: vec![],
+        abi_version: 5,
         context: 1,
         device: 0,
         max_active: slots,

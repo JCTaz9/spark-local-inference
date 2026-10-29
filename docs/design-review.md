@@ -55,6 +55,8 @@ before committing; a design acknowledgment cannot authorize them.
    plans, refresh bindings, compile complete forwards, and warm every variant
    before capture. TP forwards compile once, sharded across ranks; every rank
    binds the same artifacts and captures.
+   Captured startup tuning graphs may select persistent binding values from
+   prepared candidates before serving; compilation and capture remain preparation work.
 6. **Make storage and lifetimes explicit.** Concurrent work has disjoint scratch
    and preserved fork/join dependencies. Values surviving graph boundaries use
    persistent storage. Never reuse inputs, pages, or slots while queued work or
@@ -98,7 +100,7 @@ before committing; a design acknowledgment cannot authorize them.
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
 13. **Validate the supported model package contract.** Serving requires execution
-    ABI 4 and prepared model contract 2. Payload format 2 is the canonical carrier;
+    ABI 5 and prepared model contract 3. Payload format 2 is the canonical carrier;
     signed format-6 logical-resource containers require the same contracts. Reject unsupported
     execution ABI and prepared contract versions before replay with a clear
     re-export error. Version semantic contract changes, reserve removed Protobuf

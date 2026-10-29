@@ -270,3 +270,30 @@ def test_projection_gate_trials_produce_private_inputs_and_retain_weights():
     assert not source.count_nonzero() and not normalized.count_nonzero() and not output.count_nonzero()
     assert inputs.nbytes == sum(t.nbytes for t in (
         inputs.source, inputs.normalized, inputs.output, inputs.workspace, *inputs.seeds))
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_sharded_weights_reconstruct_lowrank_axis_and_scratch_preserves_injection(world):
+    from ignition.components.parallel import TensorParallelShard
+
+    down = torch.arange(320 * 16).reshape(320, 16)
+    up = torch.arange(16 * 320).reshape(16, 320)
+    shards = [hyperconnection.hyperconnection_extents(TensorParallelShard(rank, world), True)
+              for rank in range(world)]
+    assert torch.equal(torch.cat([down[e["input_mix_weight_down.weight"]] for e in shards]), down)
+    assert torch.equal(torch.cat([up[e["input_mix_weight_up.weight"]] for e in shards], dim=1), up)
+    assert hyperconnection.hyperconnection_extents(TensorParallelShard(0, world), False) == {}
+    lowrank = 320 // world
+    scratch = HyperconnectionScratch.allocate(64, torch.device("cpu"), lowrank=lowrank)
+    assert scratch.gate_logits.shape == scratch.gate_workspace.shape == (64, 10240)
+    assert scratch.gate_logits.data_ptr() != scratch.gate_workspace.data_ptr()
+    for tokens in (1, 6, 64):
+        rows = scratch.rows(tokens)
+        rows.down_and_injection[:, :lowrank].fill_(2)
+        rows.down_and_injection[:, lowrank:lowrank + 4].fill_(3)
+        assert torch.all(rows.projected_down == 2) and torch.all(rows.injection_logits == 3)
+        assert rows.projected_down.stride() == ((lowrank + 19) // 16 * 16, 1)
+        assert rows.gate_logits.shape == (tokens, 10240)
+        rows.priming_arguments(torch.zeros_like(rows.normalized), torch.ones(10240))
+    with pytest.raises(ValueError, match="tensor parallelism"):
+        hyperconnection.hyperconnection_extents(TensorParallelShard(0, 1), True)

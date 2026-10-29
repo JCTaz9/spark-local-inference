@@ -33,7 +33,7 @@ pub(super) fn serving_contract(
     value: wire::ServingContract,
     _prepared_concurrency: u64,
 ) -> Result<serde_json::Value> {
-    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 2) {
+    if value.model_contract.as_ref().is_none_or(|contract| contract.version != 3) {
         return Err(invalid("unsupported prepared model contract version; re-export the model package"));
     }
     let mut value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
@@ -677,8 +677,28 @@ mod tests {
     }
 
     #[test]
+    fn startup_tuning_metadata_roundtrips_physical_and_semantic_bindings() {
+        let binding = wire::TunedBinding { buffer: "winner".into(), tuning_graph: "tune".into() };
+        let execution = wire::Execution {
+            tuning_graphs: vec![wire::TuningGraph {
+                name: "tune".into(), outputs: vec!["winner".into()], status_buffer: "status".into(),
+            }],
+            graphs: vec![wire::ExecutionGraph { tuned_bindings: vec![binding.clone()], ..Default::default() }],
+            ..Default::default()
+        };
+        let restored = wire::Execution::decode(execution.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(restored, execution);
+        let semantic = wire::GraphContract { kind: 5, tuned_bindings: vec![binding], ..Default::default() };
+        let restored = wire::GraphContract::decode(semantic.encode_to_vec().as_slice()).unwrap();
+        let contract: crate::model::contract::GraphContract =
+            serde_json::from_value(serde_json::to_value(restored).unwrap()).unwrap();
+        assert_eq!(contract.tuned_bindings[0].buffer, "winner");
+        assert_eq!(contract.tuned_bindings[0].tuning_graph, "tune");
+    }
+
+    #[test]
     fn prepared_contract_versions_require_reexport() {
-        for version in [0, 1, 3] {
+        for version in [0, 1, 2, 4] {
             let value = wire::ServingContract { model_contract: Some(wire::ModelContract {
                 version, ..Default::default()
             }), ..Default::default() };

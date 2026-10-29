@@ -1754,7 +1754,7 @@ mod tests {
         let (stored, compressed) = compress(plaintext).unwrap();
         let decoded = plaintext.len() as u64;
 
-        let mut valid_reader = open_compressed_reader(
+        let valid_reader = open_compressed_reader(
             std::io::Cursor::new(&stored),
             stored.len() as u64,
             decoded,
@@ -1773,7 +1773,7 @@ mod tests {
             .chunks(CHUNK)
             .map(|chunk| sha256(chunk).to_vec())
             .collect::<Vec<_>>();
-        let mut trailing_reader = open_compressed_reader(
+        let trailing_reader = open_compressed_reader(
             std::io::Cursor::new(&trailing),
             trailing.len() as u64,
             decoded,
@@ -1791,7 +1791,7 @@ mod tests {
             .chunks(CHUNK)
             .map(|chunk| sha256(chunk).to_vec())
             .collect::<Vec<_>>();
-        let mut extra_reader = open_compressed_reader(
+        let extra_reader = open_compressed_reader(
             std::io::Cursor::new(&extra),
             extra.len() as u64,
             decoded,

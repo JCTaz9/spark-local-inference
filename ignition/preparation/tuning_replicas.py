@@ -32,13 +32,13 @@ def authorization(states, *, replica, rank, tensor_parallel, ranks):
     if all(item[3] is not None for item in peers):
         return {"cache": tuple(item[3] for item in peers)}
     if all(item[4] for item in peers):
-        from .collectives import _winners
+        from .collectives import _tuning_results
 
         keys = [sorted(value.key for value in item[4]) for item in peers]
         if any(value != keys[0] for value in keys[1:]):
             raise RuntimeError("corresponding tuning ranks declared different candidate races")
-        winners = _winners(value for item in peers for value in item[4])
-        return {"tuning": winners[0] if len(winners) == 1 else winners}
+        results = _tuning_results(value for item in peers for value in item[4])
+        return {"tuning": results[0] if len(results) == 1 else results}
     if any(item[0] for item in peers) and any(item[3] is not None or item[4] for item in peers):
         raise RuntimeError("a tuning replica finished before its corresponding rank")
     local = states[replica * tensor_parallel:(replica + 1) * tensor_parallel]

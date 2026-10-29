@@ -77,7 +77,7 @@ class Resources:
             offset = (offset + 7) // 8 * 8
             bindings.append({"buffer_name": name, "host_offset": offset, "nbytes": tensor.numel() * tensor.element_size()})
             offset += bindings[-1]["nbytes"]
-        self.manifest = {"abi_version": 4, "context": context, "device": device, "max_active": 4,
+        self.manifest = {"abi_version": 5, "context": context, "device": device, "max_active": 4,
             "input_frame_bytes": (offset + 7)//8*8,
             "buffers": [{"name": name, "address": tensor.data_ptr(), "nbytes": tensor.numel() * tensor.element_size(),
                 "dtype": str(tensor.dtype).removeprefix("torch."), "shape": list(tensor.shape), "strides": list(tensor.stride())}
@@ -85,8 +85,8 @@ class Resources:
             "graphs": [{"name": f"decode{count}", "kind": "decode", "handle": graph.raw_cuda_graph_exec(),
                 "sampling_mode": "general", "confidence_width": 0, "estimated_duration_ns": 0,
                 "batch_capacity": count, "token_capacity": 1, "prefill_capacity": 0,
-                "input_bindings": bindings}
-                for count, graph in zip((2,4), self.graphs)]}
+                "input_bindings": bindings, "tuned_bindings": []}
+                for count, graph in zip((2,4), self.graphs)], "tuning_graphs": []}
 
     def __del__(self):
         if self.finalizer:

@@ -42,7 +42,8 @@ class SpeculativePreparation:
         self.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
         self.verification_residual = torch.zeros((b * w, 10240), dtype=torch.bfloat16, device=device)
         self.mtp_scratch = MTPScratch.allocate(prefill_capacity, requests.capacity, device, world_size=weights.shard.world_size,
-            buffers=None if graph_buffers is None else graph_buffers.cursor())
+            buffers=None if graph_buffers is None else graph_buffers.cursor(),
+            hyperconnection_lowrank=mtp_weights.module.hyper_connection_mixer.input_mix_weight_down.weight.shape[0])
         # Feedback is consumed before the MTP mixer writes normalized activations.
         self.feedback_hidden = self.mtp_scratch.hyperconnection.normalized
         self.prefill_residual = scratch.residual

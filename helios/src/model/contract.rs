@@ -3,7 +3,7 @@
 use super::VisionCapabilities;
 use crate::{
     Result,
-    execution::{ExecutionManifest, GraphKind},
+    execution::{ExecutionManifest, GraphKind, TunedBinding},
 };
 
 macro_rules! contract_enum {
@@ -54,8 +54,8 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6, Atem = 7 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4, RecipientHeaders = 5 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
@@ -223,6 +223,7 @@ pub struct GraphContract {
     pub draft_cursor: Option<CompletionCursor>,
     pub embedding_tables: Vec<u32>,
     pub pending_token: Option<StateView>,
+    pub tuned_bindings: Vec<TunedBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -338,7 +339,7 @@ impl PreparedContract {
     }
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err("unsupported prepared model contract version; re-export the model package".into());
         }
         if self.vocabulary == 0
@@ -394,6 +395,22 @@ impl PreparedContract {
                 return Err("duplicate page-table view".into());
             }
         }
+        let protected: std::collections::HashSet<_> = manifest.tuning_graphs.iter()
+            .flat_map(|graph| graph.outputs.iter().chain(std::iter::once(&graph.status_buffer)))
+            .collect();
+        for name in &protected {
+            manifest.buffer(name)?;
+            if self.cache.regions.iter().any(|region| &region.storage.buffer == *name)
+                || self.cache.page_tables.iter().any(|view| &view.buffer == *name)
+                || self.graphs.iter().any(|graph| {
+                    graph.inputs.iter().any(|input| &input.buffer == *name)
+                        || graph.state.iter().any(|state| &state.view.buffer == *name)
+                        || graph.pending_token.as_ref().is_some_and(|view| &view.buffer == *name)
+                        || graph.draft_cursor.as_ref().is_some_and(|cursor| &cursor.state.buffer == *name)
+                }) {
+                return Err("startup tuning storage overlaps request inputs or state".into());
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for graph in &self.graphs {
             if !names.insert(&graph.graph) || !(1..=8).contains(&graph.state_rows_per_request) {
@@ -406,6 +423,14 @@ impl PreparedContract {
             let graph = self.graph(&descriptor.name)?;
             if graph.kind != descriptor.kind.try_into()? {
                 return Err("semantic graph operation differs from its execution catalog".into());
+            }
+            let semantic: std::collections::BTreeMap<_, _> = graph.tuned_bindings.iter()
+                .map(|binding| (&binding.buffer, &binding.tuning_graph)).collect();
+            let physical: std::collections::BTreeMap<_, _> = descriptor.tuned_bindings.iter()
+                .map(|binding| (&binding.buffer, &binding.tuning_graph)).collect();
+            if semantic.len() != graph.tuned_bindings.len()
+                || physical.len() != descriptor.tuned_bindings.len() || semantic != physical {
+                return Err("semantic tuned bindings differ from the execution catalog".into());
             }
             let targets: Vec<_> = graph.inputs.iter().filter(|b| b.source == ValueSource::PromptTargetToken).collect();
             if (descriptor.kind == GraphKind::ScoredPrefill && (targets.len() != 1
@@ -592,12 +617,18 @@ impl FrontendContract {
                 return Err("unsupported tool parser syntax parameters".into());
             }
         }
+        if self.tools.as_ref().is_some_and(|t| t.kind == ToolParserKind::Atem)
+            != self.reasoning.as_ref().is_some_and(|r| r.kind == ReasoningParserKind::RecipientHeaders)
+        {
+            return Err("ATEM recipient framing requires recipient-header reasoning syntax".into());
+        }
         if let Some(reasoning) = &self.reasoning {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
                 ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
+                ReasoningParserKind::RecipientHeaders => ("<|start|>assistant to=self<|message|>", "<|eom|>"),
             };
             let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
                 ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
@@ -613,6 +644,8 @@ impl FrontendContract {
                             .tools
                             .as_ref()
                             .is_none_or(|tool| tool.kind != ToolParserKind::Xtml)))
+                || (reasoning.kind == ReasoningParserKind::RecipientHeaders
+                    && (reasoning.wrapping_newlines != 0 || !reasoning.terminal_markers.is_empty()))
                 || reasoning.wrapping_newlines > 1
                 || reasoning
                     .terminal_markers
@@ -636,6 +669,78 @@ impl FrontendContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipient_syntax_requires_matching_typed_parsers_and_known_identifiers() {
+        assert_eq!(ToolParserKind::try_from(7).unwrap(), ToolParserKind::Atem);
+        assert_eq!(ReasoningParserKind::try_from(5).unwrap(), ReasoningParserKind::RecipientHeaders);
+        for value in [0, 8, 999] { assert!(ToolParserKind::try_from(value).is_err()); }
+        for value in [0, 6, 999] { assert!(ReasoningParserKind::try_from(value).is_err()); }
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {kind: ToolParserKind::Atem, wrapping_newlines: 0, tag_separator: String::new()});
+        assert!(syntax.validate().is_err());
+        syntax.reasoning = Some(ReasoningParser {kind: ReasoningParserKind::ThinkTags, open: "<think>".into(), close: "</think>".into(), wrapping_newlines: 0, terminal_markers: vec![]});
+        let reasoning = syntax.reasoning.as_mut().unwrap();
+        reasoning.kind = ReasoningParserKind::RecipientHeaders;
+        reasoning.open = "<|start|>assistant to=self<|message|>".into();
+        reasoning.close = "<|eom|>".into();
+        reasoning.wrapping_newlines = 0;
+        reasoning.terminal_markers.clear();
+        syntax.tools.as_mut().unwrap().wrapping_newlines = 0;
+        assert!(syntax.validate().is_ok());
+    }
+
+    #[test]
+    fn startup_tuning_bindings_match_transport_and_exclude_request_state() {
+        use crate::execution::{BufferDescriptor, Dtype, TuningGraphDescriptor};
+        let config = crate::model::tests::config();
+        let mut contract = config.contract.clone();
+        let mut manifest = crate::model::testing::manifest(&config);
+        let base = manifest.buffers.iter().map(|buffer| buffer.address + buffer.nbytes).max().unwrap() + 256;
+        for (index, name) in ["tuning_winner", "tuning_status"].into_iter().enumerate() {
+            manifest.buffers.push(BufferDescriptor {
+                name: name.into(), address: (base + 255) / 256 * 256 + index * 256,
+                nbytes: 4, dtype: Dtype::Int32, shape: vec![1], strides: vec![1],
+            });
+        }
+        manifest.tuning_graphs.push(TuningGraphDescriptor {
+            name: "startup_tune".into(), handle: 99999, outputs: vec!["tuning_winner".into()],
+            status_buffer: "tuning_status".into(),
+        });
+        let binding = TunedBinding { buffer: "tuning_winner".into(), tuning_graph: "startup_tune".into() };
+        manifest.graphs[0].tuned_bindings.push(binding.clone());
+        let name = manifest.graphs[0].name.clone();
+        contract.graphs.iter_mut().find(|graph| graph.graph == name).unwrap().tuned_bindings.push(binding);
+        contract.validate(&manifest).unwrap();
+        let mut wrong = contract.clone();
+        wrong.graphs.iter_mut().find(|graph| graph.graph == name).unwrap().tuned_bindings.clear();
+        assert!(wrong.validate(&manifest).unwrap_err().to_string().contains("semantic tuned bindings"));
+        let mut wrong = contract.clone();
+        let graph = wrong.graphs.iter_mut().find(|graph| graph.graph == name).unwrap();
+        graph.tuned_bindings.push(graph.tuned_bindings[0].clone());
+        assert!(wrong.validate(&manifest).unwrap_err().to_string().contains("semantic tuned bindings"));
+        for protected in [contract.graphs[0].inputs[0].buffer.clone(),
+            contract.graphs[0].state[0].view.buffer.clone()] {
+            let mut wrong_manifest = manifest.clone();
+            wrong_manifest.tuning_graphs[0].status_buffer = protected;
+            assert!(contract.validate(&wrong_manifest).unwrap_err().to_string().contains("overlaps request"));
+        }
+    }
+
+    #[test]
+    fn startup_tuning_outputs_cannot_alias_cache_storage() {
+        let config = crate::model::tests::config();
+        let mut contract = config.contract.clone();
+        let mut manifest = crate::model::testing::manifest(&config);
+        let storage = contract.graphs[0].state[0].view.clone();
+        contract.cache.regions.push(HistoryRegion {
+            kind: HistoryKind::RecurrentState, storage: storage.clone(), tokens_per_record: 1, window_tokens: 0,
+        });
+        manifest.tuning_graphs.push(crate::execution::TuningGraphDescriptor {
+            name: "tune".into(), handle: 99999, outputs: vec![storage.buffer], status_buffer: "frame_index".into(),
+        });
+        assert!(contract.validate(&manifest).unwrap_err().to_string().contains("overlaps request"));
+    }
 
     #[test]
     fn pending_token_admission_writes_are_distinct_from_generation_reads() {

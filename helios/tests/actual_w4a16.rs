@@ -5,6 +5,8 @@
 //! this test never synthesizes prepared weights or substitutes a weight-only
 //! matrix for the real weight/scale owner layout.
 
+#![cfg(feature = "runtime-package")]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,

@@ -53,10 +53,15 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 The Python distribution and source package are named `ignition`. Install the
 preparation environment with `uv sync --locked --extra prepare --extra test`,
 then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
+Preparation commands apply the bundled, version-checked Inductor and Triton patches before
+importing preparation libraries; `uv run --locked --extra prepare ignition ...`
+uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
+for patch application in standalone Python tools.
 
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
 ignition debug-serve [MODEL] [flags]             run diagnostic HTTP requests without export
+ignition bench [MODEL] [flags]                   measure complete prepared GPU graph round latency
 ignition convert PACKAGE [--output PATH] [flags]  convert a package to packed or directory form
 ```
 
@@ -64,6 +69,7 @@ Every command has exactly one name. `MODEL` is a recipe alias, a Hugging Face
 repository id with an optional `@revision`, or a local checkpoint directory;
 with no `MODEL`, `export` and `debug-serve` use `defaults.model` from the configuration file and
 fail with a usage error if it is unset.
+`bench` uses the explicit model, then `defaults.model`, then `qwen3.8-27b`.
 
 `ignition --help` and preparation-command help list every declared model alias,
 supported tensor-parallel size, and default/maximum draft count. Put an alias or
@@ -180,10 +186,71 @@ verification policy. `--history-drafts` enables host history tracking and feeds
 continuations into existing graph inputs; it does not change the captured graphs.
 `--no-history-drafts` disables those proposals. Packages exported by Ignition
 record no history preference. Package defaults fill omitted settings; explicit
-startup settings win. Serving requires execution ABI 4 and prepared model
-contract 2; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
+startup settings win. Serving requires execution ABI 5 and prepared model
+contract 3; other versions require re-export before loading. Omitted capacity flags use package defaults. Only selected
 graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
+
+### GPU graph latency benchmark
+
+`ignition bench qwen3.8-27b` prepares the real Qwen3.8-27B target and DFlash2
+draft checkpoint, captures the selected graph catalog, and measures complete
+speculative GPU rounds with CUDA events. It opens no HTTP listener and exports
+no package. The benchmark supports the Qwen3.8-27B dense recipe on one local GPU;
+other recipes fail explicitly.
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 \
+  --batches 1,4 --contexts 2048,8192 --warmup 5 --repetitions 20 --seeds 3,7,11
+```
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--batches LIST` | Distinct comma-separated request batches selected from `1,2,4` | `1,2,4` |
+| `--contexts LIST` | Distinct consumed context lengths before each measured round; positive multiples of 128 | `512,2048,8192,16384` |
+| `--verify-width N` | Target tokens per request, including the pending token; only eight is supported, with seven draft tokens | `8` |
+| `--warmup N` | Positive count of untimed restored rounds per case and seed | `5` |
+| `--repetitions N` | Timed restored rounds per case and seed | `20` |
+| `--seeds LIST` | Distinct input and sampling seeds | `0,1,2` |
+| `--output PATH` | JSON destination for configuration, device identity, per-case statistics, and raw samples | None; table still prints |
+
+The default matrix contains twelve cases: each batch at each context, with
+verification width eight and aggregate target rows `P = B × 8`. Seven draft
+tokens plus one pending token form each request's verification block. The
+speculative token capacity remains 128 unless configuration or an explicit flag
+overrides it. Preparation accepts the normal GPU, memory, cache, compiler,
+autotuning, precision, and overlap settings. Omitted concurrency defaults to the
+largest selected batch; configured and explicit capacities must cover it.
+The prepared request capacity is the largest selected batch. JSON distinguishes
+that capacity from the concurrency requested through configuration or flags.
+`--no-mtp`, mixed prefill, and prompt-logprob graphs do not apply.
+
+Each case starts from a real tokenized and prefilled context. Context length
+counts consumed positions before the pending token. Complete cache and
+speculative state restoration occurs outside CUDA timing before every round.
+A same-device snapshot retains one additional complete mutable-state copy
+(about 3.8 GiB for the default matrix); weights and disposable scratch are not
+duplicated. Snapshot allocation and copies occur outside the measured interval.
+Benchmark requests use the supported `ignore_eos` stop policy to preserve fixed
+round widths: sampled EOS tokens remain real pending and accepted tokens, while
+EOS does not end the request. Sampling, proposal probabilities, and acceptance
+are unchanged. JSON records `ignore_eos: true`.
+Timing includes draft proposals, target verification, vocabulary projection,
+sampling, and state commit. Preparation, context prefill, state restoration,
+native scheduling, and HTTP are outside the measured interval.
+
+The table reports each case's median and interquartile range in milliseconds.
+The aggregate is the equal-weight arithmetic mean of case medians, with lower
+values better. Equal weights describe matrix coverage rather than production
+traffic. JSON retains every sample by seed. Progress prints after each seed and
+updates `--output` with device identity, preparation configuration, and available
+raw samples. Successful results have `status: complete`. A failed run preserves
+partial samples with `status: incomplete`, its failure, and per-case completion
+flags; it has no aggregate score. Scores from different GPU classes
+remain separate. These measurements support graph optimization; serving
+throughput and comparisons against other runtimes still require exported
+packages running through `flare run`.
 
 ## 3. Parameters
 
@@ -247,7 +314,11 @@ explicit flags take precedence.
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | Recipe default: `bf16` for DeepSeek V4.1, `auto` otherwise |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
-| `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x autotuning, then reset driver clock defaults. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
+| `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
+| `--shard-hyperconnections` | Partition Qwen3.8 Flash target and MTP hyperconnection bottlenecks across TP ranks and all-reduce BF16 gate logits before sigmoid. Requires TP2 or TP4. Command line only; changing it requires re-export. | off (replicated) |
+| `--collective-ladder PATH` | JSON file of final joint collective geometries and runtime profiles. Required when the resolved collective tuning policy is `runtime`; rejected with `static`. See [offline ladders](../ignition/preparation/ladders/README.md). | None |
+| `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime uses the required ladder file for final compiled geometry and captures runtime submode/active-CTA selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
+| `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
@@ -797,7 +868,7 @@ selects a destination and `--form` selects packed or directory form. Conversion
 leaves its source intact. Conversion rejects logical-resource containers;
 export them again with Ignition to obtain a payload package. Serving accepts
 payload format 2 and signed format-6 logical-resource containers, both requiring
-execution ABI 4 and prepared model contract 2. Other execution ABI or prepared
+execution ABI 5 and prepared model contract 3. Other execution ABI or prepared
 contract versions require re-export.
 
 The printed cache entry is self-contained and can be uploaded to the recipe's
@@ -937,12 +1008,14 @@ max_concurrency = 4
 [preparation]
 # compile_workers = 24           # Optional CPU process budget per host.
 # autotune_effort = "default"     # off, default, audit.
+# collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
 
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
 
 [prefix_cache]
 memory = ""                      # Host retention budget; empty: disabled.
+drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
 disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
 disk_transport = ""              # Empty: staged; also accepts direct.
 
@@ -1021,6 +1094,7 @@ Configuration assigns each decision to one owner:
 | Weight format, KV precision, page geometry, kernel plans | Checkpoint metadata and recipe preparation |
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
+| Collective selection | `--collective-tuning`, then `[preparation] collective_tuning`, otherwise the recipe default (`static`) |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |
@@ -1039,6 +1113,20 @@ in the [host retention design](prefix-cache-offload.md). Both tiers remain
 disabled unless configured. The memory setting includes registered checkpoint
 slabs and ordinary retained CPU inputs; bounded transfer, preprocessing, and
 decoded-source windows are accounted for separately at startup.
+
+`--prefix-cache-pool ADDRESS` accepts `unix:PATH` for a local socket,
+`HOST:PORT` for plain TCP, or `tls:HOST:PORT` for TLS. Network
+addresses require a nonempty host and a port from 1 through 65535; IPv6
+addresses use brackets, for example `[::1]:7000` or `tls:[::1]:7000`.
+The manager's `--name` supplies the pool salt for scope and instance identities.
+`--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
+without it, TLS verifies the manager against the host's trust store. A CA
+cannot be used with a Unix socket or plaintext address. A manager declaring
+a different encryption setting disables the pool for TCP clients. Unix-socket
+clients trust filesystem permissions and can use the same TLS manager. The CA
+requires the pool flag. These command-line options are forwarded to
+every rank and have no configuration-file key. See
+[the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
 
 ## 4. Derived settings
 

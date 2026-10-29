@@ -61,13 +61,14 @@ speculative_token_capacity = 8
 
 
 def test_prefix_cache_settings_validate(tmp_path):
-    configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\ndisk_transport = \"direct\"\n")
+    configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\n")
     assert configuration.get("prefix_cache.memory") == Setting("4G", "[prefix_cache]")
     assert configuration.directory("prefix_cache") is None
     with pytest.raises(UsageError, match="prefix_cache disk_limit"):
         load(tmp_path, "[prefix_cache]\ndisk_limit = \"lots\"\n")
-    with pytest.raises(UsageError, match="disk_transport"):
-        load(tmp_path, "[prefix_cache]\ndisk_transport = \"nvme\"\n")
+    for transport in ("nvme", "staged", "direct"):
+        with pytest.raises(UsageError, match="disk_transport"):
+            load(tmp_path, f'[prefix_cache]\ndisk_transport = "{transport}"\n')
 
 
 def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):
@@ -159,3 +160,33 @@ def test_autotune_effort_configuration_and_flag_precedence(tmp_path, effort):
     for legacy in ("exhaustive", "medium", "max"):
         with pytest.raises(UsageError, match="autotune_effort"):
             load(tmp_path, f'[preparation]\nautotune_effort = "{legacy}"\n')
+
+
+@pytest.mark.parametrize("recipe_mode", ["static", "runtime"])
+@pytest.mark.parametrize("configured", [None, "static", "runtime"])
+@pytest.mark.parametrize("flag", [None, "static", "runtime"])
+def test_collective_tuning_resolves_flag_configuration_and_recipe(tmp_path, recipe_mode, configured, flag):
+    from types import SimpleNamespace
+    from ignition.cli.preparation import collective_tuning_mode
+
+    config = load(tmp_path, "" if configured is None else f'[preparation]\ncollective_tuning = "{configured}"\n')
+    model = SimpleNamespace(recipe=SimpleNamespace(collective_tuning=recipe_mode))
+    assert collective_tuning_mode(config, model, flag) == (flag or configured or recipe_mode)
+
+
+def test_collective_tuning_rejects_unknown_policy(tmp_path):
+    with pytest.raises(UsageError, match="collective_tuning must be static or runtime"):
+        load(tmp_path, '[preparation]\ncollective_tuning = "dynamic"')
+
+
+@pytest.mark.parametrize("value", ["on", "off", "0", "90s", "1.5m", "20ms", "2h", "0.001"])
+def test_shutdown_drain_configuration(tmp_path, value):
+    config = load(tmp_path, f'[prefix_cache]\ndrain_on_shutdown = "{value}"\n')
+    assert config.get("prefix_cache.drain_on_shutdown").value == value
+    assert config.get("prefix_cache.drain_on_shutdown", "off").value == "off"
+
+
+@pytest.mark.parametrize("value", ["-1", "NaN", "inf", "1e30h", "later", "0s"])
+def test_invalid_shutdown_drain_configuration(tmp_path, value):
+    with pytest.raises(UsageError, match="drain_on_shutdown"):
+        load(tmp_path, f'[prefix_cache]\ndrain_on_shutdown = "{value}"\n')

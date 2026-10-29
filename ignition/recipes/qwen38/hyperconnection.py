@@ -9,10 +9,21 @@ import torch
 from b12x.norm import hyperconnection as hc
 from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 
-from ignition.components.hyperconnection_gate import PreparedHyperconnectionGate
+from ignition.components.hyperconnection_gate import PreparedHyperconnectionGate, PreparedShardedHyperconnectionGate
 from ignition.components.linear import UnquantizedProjection
 from ignition.preparation.fixtures import hyperconnection as hc_fixtures
 from ignition.preparation.tuning import declare, register_finalizer
+
+
+def hyperconnection_extents(shard, sharded: bool):
+    """Partition the lowrank axis while retaining normalization and injection weights."""
+    if not sharded:
+        return {}
+    if shard.world_size < 2:
+        raise ValueError("hyperconnection sharding requires tensor parallelism")
+    lowrank = slice(*shard.partition(320, alignment=16))
+    return {"input_mix_weight_down.weight": lowrank,
+            "input_mix_weight_up.weight": (slice(None), lowrank)}
 
 
 def packed_down_projection(module: torch.nn.Module) -> torch.Tensor:
@@ -37,8 +48,8 @@ def packed_down_projection(module: torch.nn.Module) -> torch.Tensor:
 class HyperconnectionScratch:
     """Shared activations and transient storage for serialized mixers.
 
-    Gate workspace is not an observable intermediate: fused plans do not
-    materialize projection logits.
+    Gate workspace holds local partial logits for sharded mixers and private
+    scratch for fused replicated mixers. Reduced logits have separate storage.
     """
 
     normalized: torch.Tensor
@@ -48,26 +59,31 @@ class HyperconnectionScratch:
     injection_logits: torch.Tensor
     block_input: torch.Tensor
     down_and_injection: torch.Tensor
+    gate_logits: torch.Tensor | None = None
 
     @classmethod
     def allocate(cls, tokens: int, device: torch.device, *, buffers=None, projected=None,
-                 block_input=None) -> HyperconnectionScratch:
+                 block_input=None, lowrank: int = 320) -> HyperconnectionScratch:
         if tokens <= 0:
             raise ValueError("hyperconnection token capacity must be positive")
+        if lowrank not in (80, 160, 320):
+            raise ValueError("Qwen hyperconnection lowrank must be 320, 160 or 80")
         def zeros(width):
             return (torch.zeros((tokens, width), device=device, dtype=torch.bfloat16) if buffers is None
                     else buffers.zeros((tokens, width), torch.bfloat16))
         normalized = zeros(10240)
-        projected = zeros(336) if projected is None else projected
-        bottleneck, gate_workspace = zeros(320), zeros(10240)
+        projected = zeros((lowrank + 4 + 15) // 16 * 16) if projected is None else projected
+        bottleneck, gate_workspace = zeros(lowrank), zeros(10240)
         block_input = zeros(2560) if block_input is None else block_input
-        return cls(normalized, projected[:, :320], bottleneck, gate_workspace,
-                   projected[:, 320:324], block_input, projected)
+        return cls(normalized, projected[:, :lowrank], bottleneck, gate_workspace,
+                   projected[:, lowrank:lowrank + 4], block_input, projected,
+                   zeros(10240) if lowrank < 320 else None)
 
     def rows(self, tokens: int) -> HyperconnectionScratch:
         if not 0 < tokens <= self.normalized.shape[0]:
             raise ValueError("hyperconnection rows exceed scratch capacity")
-        return HyperconnectionScratch(*(getattr(self, field)[:tokens] for field in self.__dataclass_fields__))
+        return HyperconnectionScratch(*(None if (value := getattr(self, field)) is None else value[:tokens]
+                                       for field in self.__dataclass_fields__))
 
     def priming_arguments(self, source: torch.Tensor, norm_gain: torch.Tensor):
         """Borrow a zero-initialized source kept unchanged until preparation ends."""
@@ -77,6 +93,8 @@ class HyperconnectionScratch:
             raise ValueError("hyperconnection priming source must match normalized shape, stride, dtype and device")
         start, end = source.data_ptr(), source.data_ptr() + source.nbytes
         def overlaps(tensor):
+            if tensor is None:
+                return False
             extent = (1 + sum((n - 1) * stride for n, stride in zip(tensor.shape, tensor.stride()))) * tensor.element_size()
             return tensor.numel() > 0 and start < tensor.data_ptr() + extent and tensor.data_ptr() < end
         if any(overlaps(getattr(self, field)) for field in self.__dataclass_fields__):
@@ -104,6 +122,8 @@ class PreparedHyperconnection:
         priming_state: torch.Tensor,
         session: PreparationSession,
         name: str,
+        runtime=None,
+        coordinator=None,
     ) -> None:
         if module.hc_count != 4 or module.hidden_size != 2560:
             raise ValueError("Qwen hyperconnection requires four streams of width 2560")
@@ -116,7 +136,15 @@ class PreparedHyperconnection:
         if tuple(self.norm_gain.shape) != (10240,):
             raise ValueError("hyperconnection norm weight must have 10240 elements")
         self.tokens = scratch.normalized.shape[0]
-        caps = hc.Caps(device=device, max_tokens=self.tokens, hidden_size=2560, streams=4, lowrank=320)
+        self.lowrank = module.input_mix_weight_down.weight.shape[0]
+        if scratch.bottleneck.shape[1] != self.lowrank:
+            raise ValueError("hyperconnection weights and scratch have different lowrank widths")
+        sharded = self.lowrank < 320
+        if sharded and (runtime is None or self.lowrank * runtime.world_size != 320):
+            raise ValueError("sharded hyperconnections require a matching TP collective")
+        if sharded != (scratch.gate_logits is not None):
+            raise ValueError("sharded hyperconnections require separate reduced-logit storage")
+        caps = hc.Caps(device=device, max_tokens=self.tokens, hidden_size=2560, streams=4, lowrank=self.lowrank)
         self.plans = {}
         self.bindings = {}
         priming_arguments = scratch.priming_arguments(priming_state, self.norm_gain)
@@ -150,9 +178,14 @@ class PreparedHyperconnection:
         down_output = scratch.projected_down if self.injection is None else scratch.down_and_injection
         self.down = UnquantizedProjection(scratch.normalized, packed_down_projection(module),
             down_output, session=session, name=f"{name}.down")
-        self.gate = PreparedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
-            scratch.normalized, scratch.block_input, scratch.gate_workspace,
-            session=session, name=f"{name}.gate")
+        if sharded:
+            self.gate = PreparedShardedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
+                scratch.normalized, scratch.block_input, scratch.gate_workspace, scratch.gate_logits,
+                runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.gate")
+        else:
+            self.gate = PreparedHyperconnectionGate(scratch.bottleneck, module.input_mix_weight_up.weight,
+                scratch.normalized, scratch.block_input, scratch.gate_workspace,
+                session=session, name=f"{name}.gate")
 
     def prepare_combine_norm(self, following: PreparedHyperconnection, *,
                              priming_state: torch.Tensor, session: PreparationSession,
@@ -161,7 +194,7 @@ class PreparedHyperconnection:
             raise ValueError("the final hyperconnection mixer has no residual injection")
         self.following = following
         caps = hc.Caps(device=self.scratch.normalized.device, max_tokens=self.tokens,
-                       hidden_size=2560, streams=4, lowrank=320)
+                       hidden_size=2560, streams=4, lowrank=self.lowrank)
         plan = hc.plan(caps, invocation=FrozenMapping({"operation": "combine_norm",
             "eps": following.eps, "zero_centered": False, "weight_dtype": "float32",
             "output_mode": "provided"}))

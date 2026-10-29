@@ -3,6 +3,8 @@
 //! path; this test only reads exports and drives the public Helios cache
 //! acquisition/materializer.
 
+#![cfg(feature = "runtime-package")]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -11,7 +13,7 @@ use std::{
 };
 
 use flare_helios::package::{
-    cache, container, derivation, naming, progress, protection, reader, schema::wire,
+    cache, derivation, naming, progress, protection, reader, schema::wire,
 };
 use flare_helios::runtime_package::Publisher;
 use prost::Message as _;

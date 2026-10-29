@@ -147,7 +147,13 @@ winner; component names do not identify separate tuning workloads.
 order. Each candidate executes on the whole TP group and is scored by the slowest
 rank. `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
-No tuning coordination runs after graph handoff.
+Preparation-time search ends before graph handoff. With `--collective-tuning
+runtime`, the required `--collective-ladder PATH` file supplies final compiled
+geometries for eligible plain BF16 PCIe reductions. These pinned plans do not
+race geometries during preparation, including with `--autotune-effort off`.
+Captured tuning graphs select among the supplied submode/active-CTA profiles
+before serving begins; native rank coordination only launches those graphs and
+waits for their completion. See the [ladder format](../ignition/preparation/ladders/README.md).
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles
@@ -157,7 +163,14 @@ No tuning coordination runs after graph handoff.
   budgeted for their host's ranks. Ranks on one host share its cache directory;
   ranks on other hosts receive the artifacts they lack. Every rank loads the same
   artifacts, binds its tensors and native handles, and participates in ordered
-  warmup and local capture. Keep shard offsets and native handles in runtime
+  warmup and local capture. Inductor's first owner-process warmup may tune the
+  same generated kernel independently on several ranks. At each complete-forward
+  boundary, ranks adopt one measured selection and compiled kernel for each exact
+  generated source and candidate contract, with only the CUDA ordinal normalized.
+  The first canonical selection remains authoritative across the complete catalog.
+  A second warmup verifies the frozen selections before capture; cached artifacts
+  retain those selections on single-rank and tensor-parallel reloads. No selection
+  exchange occurs inside a forward or a native collective. Keep shard offsets and native handles in runtime
   bindings when they do not change the computation. For distinct rank behavior,
   select a variant key through `compilation_variant` on each rank. Every
   selected variant must compile before collective warmup; ranks must not retrace

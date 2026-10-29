@@ -1,0 +1,134 @@
+"""Benchmark CLI workload selection and GPU latency presentation."""
+
+import json
+
+import pytest
+
+from ignition.cli import _parser, main
+from ignition.cli.bench import Settings, table, write_result
+from ignition.errors import UsageError
+
+
+def settings(*flags):
+    return Settings.from_args(_parser().parse_args(["bench", *flags]))
+
+
+def test_default_matrix_and_measurement_counts():
+    value = settings()
+    assert value.batches == (1, 2, 4)
+    assert value.contexts == (512, 2048, 8192, 16384)
+    assert value.width == 8
+    assert value.warmup == 5
+    assert value.repetitions == 20
+    assert value.seeds == (0, 1, 2)
+    assert [(batch, value.width, batch * value.width) for batch in value.batches] == [
+        (1, 8, 8), (2, 8, 16), (4, 8, 32)]
+
+
+def test_explicit_workload_and_preparation_options(tmp_path):
+    args = _parser().parse_args(["bench", "qwen3.8-27b", "--batches", "2,4", "--contexts", "2048,8192",
+        "--verify-width", "8", "--mtp-draft-tokens", "7", "--seeds", "14,29", "--warmup", "2",
+        "--repetitions", "7", "--output", str(tmp_path / "rounds.json"), "--gpus", "3",
+        "--compile-workers", "12", "--autotune-effort", "off", "--speculative-token-capacity", "128"])
+    value = Settings.from_args(args)
+    assert (value.batches, value.contexts, value.width) == ((2, 4), (2048, 8192), 8)
+    assert (value.warmup, value.repetitions, value.seeds) == (2, 7, (14, 29))
+    assert (args.gpus, args.compile_workers, args.autotune_effort, args.speculative_token_capacity) == (
+        "3", 12, "off", 128)
+    assert args.output == tmp_path / "rounds.json"
+
+
+def test_explicit_draft_count_and_unordered_selections():
+    value = settings("--mtp-draft-tokens", "7", "--batches", "4,1", "--contexts", "2048,512")
+    assert value.width == 8
+    assert value.batches == (1, 4)
+    assert value.contexts == (512, 2048)
+
+
+@pytest.mark.parametrize("flags,message", [
+    (("--verify-width", "4", "--mtp-draft-tokens", "7"), "must equal"),
+    (("--verify-width", "9"), "requires --verify-width 8"),
+    (("--verify-width", "4"), "requires --verify-width 8"),
+    (("--mtp-draft-tokens", "3"), "requires --verify-width 8"),
+    (("--batches", "0"), "from 1,2,4"),
+    (("--batches", "8"), "from 1,2,4"),
+    (("--contexts", "0"), "positive multiples"),
+    (("--contexts", "513"), "positive multiples"),
+    (("--warmup", "-1"), "positive"),
+    (("--warmup", "0"), "positive"),
+    (("--repetitions", "0"), "positive"),
+    (("--seeds", "-1"), "0 through"),
+    (("--no-mtp",), "requires DFlash2 state"),
+    (("--mixed-prefill",), "speculative rounds"),
+    (("--prompt-logprobs",), "speculative rounds"),
+    (("--official-source", "https://example.com/model"), "package publishing"),
+])
+def test_invalid_measurement_settings(flags, message):
+    with pytest.raises(UsageError, match=message):
+        settings(*flags)
+
+
+@pytest.mark.parametrize("flag,value", [("--batches", "1,1"), ("--contexts", "512,"), ("--seeds", "x")])
+def test_malformed_lists_are_usage_errors(flag, value):
+    with pytest.raises(SystemExit) as error:
+        _parser().parse_args(["bench", flag, value])
+    assert error.value.code == 2
+
+
+def test_bench_help_describes_measured_boundary(capsys):
+    with pytest.raises(SystemExit) as error:
+        main(["bench", "--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "Qwen3.8-27B DFlash2 only" in output
+    assert "excludes preparation" in output
+    assert "not serving throughput" in output
+    assert "--repetitions" in output
+
+
+def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text("")
+    assert main(["bench", "qwen3.8-flash", "--config", str(config)]) == 2
+    assert "supports only the Qwen3.8-27B DFlash2 recipe" in capsys.readouterr().err
+
+
+def test_report_keeps_case_latency_and_equal_weight_score_separate(tmp_path, capsys):
+    result = {"device": {"name": "NVIDIA RTX PRO 6000 Blackwell", "capability": [12, 0]},
+        "aggregate_ms": 3.5,
+        "cases": [{"batch": 1, "width": 8, "packed_tokens": 8, "context_tokens": 512,
+                   "median_ms": 2.0, "p25_ms": 1.8, "p75_ms": 2.2,
+                   "samples": [{"seed": 0, "times_ms": [1.8, 2.0, 2.2]}]},
+                  {"batch": 4, "width": 8, "packed_tokens": 32, "context_tokens": 8192,
+                   "median_ms": 5.0, "p25_ms": 4.8, "p75_ms": 5.2}]}
+    text = table(json.loads(json.dumps(result)))
+    assert "SM120" in text
+    assert "2.0000" in text and "5.0000" in text
+    assert "1.8000–2.2000" in text
+    assert "Equal-weight mean of case medians: 3.5000 ms" in text
+    assert "lower is better" in text
+    assert "GPU class scores are separate" in text
+    destination = tmp_path / "rounds.json"
+    write_result(result, destination)
+    assert capsys.readouterr().out.strip() == text
+    assert json.loads(destination.read_text()) == result
+
+
+def test_json_write_failure_reports_destination(tmp_path):
+    result = {"device": {"name": "NVIDIA GB10", "capability": [12, 1]}, "aggregate_ms": 1.0, "cases": []}
+    with pytest.raises(UsageError, match="cannot write benchmark JSON"):
+        write_result(result, tmp_path / "missing" / "rounds.json")
+
+
+def test_partial_result_is_saved_without_printing_success_table(tmp_path, capsys):
+    from ignition.cli.bench import save_result
+
+    result = {"status": "incomplete", "ignore_eos": True, "failure": "invalid completion",
+              "device": {"name": "NVIDIA GB10", "capability": [12, 1]},
+              "configuration": {"compiled_forwards": True},
+              "cases": [{"complete": False, "samples": [{"seed": 0, "times_ms": [1.2]}]}]}
+    output = tmp_path / "rounds.json"
+    save_result(result, output)
+    assert json.loads(output.read_text()) == result
+    assert "aggregate_ms" not in json.loads(output.read_text())
+    assert capsys.readouterr().out == ""

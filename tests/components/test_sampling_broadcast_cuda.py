@@ -31,7 +31,7 @@ class SamplingRound:
     def results(self):
         return (self.ids, self.probabilities, self.valid, self.sampled, self.offset, self.seed,
                 self.verify.seed_bits, self.verify.offset,
-                *(value for name, value in vars(self.verify.output).items() if name != 'survival'),
+                *vars(self.verify.output).values(),
                 self.verify.rng.generation, self.verify.rng.target_offset,
                 self.verify.state.seed.view(torch.int64), self.verify.state.rng_counter.view(torch.int64))
 
@@ -163,17 +163,33 @@ def _rank(rank, world, rendezvous, result_channel=False, divergent_invalid=False
                 completion = worker.poll(timeout_ms=120000)
                 assert completion is not None and completion.ticket == ticket and completion.error is None
                 assert allocations == torch.cuda.memory_stats()["allocation.all.allocated"]
-                for actual, expected in zip(owners[index].results(), references[index], strict=True):
-                    assert torch.equal(actual.cpu(), expected)
+                for field, (actual, expected) in enumerate(zip(owners[index].results(), references[index], strict=True)):
+                    actual_host = actual.cpu()
+                    if actual is owners[index].verify.output.survival:
+                        root_survival = [actual_host if rank == 0 else None]
+                        dist.broadcast_object_list(root_survival, src=0)
+                        assert torch.equal(actual_host, root_survival[0]), (
+                            f"rank {rank}, graph {index}: survival differs from rank zero"
+                        )
+                        torch.testing.assert_close(actual_host, expected, rtol=1e-6, atol=0)
+                    else:
+                        assert torch.equal(actual_host, expected), (
+                            f"rank {rank}, graph {index}, result field {field}: "
+                            f"{int((actual_host != expected).sum())} differing entries"
+                        )
                 verify = owners[index].verify
                 if verify.drafts.shape[1]:
                     indices = verify.safe_ids.long().unsqueeze(-1)
                     draft = verify.safe_draft_probs.gather(-1, indices).squeeze(-1)
                     target = verify.safe_target_probs[:, :-1].gather(-1, indices).squeeze(-1)
                     expected = torch.where(draft > 0, (target / draft).clamp(max=1.), (target > 0).float()).cumprod(-1)
-                    actual = verify.output.survival[:, :verify.drafts.shape[1]]
+                    # The broadcast commits rank zero's survival law, even when
+                    # the peers deliberately supply different local distributions.
+                    root_expected = [expected.cpu() if rank == 0 else None]
+                    dist.broadcast_object_list(root_expected, src=0)
+                    actual = verify.output.survival[:, :verify.drafts.shape[1]].cpu()
                     observed = actual >= 0
-                    torch.testing.assert_close(actual[observed], expected[observed])
+                    torch.testing.assert_close(actual[observed], root_expected[0][observed], rtol=1e-6, atol=0)
             worker.close()
             worker = None
     finally:

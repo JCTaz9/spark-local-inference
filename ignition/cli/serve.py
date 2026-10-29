@@ -9,9 +9,11 @@ from dataclasses import replace
 
 from ignition import planning
 from ignition.errors import CapacityError, FlareError, PreparationError, UsageError
+from ignition.preparation.collective_ladder import resolve as resolve_collective_ladder
 
 from . import display, environment
-from .preparation import (Host, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+
+from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -194,9 +196,13 @@ def _export_hosts(args):
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
+    collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations)
+                   collective_tuning=collective_mode,
+                   collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -260,7 +266,9 @@ def _prepare(args):
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                      shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -281,6 +289,7 @@ def _prepare(args):
             serial += " · experimental RoCE ring (native neighbor relays)"
         if plan.roce_chain:
             serial += " · experimental RoCE chain (native neighbor relays, open ends)"
+        ladder_name = f" · ladder {plan.collective_ladder['name']}" if plan.collective_ladder is not None else ""
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
@@ -289,8 +298,10 @@ def _prepare(args):
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
-                     f" · autotune effort {plan.autotune_effort}"
-                     f"{' · native dense activations' if plan.native_dense_activations else ''}")
+                     f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
+                     f"{' · native dense activations' if plan.native_dense_activations else ''}"
+                     f"{' · joint tuning' if plan.joint_tuning else ''}"
+                     f"{' · BF16 sharded hyperconnections' if plan.shard_hyperconnections else ''}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -443,9 +454,13 @@ def debug_serve(args) -> int:
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+    collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations)
+                   collective_tuning=collective_mode,
+                   collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
@@ -456,7 +471,7 @@ def debug_serve(args) -> int:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):
             raise UsageError("--history-drafts requires enabled learned speculation")
         options["history_drafts"] = args.history_drafts
-    preparation_options = {} if args.direct else {"retain_graphs": True}
+    preparation_options = {}
     storage = None
     if rendezvous is None:
         import torch

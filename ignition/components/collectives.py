@@ -54,6 +54,8 @@ def _roce_plan(runtime, coordinator, surface):
 @torch.library.custom_op("flare::pcie_all_reduce", mutates_args=("output",))
 def _all_reduce(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
     owner.runtime.all_reduce(source, out=output, plan=owner.plan)
 
 
@@ -76,6 +78,7 @@ class PreparedAllReduce:
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
@@ -118,7 +121,29 @@ class PreparedAllReduce:
             if (runtime.world_size < 2 or runtime.algorithm != "oneshot"
                     or not runtime.single_channel):
                 raise ValueError("prepared PCIe reductions require single-channel b12x direct all-reduce")
-            self.plan = runtime.plan(source, out=output)
+            from b12x.comm.pcie import CollectiveConfig
+
+            channel = runtime.for_stream()
+            startup_joint = (getattr(session, "collective_tuning", "static") == "runtime"
+                             and source.dtype == torch.bfloat16
+                             and getattr(channel, "_joint_workspace", None) is not None)
+            plan_options = {}
+            if startup_joint:
+                from ignition.preparation.collective_ladder import select
+
+                ladder = session.collective_ladder
+                if ladder is None:
+                    raise ValueError("runtime collective tuning requires a collective ladder")
+                row = select(ladder, source.numel() * source.element_size(), world_size=runtime.world_size,
+                             capability=torch.cuda.get_device_capability(source.device),
+                             inplace=source.data_ptr() == output.data_ptr())
+                self.runtime_profiles = tuple((mode, active) for mode, counts in row["profiles"].items() for active in counts)
+                self.runtime_cache_policy = ladder["cache_policy"]
+                # One active CTA is legal at every payload; runtime selects from the supplied profiles.
+                plan_options = dict(joint_only=True, override=CollectiveConfig(
+                    implementation=row["implementation"], threads=row["threads"], blocks=row["blocks"],
+                    submode=self.runtime_profiles[0][0], active_blocks=1))
+            self.plan = runtime.plan(source, out=output, **plan_options)
             group = runtime.exchange_group
 
             def prepare(state):
@@ -134,6 +159,9 @@ class PreparedAllReduce:
         request = self.plan.request(name=name, prepare_call=prepare,
             collective=CollectiveRequirement(key=name, ranks=ranks))
         declare(session, (request,), coordinator=coordinator)
+        if startup_joint:
+            from ignition.preparation.startup_tuning import register_collective
+            register_collective(self, session)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 

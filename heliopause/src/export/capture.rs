@@ -845,7 +845,10 @@ impl<'a> Downloader<'a> {
                 address + (index * Self::CHUNK) as u64,
                 chunk.len(),
                 self.stream
-            )?;
+            ).map_err(|error| invalid(format!(
+                "reading {memory} storage at {:#x}+{}: {error}",
+                address + (index * Self::CHUNK) as u64, chunk.len()
+            )))?;
             self.drain()?;
             chunk.copy_from_slice(unsafe {
                 std::slice::from_raw_parts(pointer.cast::<u8>(), chunk.len())
@@ -904,7 +907,10 @@ impl<'a> Downloader<'a> {
                 allocation.address + offset,
                 size,
                 self.stream
-            )?;
+            ).map_err(|error| invalid(format!(
+                "scanning allocation {:?} ({}) at {:#x}+{}, offset {offset}: {error}",
+                allocation.name, allocation.memory, allocation.address + offset, size
+            )))?;
             cu!(
                 self.cuda,
                 "cuEventRecord",
@@ -1055,12 +1061,6 @@ fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResul
         .into_iter()
         .enumerate()
         .map(|(index, (start, end, spans))| {
-            let spans = merge_ranges(
-                spans
-                    .into_iter()
-                    .map(|(address, size)| (address, address + size))
-                    .collect(),
-            );
             Ok(Allocation {
                 name: format!("external-{index}"),
                 address: start,
@@ -1073,7 +1073,8 @@ fn external_allocations(mut spans: Vec<(u64, u64)>, granule: u64) -> ExportResul
                 snapshot_spans: Some(
                     spans
                         .into_iter()
-                        .map(|(address, stop)| (address - start, stop - address))
+                        // Adjacent CUDA allocations require separate device transfers.
+                        .map(|(address, size)| (address - start, size))
                         .collect(),
                 ),
                 sizing: None,
@@ -1273,7 +1274,8 @@ struct PackedDownload<'a, 'b> {
 impl PackedDownload<'_, '_> {
     fn queue(&mut self, index: usize, offset: u64) -> ExportResult<()> {
         let count = (self.size - offset).min(Downloader::CHUNK as u64) as usize;
-        let slot = &mut self.downloader.slots[index];
+        let downloader = &mut self.downloader;
+        let slot = &mut downloader.slots[index];
         slot.offset = offset;
         slot.nbytes = count;
         let mut logical = 0;
@@ -1285,19 +1287,23 @@ impl PackedDownload<'_, '_> {
             }
             let relative = offset.saturating_sub(logical);
             let bytes = (length - relative).min((count - copied) as u64) as usize;
-            self.downloader.drained = false;
-            self.downloader.downloaded += bytes as u64;
-            #[cfg(test)]
-            { self.downloader.copies += 1; }
-            cu!(
-                self.downloader.cuda,
-                "cuMemcpyDtoHAsync_v2",
-                (Handle, u64, usize, Handle),
-                slot.pointer.cast::<u8>().wrapping_add(copied).cast(),
-                self.allocation.address + start + relative,
-                bytes,
-                self.downloader.stream
-            )?;
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(slot.pointer.cast::<u8>().add(copied), bytes)
+            };
+            let whole = [(0, self.allocation.nbytes)];
+            let ranges = self.allocation.snapshot_spans.as_deref().unwrap_or(&whole);
+            copy_recorded_ranges(ranges, self.allocation.nbytes, start + relative, output, |source, output| {
+                downloader.drained = false;
+                downloader.downloaded += output.len() as u64;
+                #[cfg(test)]
+                { downloader.copies += 1; }
+                cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
+                    output.as_mut_ptr().cast(), self.allocation.address + source, output.len(), downloader.stream)
+                    .map_err(|error| invalid(format!(
+                        "packing allocation {:?} at {:#x}+{}: {error}",
+                        self.allocation.name, self.allocation.address + source, output.len()
+                    )))
+            })?;
             copied += bytes;
             logical += length;
             if copied == count {
@@ -1310,11 +1316,11 @@ impl PackedDownload<'_, '_> {
             ));
         }
         cu!(
-            self.downloader.cuda,
+            downloader.cuda,
             "cuEventRecord",
             (Handle, Handle),
             slot.event,
-            self.downloader.stream
+            downloader.stream
         )?;
         self.pending.push_back(index);
         self.next = offset + count as u64;
@@ -1441,7 +1447,11 @@ impl<'a, 'cuda> WeightDownload<'a, 'cuda> {
                 #[cfg(test)]
                 { downloader.copies += 1; }
                 cu!(downloader.cuda, "cuMemcpyDtoHAsync_v2", (Handle, u64, usize, Handle),
-                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)?;
+                    output.as_mut_ptr().cast(), allocation.address + offset, output.len(), downloader.stream)
+                    .map_err(|error| invalid(format!(
+                        "reading weight allocation {:?} at {:#x}+{}: {error}",
+                        allocation.name, allocation.address + offset, output.len()
+                    )))?;
             }
             Ok(())
         })?;
@@ -1846,10 +1856,11 @@ pub(super) fn resolve_staged_weight_payload(
     request: &CaptureRequest,
     output: &mut RankOutput,
 ) -> ExportResult<Option<WeightPayloadSources>> {
-    resolve_weight_payload(request, output, None)
+    resolve_weight_payload(request, &output.allocations.clone(), output, None)
 }
 fn resolve_weight_payload(
     request: &CaptureRequest,
+    all_allocations: &[Allocation],
     output: &mut RankOutput,
     device: Option<(&mut Downloader<'_>, &[Allocation])>,
 ) -> ExportResult<Option<WeightPayloadSources>> {
@@ -1857,10 +1868,10 @@ fn resolve_weight_payload(
         return Ok(None);
     };
     let declaration: weight_payload::WeightPayloadDeclaration = serde_json::from_value(declaration)?;
-    let allocations = weight_allocations(&output.allocations);
+    let allocations = weight_allocations(all_allocations);
     if allocations.is_empty() {
         return Err(invalid(
-            "weight declarations require retained allocations with recorded addresses",
+            "weight declarations require capture allocations with recorded addresses",
         ));
     }
     let views: Vec<super::WeightPayloadView> = declaration
@@ -1876,8 +1887,11 @@ fn resolve_weight_payload(
             statistics_domain: view.statistics_domain.clone(),
         })
         .collect();
-    let catalog = weight_payload::extract(
+    let retained_allocations = weight_allocations(&output.allocations);
+    let retained = retained_allocations.iter().map(|a| a.name.as_str()).collect();
+    let catalog = weight_payload::extract_retained(
         &declaration.into_request(allocations, request.zero_ranges.clone()),
+        &retained,
     )?;
     let root = match request.options.cache.as_ref() {
         Some(cache) => Some(helios_core::package::cache::Root::open(cache)?),
@@ -3110,6 +3124,7 @@ pub(crate) fn capture_rank(
     if request.options.reuse_weights.is_none() {
         output.weight_payload = resolve_weight_payload(
             &request,
+            &allocations,
             &mut output,
             if cache_scan {
                 Some((&mut downloader, device_allocations.as_slice()))
@@ -3161,7 +3176,7 @@ pub(crate) fn capture_rank(
     }
     super::binding::finish_rank(request, &mut output)?;
     if request.options.reuse_weights.is_some() {
-        output.weight_payload = resolve_weight_payload(request, &mut output,
+        output.weight_payload = resolve_weight_payload(request, &allocations, &mut output,
             Some((&mut downloader, device_allocations.as_slice())))?;
     }
     weight_phase.finish("");
@@ -3357,6 +3372,29 @@ mod tests {
     }
 
     #[test]
+    fn payload_materialization_omits_unreachable_weight_storage() -> ExportResult<()> {
+        let directory = tempfile::tempdir()?;
+        let bytes = vec![0x37u8; 128];
+        let (mut request, mut output) = declared_capture_view(directory.path(), &bytes, 64, false)?;
+        let mut allocations = output.allocations.clone();
+        let expected = resolve_weight_payload(&request, &allocations, &mut output, None)?.unwrap();
+        allocations.push(allocation("discarded-scales", 0x2000, 256));
+        request.weight_payload.as_mut().unwrap()["views"].as_array_mut().unwrap().push(
+            serde_json::json!({
+                "name": "weights.source_scales", "group": "embedding", "storage": "stable",
+                "element_bytes": 1, "shape": [256], "stride": [1], "address": 0x2000
+            })
+        );
+        let actual = resolve_weight_payload(&request, &allocations, &mut output, None)?.unwrap();
+        assert_eq!(actual.groups.len(), 1);
+        assert_eq!(actual.groups[0].payload_id, expected.groups[0].payload_id);
+        assert_eq!(actual.groups[0].nbytes, 64);
+        assert_eq!(actual.initial_state.payload_id, expected.initial_state.payload_id);
+        assert_eq!(output.allocations.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn no_weights_reuses_weights_and_allows_new_initial_state() -> ExportResult<()> {
         let directory = std::env::temp_dir().join(format!(
             "flare-capture-state-{}",
@@ -3368,7 +3406,7 @@ mod tests {
         let view = 4096usize;
         let mut bytes = vec![0x11u8; total];
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let weight_id = catalog.groups[0].payload_id.clone();
         assert_eq!(catalog.groups.len(), 1);
         assert!(!catalog.initial_state.payload_id.is_empty());
@@ -3379,7 +3417,7 @@ mod tests {
             *byte = 0x22;
         }
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         assert_eq!(catalog.groups[0].payload_id, weight_id);
         assert_ne!(catalog.initial_state.payload_id, state_id);
         // Missing stable weight data still fails under no_weights.
@@ -3393,7 +3431,7 @@ mod tests {
         drop(object);
         fs::remove_file(&path)?;
         let (request, mut output) = declared_capture_view(&directory, &bytes, view, true)?;
-        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        let error = resolve_staged_weight_payload(&request, &mut output).unwrap_err();
         assert!(error.to_string().contains("missing cached payload"), "{error}");
         let _ = fs::remove_dir_all(&directory);
         Ok(())
@@ -3411,7 +3449,7 @@ mod tests {
         let mut bytes = vec![0u8; block + 8];
         bytes[0] = 3;
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?
             .ok_or_else(|| invalid("declared capture missing catalog"))?;
         let group = &catalog.groups[0];
         assert!(!group.payload_id.is_empty());
@@ -3446,13 +3484,13 @@ mod tests {
         fs::create_dir_all(&directory)?;
         let bytes = vec![5u8; 4096];
         let (request, mut output) = declared_capture(&directory, &bytes, false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         let id: [u8; 32] = catalog.groups[0].payload_id.clone().try_into().unwrap();
         let payload = helios_core::package::PayloadId::from_bytes(id);
         drop(output);
         // Warm: an existing object validates.
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        assert!(resolve_weight_payload(&request, &mut output, None)?.is_some());
+        assert!(resolve_staged_weight_payload(&request, &mut output)?.is_some());
         drop(output);
         // Corrupted cached bytes are rejected even with the right length.
         let root = helios_core::package::cache::Root::open(directory.join("cache"))?;
@@ -3463,12 +3501,12 @@ mod tests {
         fs::remove_file(&path)?;
         fs::write(&path, vec![0u8; length as usize])?;
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        assert!(resolve_weight_payload(&request, &mut output, None).is_err());
+        assert!(resolve_staged_weight_payload(&request, &mut output).is_err());
         drop(output);
         // Absent object fails rather than publishing fresh weights.
         fs::remove_file(&path)?;
         let (request, mut output) = declared_capture(&directory, &bytes, true)?;
-        let error = resolve_weight_payload(&request, &mut output, None).unwrap_err();
+        let error = resolve_staged_weight_payload(&request, &mut output).unwrap_err();
         assert!(error.to_string().contains("missing cached payload"), "{error}");
         let _ = fs::remove_dir_all(&directory);
         Ok(())
@@ -3483,7 +3521,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory)?;
         let (request, mut output) = declared_capture(&directory, &vec![0u8; 4096], false)?;
-        let catalog = resolve_weight_payload(&request, &mut output, None)?.unwrap();
+        let catalog = resolve_staged_weight_payload(&request, &mut output)?.unwrap();
         assert!(catalog.groups.is_empty());
         assert!(catalog.initial_state.payload_id.is_empty());
         assert!(output.payload_leases.0.is_empty());
@@ -3593,6 +3631,68 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
+    fn adjacent_external_allocations_download_exact_bytes() -> ExportResult<()> {
+        let cuda = Cuda::new()?;
+        cu!(&cuda, "cuInit", (u32), 0)?;
+        let previous = cuda.current()?;
+        let mut context = std::ptr::null_mut();
+        cu!(&cuda, "cuCtxCreate_v2", (*mut Handle, u32, c_int), &mut context, 0, 0)?;
+        let size = 2 << 20;
+        let mut addresses = Vec::new();
+        let result = (|| -> ExportResult<()> {
+            for _ in 0..32 {
+                let mut address = 0;
+                cu!(&cuda, "cuMemAlloc_v2", (*mut u64, usize), &mut address, size)?;
+                addresses.push(address);
+            }
+            addresses.sort_unstable();
+            let pair = addresses.windows(2).find(|pair| pair[0] + size as u64 == pair[1])
+                .ok_or_else(|| invalid("CUDA allocator did not provide adjacent external allocations"))?;
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), pair[0], 0x37, size)?;
+            cu!(&cuda, "cuMemsetD8_v2", (u64, u8, usize), pair[1], 0xa5, size)?;
+            cuda.synchronize()?;
+            let allocations = external_allocations(
+                vec![(pair[0], size as u64), (pair[1], size as u64)], size as u64)?;
+            assert_eq!(allocations.len(), 1);
+            let allocation = &allocations[0];
+            let mut actual = vec![0; 2 * size];
+            let mut downloader = Downloader::new(&cuda)?;
+            downloader.for_each(allocation, allocation.snapshot_spans.as_ref().unwrap(), |offset, bytes| {
+                actual[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })?;
+            assert!(actual[..size].iter().all(|byte| *byte == 0x37));
+            assert!(actual[size..].iter().all(|byte| *byte == 0xa5));
+            let expected = actual.clone();
+            let spans = [(0, (2 * size) as u64)];
+            let mut packed = PackedDownload {
+                downloader: &mut downloader, allocation, spans: &spans, size: (2 * size) as u64,
+                pending: std::collections::VecDeque::new(), next: 0,
+            };
+            actual.fill(0);
+            packed.fill(0, &mut actual)?;
+            assert_eq!(actual, expected);
+            let spans = [weight_payload::PayloadSpan {
+                payload_offset: 0, allocation: allocation.name.clone(), destination_offset: 0,
+                nbytes: (2 * size) as u64,
+            }];
+            let mut weights = WeightDownload::new(&mut downloader, &allocations, &spans)?;
+            actual.fill(0);
+            weights.read_into(&allocation.name, 0, &mut actual)?;
+            assert_eq!(actual, expected);
+            Ok(())
+        })();
+        cuda.synchronize()?;
+        for address in addresses {
+            cu!(&cuda, "cuMemFree_v2", (u64), address)?;
+        }
+        cu!(&cuda, "cuCtxDestroy_v2", (Handle), context)?;
+        cu!(&cuda, "cuCtxSetCurrent", (Handle), previous as Handle)?;
+        result
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
     fn weight_payload_device_materialization_matches_staged_bytes() -> ExportResult<()> {
         let cuda = Cuda::new()?;
         cu!(&cuda, "cuInit", (u32), 0)?;
@@ -3627,7 +3727,7 @@ mod tests {
                 Ok((request, output))
             };
             let (reference_request, mut reference_output) = prepare(reference.path())?;
-            let expected = resolve_weight_payload(&reference_request, &mut reference_output, None)?.unwrap();
+            let expected = resolve_staged_weight_payload(&reference_request, &mut reference_output)?.unwrap();
             let (mut request, mut output) = prepare(device.path())?;
             let allocations = output.allocations.clone();
             let mut downloader = Downloader::new(&cuda)?;
@@ -3636,7 +3736,7 @@ mod tests {
                 let copies = downloader.copies;
                 let downloaded = downloader.downloaded;
                 let started = std::time::Instant::now();
-                let actual = resolve_weight_payload(&request, &mut output,
+                let actual = resolve_weight_payload(&request, &output.allocations.clone(), &mut output,
                     Some((&mut downloader, &allocations)))?.unwrap();
                 downloader.drain()?;
                 eprintln!("weight materialization: bytes={size}, cached={}, copies={}, elapsed={:?}",

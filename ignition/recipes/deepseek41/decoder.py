@@ -227,7 +227,7 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None):
+                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
@@ -306,12 +306,26 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=129280, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True,
             logits_dtype=torch.float32)
+        self._prepare_head(vocabulary_parallel=vocabulary_parallel, vocabulary_runtime=vocabulary_runtime,
+            coordinator=coordinator, session=session, name=name)
+
+    def _prepare_head(self, *, vocabulary_parallel, vocabulary_runtime, coordinator, session, name):
+        scratch, weights = self.scratch, self.weights
         self.compact_head = scratch.hidden.shape[0] > self.output_metadata.token_ids.numel()
         head_rows = self.output_metadata.token_ids.numel() if self.compact_head else scratch.hidden.shape[0]
         self.head_hidden = scratch.hidden[:head_rows]
+        head_output = scratch.logits
+        if vocabulary_parallel and self.compact_head:
+            # Physical projection rows must remain intact while their logical
+            # sample rows are expanded. Local sampling does not use gathered
+            # logits; the captured round consumes this arena prefix through
+            # verification and logprobs before another decoder reuses it.
+            head_output = scratch.logits.view(-1)[:scratch.local_logits.numel()].view_as(scratch.local_logits)
         self.head = PreparedVocabularyProjection(self.head_hidden, weights.head, scratch.local_logits[:head_rows],
-            scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
-            row_indices=self.output_metadata.sample_indices if self.compact_head else None)
+            head_output, runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
+            row_indices=self.output_metadata.sample_indices if self.compact_head else None, gather=not vocabulary_parallel)
+
+        self.local_logits = self.head.output if vocabulary_parallel else scratch.local_logits
 
     def __call__(self):
         s, m = self.scratch, self.metadata

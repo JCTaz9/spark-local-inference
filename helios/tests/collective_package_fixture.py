@@ -20,7 +20,7 @@ def _process():
     return dict(pid=os.getpid(), start_ticks=int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]))
 
 
-def _configuration(folder, signatures):
+def _configuration(folder, signatures, tuned_bindings=None):
     from ignition.preparation import contract as c, runtime_package_pb2 as p
 
     view = c.state_view("state_pool", 32)
@@ -31,7 +31,8 @@ def _configuration(folder, signatures):
         page_tables=[], regions=cache,
         graphs=[dict(graph=name, kind=p.GraphOperation.Value(signature.kind.upper()),
             inputs=[], state=[dict(view=view, access=p.READ_WRITE)], state_rows_per_request=1,
-            embedding_tables=[]) for name, signature in signatures.items()],
+            embedding_tables=[], tuned_bindings=[dict(buffer=b.buffer, tuning_graph=b.tuning_graph)
+                for b in (tuned_bindings or {}).get(name, ())]) for name, signature in signatures.items()],
         vision=dict(feature_slots=0, features_per_request=0, max_images=0,
                     patches_per_feature=0, patch_capacities=[]),
         frontend=c.frontend(tools=p.QWEN_CODER, assistant_marker="assistant",
@@ -42,10 +43,10 @@ def _configuration(folder, signatures):
         "page_tokens": 64, "reserve_bytes": 0}
 
 
-def _rank(rank, directory):
+def _rank(rank, directory, startup_tuning=False):
     from ignition.components.collectives import PreparedAllReduce
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
-    from ignition.preparation.execution import GraphSignature, PreparedExecution
+    from ignition.preparation.execution import GraphSignature, PreparedExecution, TunedBinding, TuningGraph
     from ignition.preparation.module_images import ModuleImages
     from ignition.preparation.package_storage import PackageStorage
     from ignition.preparation.runtime_package import export_model
@@ -85,6 +86,58 @@ def _rank(rank, directory):
                         print(f"{name}: {operation.plan.selection.config}; surface={query['surface']}; "
                               f"transport={query['call'].get('transport')}", flush=True)
                 stream = torch.cuda.Stream(device=device)
+                startup_buffers, tuning_graphs, tuned_bindings = {}, {}, {}
+                startup_consumer = None
+                if startup_tuning:
+                    startup_buffers = {
+                        name: torch.zeros(1, dtype=torch.int32, device=device)
+                        for name in ("startup-selector", "startup-bias", "startup-count", "startup-status",
+                                     "startup-failure", "startup-observed", "unused-count", "unused-status")
+                    }
+
+                    def produce(selector, bias, count, status, failure):
+                        count.add_(1)
+                        selector.fill_(3)
+                        bias.fill_(7)
+                        status.copy_(failure)
+
+                    def consume(selector, bias, observed):
+                        observed.copy_(selector * 11 + bias)
+
+                    producer = torch.compile(produce, fullgraph=True)
+                    startup_consumer = torch.compile(consume, fullgraph=True)
+                    producer(*(startup_buffers[name] for name in (
+                        "startup-selector", "startup-bias", "startup-count", "startup-status", "startup-failure")))
+                    startup_consumer(*(startup_buffers[name] for name in (
+                        "startup-selector", "startup-bias", "startup-observed")))
+                    sources[2560].fill_(rank + 1)
+                    operations["init"](sources[2560][:12])
+                    startup_buffers["unused-count"].add_(1)
+                    startup_buffers["unused-status"].zero_()
+                    torch.cuda.synchronize(device)
+                    graph = torch.cuda.CUDAGraph(keep_graph=True)
+                    stream.wait_stream(torch.cuda.current_stream(device))
+                    dist.barrier()
+                    with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
+                            graph, stream=stream, pool=storage.graph_pool.id):
+                        operations["init"](sources[2560][:12])
+                        producer(*(startup_buffers[name] for name in (
+                            "startup-selector", "startup-bias", "startup-count", "startup-status", "startup-failure")))
+                    graph.instantiate()
+                    captured.append(graph)
+                    tuning_graphs["choose-profile"] = TuningGraph(graph=graph,
+                        outputs=("startup-selector", "startup-bias", "startup-count"), status_buffer="startup-status")
+                    bindings = tuple(TunedBinding(buffer=name, tuning_graph="choose-profile")
+                                     for name in ("startup-selector", "startup-bias"))
+                    tuned_bindings = dict.fromkeys(("init", "decode"), bindings)
+                    graph = torch.cuda.CUDAGraph(keep_graph=True)
+                    with torch.cuda.graph(graph, stream=stream, pool=storage.graph_pool.id):
+                        startup_buffers["unused-count"].add_(1)
+                        startup_buffers["unused-status"].zero_()
+                    graph.instantiate()
+                    captured.append(graph)
+                    tuning_graphs["unused-profile"] = TuningGraph(graph=graph,
+                        outputs=("unused-count",), status_buffer="unused-status")
                 graphs, signatures = {}, {}
                 for name, operation in operations.items():
                     width, rows = shapes[name]
@@ -97,6 +150,9 @@ def _rank(rank, directory):
                     with runtime.capture(stream=stream), session.capture(), torch.cuda.graph(
                             graph, stream=stream, pool=storage.graph_pool.id):
                         operation(sources[width][:rows])
+                        if name in tuned_bindings:
+                            startup_consumer(*(startup_buffers[field] for field in (
+                                "startup-selector", "startup-bias", "startup-observed")))
                     graph.instantiate()
                     captured.append(graph)
                     graphs[name] = graph
@@ -131,10 +187,12 @@ def _rank(rank, directory):
                 records[..., 16:] = -1
                 buffers.update({f"source-{width}": value for width, value in sources.items()})
                 buffers.update({f"output-{name}": value for name, value in outputs.items()})
+                buffers.update(startup_buffers)
                 prepared = PreparedExecution(device=rank, graphs=graphs, buffers=buffers,
                     signatures=signatures, max_active=1,
-                    resources=(runtime, session, sources, outputs, storage, stream))
-                prepared.server_config = _configuration(folder, signatures)
+                    tuning_graphs=tuning_graphs, tuned_bindings=tuned_bindings,
+                    resources=(runtime, session, sources, outputs, storage, stream, startup_buffers, startup_consumer))
+                prepared.server_config = _configuration(folder, signatures, tuned_bindings)
                 prepared.package_data = None
                 cases = []
                 for step in range(3):
@@ -153,6 +211,8 @@ def _rank(rank, directory):
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 storage.peer_storage.reset()
+                for value in startup_buffers.values():
+                    value.zero_()
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 export_model(prepared, images, storage, directory / f"rank-{rank}.json",
@@ -172,17 +232,17 @@ def _rank(rank, directory):
         dist.destroy_process_group()
 
 
-def prepare(directory):
+def prepare(directory, *, startup_tuning=False):
     from ignition.preparation.package_file import combine
 
     directory.mkdir(exist_ok=True)
-    mp.spawn(_rank, args=(directory,), nprocs=4, join=True)
+    mp.spawn(_rank, args=(directory, startup_tuning), nprocs=4, join=True)
     ranks = [json.loads((directory / f"rank-{rank}" / "metadata.json").read_text()) for rank in range(4)]
     peers = [dict(owner=rank, address=address, nbytes=size, readers=list(range(4)))
              for rank, metadata in enumerate(ranks) for address, size in metadata["owned"]]
     combine(directory / "package", [directory / f"rank-{rank}.json" for rank in range(4)],
             peers, publisher=publisher())
-    (directory / "collective-expected.json").write_text(json.dumps(dict(ranks=ranks,
+    (directory / "collective-expected.json").write_text(json.dumps(dict(ranks=ranks, startup_tuning=startup_tuning,
         preparation_processes=[_process(), *(rank["process"] for rank in ranks)])))
     total = sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
     assert total < 128 << 20, f"collective fixture exceeded 128 MiB: {total}"
@@ -190,4 +250,4 @@ def prepare(directory):
 
 
 if __name__ == "__main__":
-    prepare(Path(sys.argv[1]).resolve())
+    prepare(Path(sys.argv[1]).resolve(), startup_tuning="--startup-tuning" in sys.argv[2:])

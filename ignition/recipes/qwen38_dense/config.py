@@ -16,6 +16,7 @@ PAGE_TOKENS = 128
 class ModelConfig:
     text: dict
     quantization: dict
+    draft: object = None
 
     @classmethod
     def load(cls, snapshot):

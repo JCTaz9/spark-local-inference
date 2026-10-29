@@ -49,7 +49,8 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         package_storage.transports.append(runtime)
     return runtime
 
-def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2):
+def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
+                              collective_tuning="static"):
     """Allocate one b12x IPC channel for the largest hidden activation.
 
     Every rank supplies identical capacities before preparing graph variants.
@@ -61,11 +62,14 @@ def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=Non
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
+    if collective_tuning not in ("static", "runtime"):
+        raise ValueError("collective_tuning must be static or runtime")
     nbytes = max_tokens * hidden_size * element_bytes
     if nbytes % 16:
         raise ValueError("all-reduce capacity must occupy complete 16-byte packs")
     return AllReduce.from_exchange_group(exchange_group=group, device=device, single_channel=True,
-                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc)
+                                         max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc,
+                                         joint=collective_tuning == "runtime")
 
 
 def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
@@ -134,18 +138,25 @@ def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head
         total_heads=heads, head_dim=head_dim, query_head_dim=query_head_dim, stream_affine=False, ipc=ipc)
 
 
-def _winners(contributions):
-    """Each sharded race's fastest complete contribution, ties going to the lower candidate index."""
+def _tuning_results(contributions):
+    """Forward finalist shards in rank order and select ordinary race winners."""
     races = {}
     for item in contributions:
-        best = races.get(item.key)
-        if item.assignment is not None and (
-                best is None or (item.latency_us, item.candidate_index) < (best.latency_us, best.candidate_index)):
-            best = item
-        races[item.key] = best
-    if missing := [key for key, item in races.items() if item is None]:
-        raise RuntimeError(f"no rank completed a candidate of tuning race {missing[0]!r}")
-    return tuple(races[key] for key in sorted(races))
+        races.setdefault(item.key, []).append(item)
+    results = []
+    for key in sorted(races):
+        members = races[key]
+        policy = getattr(members[0], "finalist_policy", None)
+        if any(getattr(item, "finalist_policy", None) != policy for item in members):
+            raise ValueError("sharded finalist policies differ across ranks")
+        if policy is not None:
+            results.extend(members)
+        else:
+            completed = [item for item in members if item.assignment is not None]
+            if not completed:
+                raise RuntimeError(f"no rank completed a candidate of tuning race {key!r}")
+            results.append(min(completed, key=lambda item: (item.latency_us, item.candidate_index)))
+    return tuple(results)
 
 
 class CollectivePreparation:
@@ -155,8 +166,9 @@ class CollectivePreparation:
     coordinator releases a collective only after all group members report the
     same declaration. When the session shards tuning, it also relays b12x's
     two exchanges: every rank's cached selections, which b12x reconciles in
-    rank order, and each race's fastest result among the ranks' disjoint
-    candidate shares. It is unused after graph handoff.
+    rank order, and candidate results. Ordinary races use the fastest result;
+    finalist races retain every shard for b12x to consolidate. It is unused
+    after graph handoff.
     """
 
     def __init__(self, group, *, timeout=timedelta(minutes=2)):
@@ -289,8 +301,8 @@ class CollectivePreparation:
                                 differences[rank] = {"missing": len(missing), "extra": len(extra),
                                                      "examples": sorted(missing | extra)[:2]}
                         raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    winners = _winners(contribution for item in states for contribution in item[4])
-                    authorization = {"tuning": winners[0] if len(winners) == 1 else winners}
+                    results = _tuning_results(contribution for item in states for contribution in item[4])
+                    authorization = {"tuning": results[0] if len(results) == 1 else results}
                     continue
                 ready = [item[1] for item in states]
                 if all(ready):
@@ -301,7 +313,16 @@ class CollectivePreparation:
                         raise ValueError("collective preparation requires the complete control group")
                     authorization = {"collective_key": key}
                 elif all(item[1] or item[3] is not None or item[4] or item[5] is not None for item in states):
-                    raise RuntimeError("ranks reached incompatible preparation exchanges")
+                    pending = {
+                        rank: {
+                            "collectives": item[1],
+                            "cache": None if item[3] is None else tuple(item[3].records),
+                            "tuning": tuple(contribution.key for contribution in item[4]),
+                            "collective_tuning": None if item[5] is None else (item[5].key, item[5].step),
+                        }
+                        for rank, item in zip(self.ranks, states, strict=True)
+                    }
+                    raise RuntimeError(f"ranks reached incompatible preparation exchanges: {pending}")
         except BaseException as failure:
             try:
                 if job is not None:

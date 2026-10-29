@@ -7,6 +7,7 @@ import torch
 from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
 from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
+from ignition.components.markov_sampling import fp8_markov_head
 
 from .config import ModelConfig
 
@@ -67,7 +68,8 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
-             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None):
+             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
+             vocabulary_parallel_sampling=False):
         config = ModelConfig.load(manifest.metadata_path)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
@@ -77,12 +79,21 @@ class ModelWeights:
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
             if draft is not None:
+                if vocabulary_parallel_sampling:
+                    first, last = shard.padded_partition(129280, alignment=64)
+                    local = torch.zeros((last - first, draft.markov_head.shape[1]),
+                                        device=device, dtype=draft.markov_head.dtype)
+                    covered = min(last, 129280) - first
+                    local[:covered].copy_(draft.markov_head[first:first + covered])
+                    draft = replace(draft, markov_head=local)
                 if draft_head_quantization == "nvfp4":
                     draft = replace(draft, draft_head=nvfp4_draft_head(head))
                 elif draft_head_quantization == "mxfp8":
                     draft = replace(draft, draft_head=mxfp8_draft_head(head))
                 if markov_head_quantization == "nvfp4":
                     draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
+                elif markov_head_quantization == "fp8":
+                    draft = replace(draft, markov_head=fp8_markov_head(draft.markov_head))
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)

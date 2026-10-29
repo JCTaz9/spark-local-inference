@@ -155,7 +155,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
             GraphKind::Speculative,
         ] {
             for tokens in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                graphs.push(crate::execution::GraphDescriptor { confidence_width: 0,
+                graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
                     draft_tokens: if kind == GraphKind::Speculative { tokens - 1 } else { 0 },
                     packed_token_capacity: if kind == GraphKind::Speculative { batch * tokens } else { 0 },
                     name: format!("{kind:?}-{batch}-{tokens}"),
@@ -176,7 +176,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
         (GraphKind::Vision, vec![8, 16, 256, 1024, 4096, 16384]),
     ] {
         for tokens in capacities {
-            graphs.push(crate::execution::GraphDescriptor { confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+            graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
                 name: format!("{kind:?}-{tokens}"),
                 kind,
                 sampling_mode: crate::execution::SamplingMode::General,
@@ -1306,6 +1306,7 @@ fn speculative_every_committed_prefix_updates_counts_and_tokens_once() {
         assert_eq!(s.request(h).unwrap().scheduled_consumed, 65 + count as u64);
     }
 }
+
 #[test]
 fn speculative_rounds_allow_lookahead_and_use_actual_counts() {
     let (mut s, h) = speculative_scheduler(65, 32);

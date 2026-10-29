@@ -43,10 +43,15 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, language_model_only: bool = False,
-           compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None,
+           compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
-           lock_gpu_clocks: bool = False, native_dense_activations: bool = False) -> planning.Plan:
+           lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
+           joint_tuning: bool = False, shard_hyperconnections: bool = False) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
+    from ignition.preparation.collective_ladder import resolve as resolve_ladder
+
+    mode = collective_tuning_mode(configuration, model, collective_tuning)
+    ladder = resolve_ladder(mode, collective_ladder)
     workers = compiler_workers(configuration, compile_workers)
     result = planning.plan(
         model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
@@ -57,6 +62,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
+                     collective_tuning=mode, collective_ladder=ladder,
+                     joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
 
@@ -71,6 +78,14 @@ def tuning_effort(configuration, flag=None):
     value = configuration.get("preparation.autotune_effort", flag).value
     if value not in AUTOTUNE_EFFORTS:
         raise UsageError(f"--autotune-effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
+    return value
+
+
+def collective_tuning_mode(configuration, model, flag=None):
+    value = configuration.get("preparation.collective_tuning", flag).value
+    value = model.recipe.collective_tuning if value is None else value
+    if value not in ("static", "runtime"):
+        raise UsageError("--collective-tuning must be static or runtime")
     return value
 
 
@@ -144,7 +159,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         ("--speculative-token-capacity", args.speculative_token_capacity),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
-        ("--markov-head-quantization", getattr(args, "markov_head_quantization", None))) if value is not None]
+        ("--markov-head-quantization", getattr(args, "markov_head_quantization", None)),
+        ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None)) if value is not None]
     if explicit_graph_budget:
         given.append("--speculative-graph-budget")
     if default is None:
@@ -183,7 +199,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         raise UsageError("draft head quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
-                       draft_head_quantization=draft_head, markov_head_quantization=markov_head)
+                       draft_head_quantization=draft_head, markov_head_quantization=markov_head,
+                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False))
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

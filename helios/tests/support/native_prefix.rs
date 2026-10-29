@@ -15,7 +15,7 @@ pub fn without_generation(
     rendered.token_ids.clear();
     for (i, span) in rendered
         .text
-        .split(deepseek_recipe_core::multimodal::IMAGE_SPECIAL_TOKEN)
+        .split(deepseek_recipe_core::special_tokens::SpecialToken::Image.default_str())
         .enumerate()
     {
         if i != 0 {

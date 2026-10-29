@@ -19,17 +19,26 @@ def test_setup_runs_locked_sync(monkeypatch):
     calls = []
     monkeypatch.setattr(setup.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert setup.main() == 0
-    assert len(calls) == 1
+    assert len(calls) == 2
     command = calls[0][0][0]
     assert command[:3] == ["uv", "sync", "--locked"]
     assert calls[0][1]["env"]["BUILD_NVEP"] == "0"
+    assert calls[1][0][0] == ["uv", "run", "--no-sync", "python", "-m", "ignition.patches"]
+    assert calls[1][1] == {"cwd": ROOT, "check": True}
 
 
 @pytest.mark.parametrize("error", [OSError("uv unavailable"), subprocess.CalledProcessError(1, "uv")])
-def test_failed_sync_reports_error(monkeypatch, capsys, error):
+@pytest.mark.parametrize("failure_call", [1, 2])
+def test_failed_sync_or_patch_reports_error(monkeypatch, capsys, error, failure_call):
+    calls = 0
+
     def fail(*_args, **_kwargs):
-        raise error
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise error
 
     monkeypatch.setattr(setup.subprocess, "run", fail)
     assert setup.main() == 1
+    assert calls == failure_call
     assert str(error) in capsys.readouterr().err

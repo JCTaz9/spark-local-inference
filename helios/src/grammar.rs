@@ -14,8 +14,15 @@ const MAX_GRAMMAR_BYTES: usize = 262_144;
 const MAX_SCHEMA_NODES: usize = 8_192;
 const MAX_SCHEMA_DEPTH: usize = 64;
 
+/// Assistant recipient framing and the registered tool recipient names.
+pub struct RecipientEnvelope {
+    pub start: crate::output::tagged::OutputStart,
+    pub tools: Vec<String>,
+}
+
 /// Delimiters supplied by the same protocol that parses generated output.
 pub struct OutputEnvelope {
+    pub recipient: Option<RecipientEnvelope>,
     pub reasoning_end: Option<&'static str>,
     pub tool: Option<(&'static str, &'static str)>,
     pub function: Option<(&'static str, &'static str)>,
@@ -58,6 +65,7 @@ pub struct GrammarCompiler {
     tokenizer_vocab: usize,
     eos_ids: Arc<[u32]>,
     delimiters: Arc<[(u32, String)]>,
+    special_tokens: Vec<(u32, String)>,
 }
 
 impl GrammarCompiler {
@@ -129,6 +137,11 @@ impl GrammarCompiler {
                 "grammar EOS IDs must be distinct checkpoint special tokens",
             ));
         }
+        let added = tokenizer.get_added_vocabulary();
+        let special_tokens = added.get_vocab().iter()
+            .filter(|(name, _)| added.is_special_token(name))
+            .map(|(name, &id)| (id, name.clone()))
+            .collect();
         let tokenizer_vocab = bytes.len();
         let trie = TokTrie::from(&TokRxInfo::new(tokenizer_vocab as u32, eos_ids[0]), &bytes)
             .with_eos_tokens(eos_ids);
@@ -158,6 +171,7 @@ impl GrammarCompiler {
             factory,
             model_vocab,
             tokenizer_vocab,
+            special_tokens,
             eos_ids: eos_ids.into(),
             delimiters: delimiters.into(),
         })
@@ -212,6 +226,9 @@ impl GrammarCompiler {
         let Some(envelope) = envelope else {
             return self.compile(grammar);
         };
+        if let Some(recipient) = &envelope.recipient {
+            return self.compile_recipient(grammar, recipient);
+        }
         if envelope.reasoning_end.is_none()
             && envelope.tool.is_none()
             && envelope.response.is_none()
@@ -235,13 +252,13 @@ impl GrammarCompiler {
             if let Some((function_open, function_close)) = envelope.function {
                 rules.push_str(&format!(
                     "tool_after_open: ws {} tool_body (ws {})?\ntool: {} tool_after_open | tool_after_open\n",
-                    self.marker(function_open), self.marker(close), self.marker(open)
+                    self.marker(function_open), self.marker(close), self.compound_marker(open)
                 ));
                 rules.push_str(&self.region("tool_body", function_close));
             } else {
                 rules.push_str(&format!(
                     "tool_after_open: tool_body\ntool: {} tool_after_open\n",
-                    self.marker(open)
+                    self.compound_marker(open)
                 ));
                 rules.push_str(&self.region("tool_body", close));
             }
@@ -283,14 +300,89 @@ impl GrammarCompiler {
         self.compile(grammar)
     }
 
+    fn compile_recipient(&self, mut grammar: TopLevelGrammar, envelope: &RecipientEnvelope) -> Result<RequestGrammar> {
+        use crate::output::tagged::OutputStart;
+        let mut rules = String::new();
+        let marker = |text: &str| self.marker(text);
+        let message = marker("<|message|>");
+        let resume = format!("{} {} {}", marker("<|eom|>"), marker("<|start|>"), marker("assistant"));
+        rules.push_str(&format!("resume: {resume}\n"));
+        rules.push_str(&self.region("reasoning_body", "<|eom|>"));
+        rules.push_str(&self.region("commentary_body", "<|eom|>"));
+        let restart = format!("{} {}", marker("<|start|>"), marker("assistant"));
+        rules.push_str(&format!(
+            "reasoning: {} {message} reasoning_body {restart}\ncommentary: {} {message} commentary_body {restart}\nanswer: {} {message} @answer\n",
+            marker(" to=self"), marker(" to=commentary"), marker(" to=user")));
+        let mut ending = "answer".to_owned();
+        if !envelope.tools.is_empty() {
+            rules.push_str("ws: /[ \\t\\r\\n]*/\n");
+            rules.push_str(&self.region("parameters", "</atem:invoke>"));
+            let open = marker("<atem:function_calls>");
+            let close = marker("</atem:function_calls>");
+            let mut names = Vec::new();
+            let mut invocations = Vec::new();
+            for (index, name) in envelope.tools.iter().enumerate() {
+                let attr = name.replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&#39;").replace('<', "&lt;").replace('>', "&gt;");
+                let invoke = marker(&format!("<atem:invoke name=\"{attr}\">"));
+                rules.push_str(&format!("invoke_{index}: {invoke} parameters\nnamed_tool_{index}: {} {message} {open} ws invoke_{index} ws {close}\n", marker(&format!(" to={name}"))));
+                names.push(format!("named_tool_{index}"));
+                invocations.push(format!("invoke_{index}"));
+            }
+            rules.push_str(&format!("invocation: {}\ntool_body: {open} ws invocation ws {close}\ntool: {} | {} {message} tool_body\n", invocations.join(" | "), names.join(" | "), marker(" to=tool")));
+            rules.push_str("tools: tool (resume (reasoning | commentary)* tool)* (resume (reasoning | commentary)* answer)?\n");
+            ending = "(answer | tools)".into();
+        }
+        rules.push_str(&format!("tail: (reasoning | commentary)* {ending}\n"));
+        match envelope.start {
+            OutputStart::RecipientHeader => rules.push_str("start: tail\n"),
+            OutputStart::RecipientFrame => rules.push_str(&format!("start: {restart} tail\n")),
+            OutputStart::Reasoning => rules.push_str(&format!("start: reasoning_body {restart} tail\n")),
+            OutputStart::Content => rules.push_str("start: @answer\n"),
+            OutputStart::ToolBody => {
+                if envelope.tools.is_empty() { return Err("tool continuation requires registered tools".into()); }
+                rules.push_str("start: tool_body (resume tail)?\n");
+            }
+        }
+        grammar.grammars[0].name = Some("answer".into());
+        grammar.grammars.insert(0, GrammarWithLexer::from_lark(rules));
+        self.compile(grammar)
+    }
+
     fn marker(&self, text: &str) -> String {
+        if text.is_empty() {
+            String::new()
+        } else {
+            self.token_id(text).map_or_else(
+                || serde_json::to_string(text).unwrap(),
+                |id| format!("<[{id}]>"),
+            )
+        }
+    }
+
+    fn compound_marker(&self, text: &str) -> String {
         if text.is_empty() {
             return String::new();
         }
-        match self.token_id(text) {
-            Some(id) => format!("<[{id}]>"),
-            None => serde_json::to_string(text).unwrap(),
+        if let Some(id) = self.token_id(text) {
+            return format!("<[{id}]>");
         }
+        let mut rest = text;
+        let mut pieces = Vec::new();
+        while let Some((at, spelling, id)) = self.special_tokens.iter()
+            .filter(|(_, spelling)| !spelling.is_empty())
+            .filter_map(|(id, spelling)| rest.find(spelling).map(|at| (at, spelling.as_str(), *id)))
+            .min_by_key(|(at, spelling, _)| (*at, std::cmp::Reverse(spelling.len())))
+        {
+            if at > 0 {
+                pieces.push(serde_json::to_string(&rest[..at]).unwrap());
+            }
+            pieces.push(format!("<[{id}]>"));
+            rest = &rest[at + spelling.len()..];
+        }
+        if !rest.is_empty() {
+            pieces.push(serde_json::to_string(rest).unwrap());
+        }
+        pieces.join(" ")
     }
 
     /// The ID of a declared delimiter or special token, which grammars match only as
@@ -304,13 +396,10 @@ impl GrammarCompiler {
     }
 
     fn region(&self, name: &str, close: &str) -> String {
-        let trie = self.factory.tok_env().tok_trie();
         if let Some(end) = self.token_id(close) {
-            let specials: Vec<_> = trie
-                .get_special_tokens()
-                .into_iter()
-                .filter(|id| *id != end && !self.eos_ids.contains(id))
-                .map(|id| id.to_string())
+            let specials: Vec<_> = self.special_tokens.iter()
+                .filter(|(id, _)| *id != end && !self.eos_ids.contains(id))
+                .map(|(id, _)| id.to_string())
                 .collect();
             let body = if specials.is_empty() {
                 "/(?s:.*)/".into()
@@ -318,6 +407,22 @@ impl GrammarCompiler {
                 format!("(/(?s:.+)/ | <[{}]>)*", specials.join(","))
             };
             format!("{name}: {body} <[{end}]>\n")
+        } else if let Some((at, spelling, id)) = self.special_tokens.iter()
+            .filter(|(id, spelling)| !spelling.is_empty() && !self.eos_ids.contains(id))
+            .filter_map(|(id, spelling)| close.find(spelling)
+                .filter(|&at| &close[..at] == "</" && at + spelling.len() < close.len())
+                .map(|at| (at, spelling.as_str(), *id)))
+            .min_by_key(|(at, spelling, _)| (*at, std::cmp::Reverse(spelling.len())))
+        {
+            let before = &close[..at];
+            let after = &close[at + spelling.len()..];
+            let specials = self.special_tokens.iter()
+                .filter(|(id, _)| !self.eos_ids.contains(id))
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let tail = format!("{}_TAIL", name.to_uppercase());
+            format!("{tail}: (/[^<]+/ & ~({} /(?s:.*)/))\n{name}: (/[^<]+/ | \"<\" | <[{specials}]> | {} <[{id}]> {tail})* {} <[{id}]> {}\n", serde_json::to_string(after).unwrap(), serde_json::to_string(before).unwrap(), serde_json::to_string(before).unwrap(), serde_json::to_string(after).unwrap())
         } else {
             // Lazy suffixes consume the delimiter without token backtracking.
             format!(
@@ -328,7 +433,6 @@ impl GrammarCompiler {
     }
 
     fn delimited_region(&self, name: &str, close: &str, ends: &[&str]) -> String {
-        let trie = self.factory.tok_env().tok_trie();
         let literals: Vec<_> = ends
             .iter()
             .filter(|end| self.token_id(end).is_none())
@@ -343,11 +447,9 @@ impl GrammarCompiler {
             )
         };
         let excluded: Vec<_> = ends.iter().filter_map(|end| self.token_id(end)).collect();
-        let specials: Vec<_> = trie
-            .get_special_tokens()
-            .into_iter()
-            .filter(|id| !excluded.contains(id) && !self.eos_ids.contains(id))
-            .map(|id| id.to_string())
+        let specials: Vec<_> = self.special_tokens.iter()
+            .filter(|(id, _)| !excluded.contains(id) && !self.eos_ids.contains(id))
+            .map(|(id, _)| id.to_string())
             .collect();
         let terminal = format!("{}_TEXT", name.to_uppercase());
         let ending = if let Some(id) = self.token_id(close) {
@@ -863,6 +965,7 @@ mod tests {
         let schema = json!({"const":{"ok":true}});
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
+                recipient: None,
                 reasoning_end: reasoning.then_some("</think>"),
                 tool: Some(("<tool_call>", "</tool_call>")),
                 function: None,
@@ -908,6 +1011,7 @@ mod tests {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
+                recipient: None,
                 reasoning_end: reasoning.then_some("<|close|>think<|sep|><|open|>response<|sep|>"),
                 tool: Some(("<|open|>tools<|sep|>", "<|close|>tools<|sep|>")),
                 function: None,
@@ -947,6 +1051,7 @@ mod tests {
     fn qwen_envelope_preserves_implicit_reasoning_and_function_boundaries() {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let envelope = OutputEnvelope {
+            recipient: None,
             reasoning_end: Some("</think>"),
             tool: Some(("<tool_call>", "</tool_call>")),
             function: Some(("<function=", "</function>")),
@@ -1005,7 +1110,8 @@ mod tests {
         };
         for tool_ends_reasoning in [false, true] {
             let envelope = OutputEnvelope {
-                reasoning_end: Some("</think>"),
+                recipient: None,
+            reasoning_end: Some("</think>"),
                 tool: Some(("<tool_call>", "</tool_call>")),
                 function: Some(("<function=", "</function>")),
                 tool_ends_reasoning,
@@ -1048,6 +1154,7 @@ mod tests {
     fn output_envelope_copy_masks_cross_reasoning_and_tool_boundaries() {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let envelope = OutputEnvelope {
+            recipient: None,
             reasoning_end: Some("</think>"),
             tool: Some(("<tool_call>", "</tool_call>")),
             function: Some(("<function=", "</function>")),
@@ -1110,6 +1217,7 @@ mod tests {
         let literal = r#"{"literal":"<think>東京</think><tool_call>literal</tool_call>"}"#;
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
+                recipient: None,
                 reasoning_end: reasoning.then_some("</think>"),
                 tool: Some(("<tool_call>", "</tool_call>")),
                 function: Some(("<function=", "</function>")),
@@ -1587,6 +1695,7 @@ mod tests {
             ("<｜DSML｜ calls>", "</｜DSML｜ calls>", " "),
         ] {
             let envelope = OutputEnvelope {
+                recipient: None,
                 reasoning_end: None,
                 tool: Some((open, close)),
                 function: None,
@@ -1622,6 +1731,53 @@ mod tests {
                     assert_eq!(accepted, expected, "lark={lark}: {text}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test,feature="server"))]
+mod recipient_tests {
+    use super::*;
+    use serde_json::json;
+    use crate::output::tagged::OutputStart;
+
+    #[test]
+    #[ignore = "requires FLARE_MUSE_SPARK_SNAPSHOT checkpoint tokenizer"]
+    fn recipient_headers_constrain_checkpoint_answers_and_tool_recipients() {
+        let snapshot=std::path::PathBuf::from(std::env::var_os("FLARE_MUSE_SPARK_SNAPSHOT").unwrap());
+        let tokenizer=Tokenizer::from_file(snapshot.join("tokenizer.json")).unwrap();
+        let controls=["<|start|>","<|message|>","<|eom|>","<|eot|>"].map(|s|(tokenizer.token_to_id(s).unwrap(),s.to_owned()));
+        let compiler=GrammarCompiler::new(&tokenizer,tokenizer.get_vocab_size(true),&[200001,200008],&controls).unwrap();
+        let envelope=|start,tools:Vec<String>| OutputEnvelope {
+            recipient:Some(RecipientEnvelope{start,tools}),reasoning_end:None,tool:None,function:None,
+            tool_ends_reasoning:false,tool_body_start:false,response:None,
+        };
+        let answer=r#"{"ok":true}"#;
+        let tool=" to=lookup<|message|><atem:function_calls><atem:invoke name=\"lookup\"><atem:parameter name=\"q\">café</atem:parameter></atem:invoke></atem:function_calls>";
+        let resume="<|eom|><|start|>assistant";
+        let reasoning=format!(" to=self<|message|>Plan 世界{resume}");
+        let commentary=format!(" to=commentary<|message|>Checking.{resume}");
+        for (start,tools,text,valid) in [
+            (OutputStart::RecipientHeader,vec![],format!(" to=user<|message|>{answer}"),true),
+            (OutputStart::RecipientHeader,vec![],format!("{reasoning}{commentary} to=user<|message|>{answer}"),true),
+            (OutputStart::RecipientHeader,vec![]," to=user<|message|>{\"ok\":false}".into(),false),
+            (OutputStart::RecipientHeader,vec![],tool.into(),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.into(),true),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],format!("{reasoning}{tool}{resume}{commentary}{tool}"),true),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup","to=other"),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into(),"other".into()],tool.replace("name=\"lookup\"", "name=\"other\""),false),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("to=lookup", "to=tool"),true),
+            (OutputStart::RecipientHeader,vec!["lookup".into()],tool.replace("</atem:function_calls>", "<atem:invoke name=\"lookup\"></atem:invoke></atem:function_calls>"),false),
+            (OutputStart::Reasoning,vec![],format!("Plan{resume} to=user<|message|>{answer}"),true),
+            (OutputStart::Content,vec![],answer.into(),true),
+            (OutputStart::RecipientFrame,vec![],format!("<|start|>assistant{reasoning} to=user<|message|>{answer}"),true),
+            (OutputStart::RecipientFrame,vec![],format!(" to=user<|message|>{answer}"),false),
+        ] {
+            let mut request=compiler.compile_json_schema_in(&json!({"const":{"ok":true}}),Some(&envelope(start,tools))).unwrap();
+            let tokens=tokenizer.encode(text.clone(),false).unwrap().get_ids().to_vec();
+            let accepted=tokens.into_iter().all(|id|request.advance(id).is_ok()) && request.advance(200008).is_ok();
+            assert_eq!(accepted,valid,"{text}");
         }
     }
 }

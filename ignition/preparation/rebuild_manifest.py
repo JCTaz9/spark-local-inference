@@ -216,14 +216,24 @@ def from_plan(model, plan, *, compiled_forwards):
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
         mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
-        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes)
+        compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes,
+        collective_tuning=plan.collective_tuning)
+    if plan.collective_ladder is not None:
+        import json
+
+        result["collective_ladder_json"] = json.dumps(plan.collective_ladder, separators=(",", ":"), sort_keys=True)
     if plan.expert_scale_compression is not None:
         result['expert_scale_compression'] = plan.expert_scale_compression
+    if plan.shard_hyperconnections:
+        result['shard_hyperconnections'] = True
+    if plan.joint_tuning:
+        result['joint_tuning'] = True
     if (s := plan.speculation) is not None:
         result['speculation'] = dict(draft_tokens=s.draft_tokens,
             adaptive=s.adaptive,
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
-            draft_prefix_selection=s.draft_prefix_selection)
+            draft_prefix_selection=s.draft_prefix_selection,
+            vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
         if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:

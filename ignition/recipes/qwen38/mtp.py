@@ -36,7 +36,8 @@ class MTPScratch:
     local_logits: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens: int, output_rows: int, device, *, world_size=1, buffers=None):
+    def allocate(cls, tokens: int, output_rows: int, device, *, world_size=1, buffers=None,
+                 hyperconnection_lowrank=320):
         if (type(tokens) is not int or type(output_rows) is not int
                 or not 0 < output_rows <= tokens):
             raise ValueError("MTP requires positive output rows no greater than token capacity")
@@ -52,13 +53,14 @@ class MTPScratch:
         embedding, residual, hidden = zeros(tokens, 2560), zeros(tokens, 10240), zeros(tokens, 2560)
         selected, logits = zeros(output_rows, 2560), zeros(output_rows, 248320)
         local_logits = zeros(output_rows, 248320 // world_size) if world_size > 1 else None
-        block_input, block_output, projected = zeros(tokens, 2560), zeros(tokens, 2560), zeros(tokens, 336)
+        block_input, block_output = zeros(tokens, 2560), zeros(tokens, 2560)
+        projected = zeros(tokens, (hyperconnection_lowrank + 4 + 15) // 16 * 16)
         attention, experts, mixer = buffers.fork(), buffers.fork(), buffers.fork()
         qsa = QSAScratch.allocate(tokens, device, world_size=world_size, buffers=attention, output=block_output)
         moe = QwenMoeScratch.allocate(tokens, device, intermediate=640 // world_size,
                                     buffers=experts, output=block_output)
         hc = HyperconnectionScratch.allocate(tokens, device, buffers=mixer,
-                                            projected=projected, block_input=block_input)
+                                            projected=projected, block_input=block_input, lowrank=hyperconnection_lowrank)
         buffers.join(attention, experts, mixer)
         return cls(ids, embedding, residual, hidden, selected, logits, hc, qsa, moe, local_logits)
 
@@ -170,7 +172,8 @@ class PreparedMTP:
         layer = weights.module.layers[0]
         source = scratch.hyperconnection.block_input
         self.attn_hc = PreparedHyperconnection(layer.attn_hyper_connection, scratch.hyperconnection,
-            priming_state=scratch.residual, session=session, name=f"{name}.attn_hc")
+            priming_state=scratch.residual, session=session, name=f"{name}.attn_hc",
+            runtime=runtime, coordinator=coordinator)
         self.attention = PreparedAttention(layer.self_attn, weights.attention, source, scratch.qsa,
             qsa_state, metadata, rotary, session=session, name=f"{name}.qsa", draft_tokens=draft_tokens,
             workspace=workspace, projection_workspace=workspace, max_cache_pages=max_cache_pages,
@@ -178,12 +181,14 @@ class PreparedMTP:
         if cache_only:
             return
         self.mlp_hc = PreparedHyperconnection(layer.mlp_hyper_connection, scratch.hyperconnection,
-            priming_state=scratch.residual, session=session, name=f"{name}.mlp_hc")
+            priming_state=scratch.residual, session=session, name=f"{name}.mlp_hc",
+            runtime=runtime, coordinator=coordinator)
         self.moe = PreparedQwenMoe(source, weights.moe, session=session, name=f"{name}.moe",
             scratch=scratch.moe, workspace=workspace, projection_workspace=workspace)
         self.final_mixer = PreparedHyperconnection(weights.module.hyper_connection_mixer,
             replace(scratch.hyperconnection, block_input=scratch.hidden),
-            priming_state=scratch.residual, session=session, name=f"{name}.final_mixer")
+            priming_state=scratch.residual, session=session, name=f"{name}.final_mixer",
+            runtime=runtime, coordinator=coordinator)
         self.attn_hc.prepare_combine_norm(self.mlp_hc, priming_state=scratch.residual,
             session=session, name=f"{name}.attn_combine_norm")
         self.reductions = ()

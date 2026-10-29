@@ -74,6 +74,8 @@ def chat_template_asset(hidden_size: int):
 
 @dataclass(frozen=True)
 class PreparationConfig:
+    collective_tuning: str = "static"
+    collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
@@ -240,7 +242,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             )
         elif group is not None:
             collective = create_all_reduce_runtime(
-                group, device, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
+                group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
             )
             prefill_collective = create_dma_all_reduce_runtime(
                 group,
@@ -275,6 +277,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
+            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder,
             compile_workers=config.compile_workers, native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             tuning_replica=config.tuning_replica,
             device=device,

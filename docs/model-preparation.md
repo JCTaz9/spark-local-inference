@@ -56,12 +56,12 @@ Unsigned rank staging is private to preparation and cannot load in Helios.
 Flare loads the package files without Python. Helios is a Rust library;
 `flare_heliopause` is a CPython extension imported by Ignition.
 
-Every recipe defaults to FP8 E4M3 KV storage, including learned draft-model
-caches. Qwen Flash retains BF16 selector keys; GLM and DeepSeek retain their
-packed latent formats, including scale metadata and any BF16 rotary fields.
+Recipes default to FP8 E4M3 KV storage, including learned draft-model caches. Qwen Flash retains BF16 selector keys;
+GLM and DeepSeek retain their packed latent formats, including scale metadata and any BF16 rotary fields.
 Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
-scales, and memory planning includes FP8 pages and partial-page snapshots.
+scales where required, and memory planning includes each cache's declared page
+precision and partial-page snapshots.
 Export a package to use these cache layouts; existing packages retain the
 layouts captured when they were prepared.
 
@@ -73,6 +73,39 @@ Set up the preparation environment and build the native CLI:
 uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
+
+Ignition applies three bundled preparation patches to the pinned PyTorch 2.14.1 and
+Triton 3.8 preparation environment before importing preparation libraries in
+`export`, `debug-serve`, `bench`, and `join`, including commands launched through `uv run`.
+`ignition/patches/torch-inductor-triton-cache-filenames.patch` matches
+Triton's 150-character physical cache filenames while retaining full CUDA symbol
+names. `ignition/patches/torch-inductor-cooperative-static-launch.patch` preserves
+cooperative vision reductions in portable static kernels through Triton's CUDA
+launcher, including their cooperative launch attributes and frozen selections.
+`ignition/patches/triton-platform-key-pointer-width.patch` derives Triton's helper
+cache key from the interpreter's pointer width without launching `file`.
+Nsight Systems injection can conflict with `file`'s seccomp sandbox and hang
+startup ([NVIDIA known issues](https://docs.nvidia.com/nsight-systems/ReleaseNotes/index.html#general-issues)).
+The pointer-width key retains machine and operating-system identity and
+invalidates compiled helper caches that used executable linkage metadata.
+Patch application checks dependency versions and exact source context, accepts
+already applied hunks, and replaces installation files atomically without
+modifying uv's shared wheel cache. Each preparation host needs a writable,
+dedicated Flare environment. Reinstalling Torch or Triton restores its distribution files;
+the preparation command reapplies the patches.
+
+`uv sync` installs dependencies without running the patches, and `uv build`
+includes the patch files in Ignition's wheel and source distribution without
+modifying its isolated build environment. For standalone Python tools and tests
+that import Inductor or Triton before invoking Ignition preparation, apply the bundled
+patches before starting their process:
+
+```sh
+uv run --locked --extra prepare python -m ignition.patches
+```
+
+`python scripts/setup_preparation.py` runs the locked preparation/test sync,
+rebuilds FlashInfer and Heliopause, and applies the bundled patches before exiting.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
@@ -140,8 +173,28 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
+`--collective-tuning static|runtime` selects when collective choices become fixed.
+`static` uses ordinary preparation-time autotuning and emits no collective startup
+tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
+overrides the recipe default; the command-line option overrides configuration.
+`runtime` requires `--collective-ladder PATH` and uses the file's final joint
+kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
+compiles that geometry without racing alternatives. A captured tuner selects
+among the supplied submode and active-CTA profiles when the package loads,
+including with autotune effort `off`; geometry stays fixed and no search runs
+during requests. Other collective paths retain their preparation policy. The
+[GB202 PCIe TP4 ladder](../ignition/preparation/ladders/README.md) covers four
+SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
+
+```sh
+--collective-tuning runtime \
+--collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
+```
+
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
-graphics frequency for the b12x tuning batch. It applies to serving ranks and
+graphics frequency for the b12x tuning batch and actual Inductor autotuning
+trials during compiled-forward preparation. Frozen warmup, capture, and serving
+run without these locks. It applies to serving ranks and
 extra tuning replicas, and does nothing with `--autotune-effort off`. The GPU's
 UUID selects the device under `CUDA_VISIBLE_DEVICES`. Run with permission to
 control clocks: Ignition uses `sudo -n nvidia-smi` when not root. Unsupported
@@ -280,13 +333,16 @@ For concurrency 32 with seven draft tokens per request, use
 `qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation on one GPU.
 It uses the canonical Qwen3.5 dense decoder with tensor-scaled FP8 attention
 projections and NVFP4 MLP and vocabulary weights. FP8 KV pages and Gated DeltaNet
-continuations reside in device memory. The checkpoint's BF16 MTP layer shares
-the target embedding and vocabulary head. Speculation defaults to five draft
-tokens, supports up to seven, and commits accepted GDN corrections into one
-recurrent row per request. Draft KV trails target consumption by one token;
-prefix snapshots preserve its partial page separately. The recipe has no
-host-mapped tables or vision graphs. Prepare on the same GPU architecture as
-the serving device:
+continuations reside in device memory. The pinned BF16
+`incoai/Qwen3.8-27B-DFlash2` draft consumes residual features from target layers
+5, 19, 33, 47, and 61 before final normalization, shares the target embedding and
+vocabulary head, and proposes eight-token noncausal blocks. Speculation defaults
+to seven draft tokens with adaptive packed verification capped at 128 physical
+target rows and a 64-graph budget. Accepted GDN corrections commit into one
+recurrent row per request. Five 2,048-token FP8 draft KV rings per continuation
+track target consumption without lag and survive prefix snapshot/restore.
+The recipe has no host-mapped tables or vision graphs. Prepare on the same GPU
+architecture as the serving device:
 
 ```sh
 .venv/bin/ignition export qwen3.8-27b --gpus 0
@@ -295,8 +351,22 @@ the serving device:
 
 Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
 retain draft context so adaptive verification can resume wider rounds.
-`--no-mtp` omits the draft weights and state during preparation;
+`--no-mtp` skips the draft download and omits its weights and state during preparation;
 `flare run PACKAGE --mtp-draft-tokens 0` selects the package's ordinary graphs.
+
+For complete GPU graph round latency without package export, use:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b --gpus 0 --output /tmp/qwen38-rounds.json
+```
+
+This prepares only the selected benchmark graph catalog. Defaults cover request
+batches 1, 2, and 4, verification width eight, and consumed contexts 512, 2,048,
+8,192, and 16,384 tokens. Timing uses real prefilled contexts and restores full
+cache and speculative state before each sample, outside CUDA event timing.
+The [benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines workload
+selection, repetitions, seeds, and the equal-weight latency score. Native
+serving measurements still use an exported package with `flare run`.
 
 ## Qwen3.8 Flash
 
@@ -319,6 +389,17 @@ rows, with explicit flags and configuration taking precedence. Verification is
 rectangular: the default catalog covers five drafts per request through batch 16
 and three drafts at batch 32. Already exported packages retain their captured
 capacities.
+
+`ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
+the 320-wide hyperconnection bottleneck across ranks, including target and MTP
+final mixers. Each rank loads its down-projection rows and up-projection columns;
+normalization and residual injection stay replicated. Partial gate logits round
+to BF16 before transport, and the reduced BF16 logits feed sigmoid and the stream
+mean. This changes reduction rounding relative to the replicated projection.
+The option requires TP2 or TP4 and is recorded in the package's rebuild metadata.
+Replicated execution is the default: the compute savings must outweigh the extra
+10,240-element reduction per mixer and token. Changing the option requires a
+fresh export; `--reuse-weights` requires matching prepared weight layouts.
 
 Vision recipes accept `--image-concurrency N`, independently of
 `--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
@@ -413,6 +494,16 @@ without generating proposals. Ordinary graphs remain available for native
 Standalone proposal, verification, and joined wider speculative graphs are not
 registered in the packed catalog. Image preprocessing preserves the checkpoint's
 row-major patch layout and 1024-token image limit.
+
+`--joint-tuning` enables joint selection of QKV projection, query normalization,
+and query expansion plans. It covers every prepared text execution shape,
+including prefill, ordinary decode, width-one continuations, packed target
+verification, and DSpark proposals. Matching operator declarations share a
+selection scored across their layer contexts; distinct declarations are tuned
+independently. Batch capacity, physical token capacity, attention mode, and mHC
+seams determine the measured contexts. The option defaults to off and requires
+MXFP8 query normalization on the selected GPUs and `--autotune-effort default`
+or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
@@ -551,6 +642,54 @@ when changing this preparation option.
 .venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
   --draft-head-quantization mxfp8
 ```
+
+DeepSeek V4.1 also accepts `--markov-head-quantization fp8`. It stores the draft
+Markov output weights as E4M3 values with one FP32 reconstruction scale per
+vocabulary row. The flag is independent of `--draft-head-quantization`; omit it
+to retain checkpoint precision. Both the fused batch-one and wider prepared
+Markov paths form FP32 transition scores, and the proposal draw and retained
+rejection distribution use those same scores. Target vocabulary weights remain
+BF16 and target logits remain FP32. Row-scaled FP8 is lossy draft arithmetic,
+so seeded text and acceptance may change. To prepare NVFP4 draft vocabulary
+weights together with FP8 Markov weights while retaining the recipe's other
+defaults, run from the repository root:
+
+```sh
+.venv/bin/ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --draft-head-quantization nvfp4 --markov-head-quantization fp8
+```
+
+Use an ordinary export when first changing either head's weight format.
+`--reuse-weights` trusts the previous package's weight bytes, while
+`--no-weights` requires the exact changed payloads to be cached already.
+
+`--vocabulary-parallel-sampling` keeps DeepSeek V4.1 proposal and verification
+probabilities on their vocabulary-owning GPUs. Only normalization statistics,
+selected-token probabilities, and residual winners cross ranks. The default is
+disabled. DeepSeek V4.1 requires TP4 for this option; its TP3 gather is unavailable.
+The option requires positive learned draft depth and supports BF16 or
+row-scaled FP8 Markov weights; NVFP4 Markov weights are unsupported. Target
+vocabulary weights and logits retain BF16 and FP32 precision. Full softmax and
+greedy targets are supported; top-k, top-p, and min-p filtering must remain
+disabled, as in the recipe's default policy. Raw generation logprobs and grammar
+constraints remain available. Block rejection changes seeded output relative to
+the full-vocabulary serial sampler.
+
+For a TP4, single-request configuration with seven drafts, run:
+
+```sh
+.venv/bin/python -m ignition export deepseek-v4.1-flash --gpus 0,1,2,3 \
+  --max-concurrency 1 --mtp-draft-tokens 7 --speculative-token-capacity 8 \
+  --prefill-chunk-size 4096 --expert-scale-compression native --mla-compute-mode bf16 \
+  --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
+  --vocabulary-parallel-sampling --joint-tuning --collective-tuning runtime \
+  --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
+```
+
+Use a fresh weight export when first enabling this option: the Markov head's
+stored vocabulary partition changes. Complete-model serving has been exercised
+at TP4 with one concurrent request; wider serving configurations still need
+model validation.
 
 ## DeepSeek V4 Flash
 
@@ -793,12 +932,87 @@ weight budget for this encoding; loading reports its actual allocation.
 flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0,1,2,3
 ```
 
+## Muse Spark Open
+
+The `muse-spark-open-nvfp4` alias selects
+[`meta-models/Muse-Spark-Open-816B-A42B-NVFP4`](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4)
+at revision `4239e4db19376904f2e82c167e78f70abb5455fe`. Text preparation uses
+eight SM120 GPUs, checkpoint NVFP4 experts, FP8 E4M3 KV storage, a 262144-token
+context, four concurrent requests, and 4096-token prefill chunks. Target and draft
+queries and attention outputs use BF16. Image, audio, and video are not prepared.
+
+DFlash2 drafting uses
+[`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2)
+at revision `fbec887a79866e9ecff6c57adfd9fd02aa3cadea`. Preparation downloads
+its configuration and weights into the configured Hugging Face hub cache. The
+five-layer BF16 draft uses eight-token blocks with seven proposed tokens, target
+features from layers 3, 19, 31, 47, and 59, and 2048-token sliding attention.
+Target and draft histories use unit-scale FP8 E4M3 storage. The default adaptive
+verification catalog uses width-one and width-eight graphs with per-request
+prefixes of one through eight tokens and 32 packed target-token rows.
+`--mtp-draft-tokens N` selects zero through seven proposals;
+`--no-mtp-adaptive-verification` fixes the verification width. `--no-mtp` skips
+the draft download, weights, state, and speculative graphs.
+
+At tensor parallelism eight, draft weights occupy 1,596,065,024 bytes per rank,
+including replicated convolution and candidate-selection tensors and fused context
+projections. Each continuation row occupies 27,525,120 bytes with draft history
+or 24,903,680 bytes with `--no-mtp`; each 128-token paged KV block occupies
+524,288 bytes. These cache sizes exclude transient graph scratch.
+
+Sampling follows the checkpoint model card: temperature 1.0, top-p 1.0, and
+top-k disabled. The checkpoint generation configuration's top-k 64 is not the
+recommended inference default. Reasoning effort accepts `low`, `medium`,
+`high`, and `xhigh`, with `xhigh` as the template default. Set
+`reasoning_effort` or `chat_template_kwargs.reasoning_effort` explicitly to
+override it.
+
+Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
+routed-expert outputs, independent FC1 half gains, and head-dimension-64 paged
+decode with BF16 queries and FP8 E4M3 caches, including quantized sliding-cache
+verification and rollback. The FlashInfer Git dependency pinned in
+`pyproject.toml` lacks these operators. Complete the standard environment setup and install the local
+checkout's build and runtime requirements into `.venv` first. Build requirements
+include `setuptools>=77`, `packaging>=24`, and `apache-tvm-ffi>=0.1.11,<0.2`;
+the CUDA 13 checkout's NCCL-EP dependency requires `nvidia-nccl-cu13>=2.30.7`.
+Install the checkout containing the required operators with:
+
+```sh
+FLASHINFER_BUILD_NO_PIP=1 uv pip install --python .venv/bin/python \
+  --no-deps --no-build-isolation -e /path/to/flashinfer
+```
+
+`FLASHINFER_BUILD_NO_PIP=1` disables nested dependency installation and NCCL
+upgrades in the FlashInfer build hook. `--no-build-isolation` uses the build
+requirements already installed in `.venv`.
+
+Running `uv sync --locked --extra prepare --extra test` restores the pinned Git
+dependency, so repeat the editable installation afterward when preparing Muse
+Spark. The local checkout must provide both the `flashinfer` and `b12x` imports.
+
+The annotated template in `ignition/recipes/muse_spark/assets/chat_template.jinja`
+preserves the canonical checkpoint bytes when message marks are removed.
+Native recipient headers route `self` messages to reasoning, `commentary` and
+`user` messages to visible content, and tool recipients through ATEM function
+calls. `<|eom|>` separates messages within a generated turn; `<|eot|>` and
+`<|end_of_text|>` end generation. Tool arguments in request history are normalized
+to JSON objects before rendering. Caller content and header attributes retain
+the canonical control-sequence escaping.
+
+```sh
+.venv/bin/ignition export muse-spark-open-nvfp4 --gpus 0-7 --prompt-logprobs
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/muse-spark-tp8.safetensors
+flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
+```
+
 ## Storage and graph capacities
 
-Gemma 4 defaults to four concurrent requests; its speculative target-token capacity
-is the larger of padded concurrency and draft count plus one, giving six rows at
-its default settings. Other recipes default to 32 concurrent requests, with
-speculative recipes declaring 128 target-token rows independently of concurrency.
+Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
+target-token capacity is the larger of padded concurrency and draft count plus
+one, giving six rows at its default settings. Muse Spark declares 32 packed
+target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
+default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
+of concurrency.
 Explicit flags and configuration override these defaults; existing packages retain their
 captured capacities. Memory planning rejects capacities that do not fit the
 selected GPUs.
@@ -810,6 +1024,7 @@ selected GPUs.
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
 | DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
+| Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
 
 The 128-row rectangular catalogs cover full draft depth through batch 16.
 Gemma 4's six-row default covers five drafts at batch 1 and two at batch 2,

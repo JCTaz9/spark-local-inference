@@ -29,7 +29,7 @@ speculative completion vector. All tensors have contiguous row-major storage.
 
 | Buffer | dtype | Shape | Meaning |
 | --- | --- | --- | --- |
-| `completion_records` | int64 | `[2, capacity, 24]` | ABI4 completion vectors |
+| `completion_records` | int64 | `[2, capacity, 24]` | ABI5 completion vectors |
 | `completion_logprobs` | int32 | `[2, capacity, 8, 2+2*K]` | Packed token statistics |
 | `logprob_requested` | int32 | `[capacity]` | Nonzero for requesting lanes in this submission |
 
@@ -48,7 +48,7 @@ semantic contract contains the requested output layout and its value bindings.
 
 The reduction reads the active completion frame after its token writer finishes.
 For a sampling row, the row's slot and epoch must match the record and the record
-must emit a token. ABI4 records identify the emitted prefix; ordinary sampling
+must emit a token. ABI5 records identify the emitted prefix; ordinary sampling
 emits position zero. The raw logit row corresponds to that slot's sampled token
 position.
 

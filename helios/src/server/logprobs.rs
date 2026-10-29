@@ -228,18 +228,32 @@ mod tests {
             let mut config = config(true);
             config.syntax.tools = Some(ToolParser { kind, wrapping_newlines: 0, tag_separator: separator.into() });
             config.control_tokens = vec![(1, boundary.into())];
-            let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
-            decoder.track_logprobs(&frontend, true);
-            let mut events = Vec::new();
-            for token in 0..3 {
-                events.extend(decoder.push_logprob(value(token)).unwrap());
+            for worker in [false, true] {
+                let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config.clone()));
+                decoder.track_logprobs(&frontend, true);
+                let mut events = Vec::new();
+                if worker {
+                    let mut stops = crate::server::stops::TextStops::new(&frontend, vec!["UNMATCHED".into()]).unwrap();
+                    stops.track(&frontend);
+                    for token in 0..3 {
+                        let (pieces, matched) = stops.push_logprob(token, value(token), false).unwrap();
+                        assert!(!matched);
+                        events.extend(decoder.push_protocol(pieces).unwrap());
+                    }
+                    let (pieces, _) = stops.finish(None).unwrap();
+                    events.extend(decoder.push_protocol(pieces).unwrap());
+                } else {
+                    for token in 0..3 {
+                        events.extend(decoder.push_logprob(value(token)).unwrap());
+                    }
+                }
+                events.extend(decoder.finish(Termination::Eos).unwrap());
+                let content: Vec<_> = events.iter().filter_map(|e| match e {
+                    Event::ContentLogprobs(entries) => Some(entries.iter().map(|e| e.value.token)),
+                    _ => None,
+                }).flatten().collect();
+                assert_eq!(content, [2], "{kind:?} {separator:?} worker={worker}");
             }
-            events.extend(decoder.finish(Termination::Eos).unwrap());
-            let content: Vec<_> = events.iter().filter_map(|e| match e {
-                Event::ContentLogprobs(entries) => Some(entries.iter().map(|e| e.value.token)),
-                _ => None,
-            }).flatten().collect();
-            assert_eq!(content, [2], "{kind:?} {separator:?}");
         }
     }
 

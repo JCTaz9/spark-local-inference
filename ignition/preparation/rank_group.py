@@ -125,6 +125,9 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
     except BaseException:  # noqa: BLE001 - Never unwind CUDA resources around a stranded collective.
         traceback.print_exc()
         os._exit(1)
+    # Explicit cleanup has drained rank work and released shared resources.
+    # Process exit reclaims residual CUDA owners without interpreter finalization.
+    os._exit(0)
 
 
 class PreparedRankGroup:

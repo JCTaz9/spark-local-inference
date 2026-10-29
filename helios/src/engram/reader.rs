@@ -13,7 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 
-#[cfg(any(unix, test))]
+#[cfg(test)]
 use std::path::Path;
 
 #[cfg(windows)]
@@ -72,7 +72,7 @@ impl Aligned {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(test)]
 pub(super) fn open_file(path: &Path) -> Result<File> {
     crate::os::direct_file(path, false).map_err(|e| format!("open Engram package: {e}").into())
 }

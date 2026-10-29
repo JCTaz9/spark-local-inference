@@ -611,11 +611,13 @@ mod tests {
             graphs: vec![],
             reservations: vec![],
             execution: Some(wire::Execution {
+                tuning_graphs: vec![],
                 abi_version: 9,
                 max_active: 32,
                 input_frame_bytes: 0,
                 buffers: vec![],
                 graphs: vec![wire::ExecutionGraph {
+                    tuned_bindings: vec![],
                     confidence_width: 0,
                     name: "decode_b32".into(),
                     kind: "decode".into(),

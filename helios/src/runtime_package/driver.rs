@@ -120,6 +120,7 @@ driver! {
     release_address: "cuMemAddressFree"(u64, usize);
     physical_create: "cuMemCreate"(*mut u64, usize, *const AllocationProperties, u64);
     physical_release: "cuMemRelease"(u64);
+    physical_retain: "cuMemRetainAllocationHandle"(*mut u64, *mut c_void);
     granularity: "cuMemGetAllocationGranularity"(*mut usize, *const AllocationProperties, c_int);
     map: "cuMemMap"(u64, usize, usize, u64, u64);
     unmap: "cuMemUnmap"(u64, usize);

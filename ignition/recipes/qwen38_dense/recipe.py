@@ -1,6 +1,7 @@
 """Single-GPU Qwen3.8-27B NVFP4 text preparation without host-mapped storage."""
 
 from types import MappingProxyType
+from pathlib import Path
 
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
@@ -12,18 +13,27 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     if plan.world_size != 1 or ranks is not None:
         raise ValueError("Qwen dense preparation supports one local GPU")
     speculation = plan.speculation
-    config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
+    drafting = {}
+    if speculation is not None:
+        from huggingface_hub import snapshot_download
+        from .draft_config import REPOSITORY, REVISION
+
+        drafting = dict(draft_snapshot=Path(snapshot_download(REPOSITORY, revision=REVISION,
+            cache_dir=plan.hub_cache, allow_patterns=("config.json", "model.safetensors"))),
+            speculative_graph_budget=speculation.graph_budget or 64)
+    selection = plan.benchmark_selection
+    config = PreparationConfig(benchmark_selection=selection, collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
-        max_active=plan.concurrency, context=plan.context,
+        max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, mtp=speculation is not None,
         speculative_widths=(1,) if speculation is None else speculation.widths,
         speculative_fixed_width=None if speculation is None else speculation.fixed_width,
-        speculative_token_capacity=None if speculation is None else plan.speculative_token_capacity)
+        speculative_token_capacity=None if speculation is None else plan.speculative_token_capacity, **drafting)
     return prepare_model(snapshot, config, progress=progress, package_storage=package_storage)
 
 
@@ -40,10 +50,10 @@ RECIPE = Recipe(
                 "presence_penalty": SamplingRange(0., 2.)}),
     checkpoints=(Checkpoint(alias="qwen3.8-27b", repository="nvidia/Qwen3.8-27B-NVFP4",
         revision="482ca0f3832238542f8f5295dde86b5f22711d80", architecture="Qwen3_5ForConditionalGeneration",
-        stored_bytes=21_921_428_072, device_bytes=20_999_967_880, draft_bytes=849_398_784,
+        stored_bytes=21_921_428_072, device_bytes=24_104_235_656, draft_bytes=3_953_666_560,
         expansion_bytes=307_871_744),),
     context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
-    ranks=MappingProxyType({1: RankCosts(165_292_288, 4_456_448, 4 << 30)}),
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, verification_rows=0,
+    ranks=MappingProxyType({1: RankCosts(186_001_664, 4_194_304, 4 << 30)}),
     plain_ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),
 )

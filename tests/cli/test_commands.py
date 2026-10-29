@@ -77,7 +77,7 @@ def test_unknown_commands_flags_and_abbreviations_are_usage_errors(host, capsys)
                       ["export", "qwen3.8-flash", "--max", "2"], ["join", "10.0.0.1:29600"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "17"], ["debug-serve", "--ranks", "17"],
                       ["serve", "qwen3.8-flash"], ["run", "qwen3.8-flash"], ["plan", "qwen3.8-flash"],
-                      ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["bench"], ["config"], ["skill"]):
+                      ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["config"], ["skill"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
         assert exit.value.code == 2
@@ -294,3 +294,24 @@ def test_lock_gpu_clocks_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).lock_gpu_clocks
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--lock-gpu-clocks"]).lock_gpu_clocks
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_joint_tuning_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).joint_tuning
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--joint-tuning"]).joint_tuning
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_shard_hyperconnections_flag(command):
+    parser = _parser()
+    assert not parser.parse_args([command, "qwen3.8-flash"]).shard_hyperconnections
+    assert parser.parse_args([command, "qwen3.8-flash", "--shard-hyperconnections"]).shard_hyperconnections
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_collective_tuning_preparation_flag_is_explicit(command):
+    assert _parser().parse_args([command, "qwen3.8-flash"]).collective_tuning is None
+    for mode in ("static", "runtime"):
+        assert _parser().parse_args([command, "qwen3.8-flash", "--collective-tuning", mode]).collective_tuning == mode

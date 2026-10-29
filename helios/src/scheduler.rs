@@ -5,11 +5,13 @@ mod learning;
 mod policy;
 mod refresh;
 mod service;
+mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
+pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
 pub(crate) mod decoded_history;
 mod rounds;
@@ -20,12 +22,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::cache::{
-    CheckpointId, CompletionUpdate, ConditioningEvent, EvictionTarget, Fence, Lookup, PageId,
-    PrefixCheckpointCache, PrefixHistory, PrefixKey, Publication, PublishResult, SnapshotId,
-    StateSnapshot,
+    CheckpointId, CompletionUpdate, ConditioningEvent, EvictionReport, EvictionTarget, Fence,
+    Lookup, PageId, PrefixCheckpointCache, PrefixHistory, PrefixKey, Publication, PublishResult,
+    Reclaimable, SnapshotId, StateSnapshot,
 };
 use crate::execution::{CompletionRecord, GraphKind, REQUEST_LANES};
-use crate::offload::{InboundTicket, PublishedCheckpoint};
+use flare_selene::{InboundTicket, PublishedCheckpoint};
 use crate::{Result, Shutdown};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -203,6 +205,7 @@ struct BoundaryCapture {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(any(feature = "server", test))]
 pub(crate) struct ConditionedInput {
     pub token_span: std::ops::Range<usize>,
     pub feature_range: std::ops::Range<usize>,
@@ -211,9 +214,12 @@ pub(crate) struct ConditionedInput {
 
 #[derive(Clone, Debug)]
 struct ConditionedWindow {
+    #[cfg(any(feature = "server", test))]
     inputs: std::ops::Range<usize>,
+    #[cfg(any(feature = "server", test))]
     token_start: usize,
     prefill_end: usize,
+    #[cfg(any(feature = "server", test))]
     features: Vec<std::ops::Range<usize>>,
     patches: VecDeque<usize>,
 }
@@ -311,11 +317,13 @@ impl LiveRequest {
             self.prefix_snapshot
         }
     }
+    #[cfg(feature = "server")]
     pub(crate) fn conditioned_input_end(&self) -> usize {
         self.conditioned_windows
             .front()
             .map_or(usize::MAX, |window| window.inputs.end)
     }
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn conditioned_window_ready(&self) -> bool {
         self.window_snapshot_ready
     }
@@ -667,6 +675,9 @@ pub struct RequestScheduler {
     tickets: HashMap<PrefixKey, Ticket>,
     track_publications: bool,
     publications: Vec<CheckpointId>,
+    track_evictions: bool,
+    evictions: Vec<EvictedCheckpoint>,
+    evictions_lost: bool,
     admissions: u64,
 }
 
@@ -740,6 +751,9 @@ impl RequestScheduler {
             tickets: HashMap::new(),
             track_publications: false,
             publications: Vec::new(),
+            track_evictions: false,
+            evictions: Vec::new(),
+            evictions_lost: false,
             admissions: 0,
         })
     }
@@ -954,6 +968,7 @@ impl RequestScheduler {
         self.decoded_history.as_ref().map_or(([-1; 7], 0), |history| history.lookup(context, maximum))
     }
 
+    #[cfg(feature = "server")]
     pub(crate) fn resume_decoded_sequence(
         &mut self,
         handle: RequestHandle,
@@ -1137,7 +1152,7 @@ impl RequestScheduler {
                     "request resources are awaiting GPU retirement",
                 ));
             }
-            let evicted = self.cache.evict(EvictionTarget {
+            let evicted = self.evict(EvictionTarget {
                 pages: need_pages,
                 snapshots: need_snapshots,
             });
@@ -1222,7 +1237,7 @@ impl RequestScheduler {
                 if self.pending_page_count() >= want {
                     break;
                 }
-                let evicted = self.cache.evict(EvictionTarget {
+                let evicted = self.evict(EvictionTarget {
                     pages: want - self.free_pages.len(),
                     snapshots: 0,
                 });
@@ -1311,6 +1326,35 @@ impl RequestScheduler {
         Ok(())
     }
 
+    /// Tokens a request may consume, including the widest speculative verification.
+    fn execution_limit(&self, prompt_tokens: usize, max_new_tokens: u32) -> usize {
+        let extra = self.speculative_widths.last().copied().unwrap_or(1) - 1;
+        (prompt_tokens + max_new_tokens as usize)
+            .saturating_add(extra)
+            .min(self.limits.max_sequence_tokens)
+    }
+
+    /// Pages a request reserves at admission when the destination already holds
+    /// `consumed_tokens`: a growable request reserves its prompt and one page of
+    /// output, and decoding grows it.
+    fn admission_pages(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        growable: bool,
+        consumed_tokens: u64,
+    ) -> usize {
+        let page_tokens = self.capabilities.page_tokens;
+        let execution_limit = self.execution_limit(prompt_tokens, max_new_tokens);
+        let limit = if growable {
+            execution_limit.min(prompt_tokens + page_tokens)
+        } else {
+            execution_limit
+        };
+        limit.div_ceil(page_tokens) - (consumed_tokens / page_tokens as u64) as usize
+            + self.draft_pages()
+    }
+
     pub fn admit(&mut self, spec: RequestSpec) -> Result<RequestHandle> {
         let plan = self.plan_admission(&spec)?;
         Ok(self.admit_planned(spec, plan, None)?.handle)
@@ -1346,6 +1390,15 @@ impl RequestScheduler {
             Lookup { checkpoint: None, consumed_tokens: 0, pages: Vec::new(), snapshot: None }
         } else { self.cache.lookup(&history)? };
         Ok(AdmissionPlan { history, lookup })
+    }
+
+    /// Recheck GPU residency while retaining a queued request's validated history.
+    #[cfg(feature = "server")]
+    pub(crate) fn refresh_admission_plan(&mut self, plan: &AdmissionPlan) -> Result<AdmissionPlan> {
+        Ok(AdmissionPlan {
+            history: plan.history.clone(),
+            lookup: self.cache.lookup(&plan.history)?,
+        })
     }
 
     fn free_slot(&self) -> Result<usize> {
@@ -1411,29 +1464,14 @@ impl RequestScheduler {
         if let Some(id) = pinned {
             self.cache.pin(id)?;
         }
-        let extra = self.speculative_widths.last().copied().unwrap_or(1) - 1;
-        let execution_limit = (spec.prompt.len() + spec.max_new_tokens as usize)
-            .saturating_add(extra)
-            .min(self.limits.max_sequence_tokens);
-        let draft_page = if !self.speculative_widths.is_empty()
-            && self.proposal_source == speculation::ProposalSource::Mtp
-        {
-            self.capabilities.draft_pages_per_request
-        } else {
-            0
-        };
-        // A growable request reserves its prompt and one page of output; decoding grows it.
-        let admission_limit = if spec.growable_output {
-            execution_limit.min(spec.prompt.len() + self.capabilities.page_tokens)
-        } else {
-            execution_limit
-        };
-        let reserved_count = admission_limit.div_ceil(self.capabilities.page_tokens)
-            - (consumed / page_tokens) as usize
-            + draft_page;
-        if admission_limit.div_ceil(self.capabilities.page_tokens) + draft_page
-            > self.limits.pages as usize
-        {
+        let execution_limit = self.execution_limit(spec.prompt.len(), spec.max_new_tokens);
+        let reserved_count = self.admission_pages(
+            spec.prompt.len(),
+            spec.max_new_tokens,
+            spec.growable_output,
+            consumed,
+        );
+        if reserved_count + (consumed / page_tokens) as usize > self.limits.pages as usize {
             if let Some(id) = pinned {
                 self.cache.unpin(id)?;
             }
@@ -1767,6 +1805,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn conditioned_inputs_ready(
         &mut self,
         handle: RequestHandle,
@@ -1797,6 +1836,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn set_conditioned_inputs(
         &mut self,
         handle: RequestHandle,
@@ -1929,6 +1969,7 @@ impl RequestScheduler {
         Ok(())
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn resume_conditioned_window(
         &mut self,
         handle: RequestHandle,
@@ -2241,7 +2282,7 @@ impl RequestScheduler {
             for lane in &step.lanes {
                 let record = &records[lane.request.slot as usize];
                 record.validate_vector()?;
-                let vector = record.vector.ok_or("speculative round completion requires ABI4")?;
+                let vector = record.vector.ok_or("speculative round completion requires ABI5")?;
                 if record.status != 0 && record.status != 3 {
                     let offered = usize::try_from(vector.offered_drafts)
                         .map_err(|_| "negative speculative prefix offer")?;
@@ -2318,7 +2359,7 @@ impl RequestScheduler {
                     return Err("token vector does not match committed request progress".into());
                 }
             } else if matches!(kind, GraphKind::Speculative) {
-                return Err("speculative completion requires ABI4 token vector".into());
+                return Err("speculative completion requires ABI5 token vector".into());
             }
             if record.generation != lane.request.generation as i64
                 || record.submission_sequence != fence.0 as i64

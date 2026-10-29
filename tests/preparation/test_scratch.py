@@ -106,6 +106,32 @@ def test_rank_scratch_finalization_preserves_shared_offsets(monkeypatch):
     assert arena.nbytes == 1024
 
 
+def test_trial_binding_replaces_parallel_plans_and_retains_finalizers():
+    arena = ScratchArena("cpu")
+    class Plan:
+        def __init__(self, size):
+            self.size = size
+
+        def memory_requirements(self):
+            return SimpleNamespace(scratch_nbytes=self.size)
+
+    original, replacement, side = Plan(128), Plan(384), Plan(256)
+    arena.register_parallel(original, side)
+    arena.reserve(1024)
+    bound = []
+    arena.register_finalizer(lambda: bound.append(arena.views(((64,), torch.uint8))[0]))
+    arena.finalize(retain=True)
+    assert len(bound) == 1 and bound[0].data_ptr() == arena.tensor.data_ptr()
+    arena.replace_parallel_plans({original: replacement})
+    assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 768
+    arena.finalize()
+    assert len(bound) == 2 and bound[1].data_ptr() == bound[0].data_ptr()
+    assert arena._finalizers == []
+    arena.freeze()
+    with pytest.raises(RuntimeError, match="frozen"):
+        arena.replace_parallel_plans({replacement: original})
+
+
 def test_arena_owns_one_aligned_highwater_storage_across_operator_specs():
     arena = ScratchArena("cpu")
     assert arena.nbytes == 0 and arena.device == torch.device("cpu")

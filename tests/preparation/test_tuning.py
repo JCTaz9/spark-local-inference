@@ -18,6 +18,7 @@ from ignition.preparation.tuning import (
     benchmark_resource,
     declare,
     register_finalizer,
+    _local_tuning_catalog,
 )
 
 
@@ -153,6 +154,57 @@ class Request:
     collective: object = None
     retain_benchmark_call: bool = False
     dependencies: tuple[str, ...] = ()
+    finalist_policy: object = None
+
+
+def test_context_choice_rebinds_declared_plan_owner_and_parallel_scratch(backend):
+    session = make_session(device=0, checkpoint="context-bindings")
+    session.device.identity = "test-device"
+    arena = ScratchArena("cpu")
+    arena.reserve(1024)
+    session.register_scratch(arena)
+
+    class Plan:
+        def __init__(self, *, override=None, size=256):
+            self.override = override
+            self.prepared = SimpleNamespace(device=SimpleNamespace(identity="test-device"))
+            self.selection = SimpleNamespace(source="tuned" if override is None else "override",
+                                              config={"tile": 32 if override is None else override})
+            self.size = size
+
+        def same_declaration_except_override(self, other):
+            return isinstance(other, Plan)
+
+        def memory_requirements(self):
+            return SimpleNamespace(scratch_nbytes=self.size)
+
+    original, alternative, writer = Plan(), Plan(override=64, size=512), Plan(size=128)
+    request = Request("q_b", original, lambda state: None, finalist_policy="families")
+    session.declare((request,))
+    arena.register_parallel(original, writer)
+    owner = SimpleNamespace(plan=original)
+    session.register_context_plan("q_b", original, lambda plan: setattr(owner, "plan", plan))
+    session._context_original_requests = dict(session._recorded_requests)
+    session._tune_status = "contextual"
+
+    previous = session.bind_context_plans({"q_b": alternative})
+    assert previous == {"q_b": original}
+    assert owner.plan is alternative and session._recorded_requests["q_b"].plan is alternative
+    assert session._recorded_requests["q_b"].finalist_policy is None
+    assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 768
+    session.preview_context_bindings()
+    assert not arena.frozen and session._context_scratch_owner is arena.tensor
+    session.close()
+
+
+def test_finalist_policy_applies_to_every_equivalent_declaration(backend):
+    session = make_session(device=0, checkpoint="context-families")
+    session.declare((declaration("first"), declaration("second"), declaration("different", size=256)))
+    session._set_finalist_policies({"first": "candidate-families"})
+    assert session._recorded_requests["first"].finalist_policy == "candidate-families"
+    assert session._recorded_requests["second"].finalist_policy == "candidate-families"
+    assert session._recorded_requests["different"].finalist_policy is None
+    session.close()
 
 
 def declaration(name, *, component="sequence.gdn_prefill", size=128, selected_size=None, source="tuned",
@@ -488,10 +540,11 @@ def test_explicit_cpu_budget_reaches_b12x_without_environment_switch(backend):
 
 
 
+@pytest.mark.parametrize("matching_catalog", [True, False])
 @pytest.mark.parametrize("identical", [True, False])
 @pytest.mark.parametrize("workers", [None, 4])
 @pytest.mark.parametrize("spans_hosts", [False, True])
-def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, identical, workers, spans_hosts):
+def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, identical, matching_catalog, workers, spans_hosts):
     import torch.distributed as dist
 
     monkeypatch.setattr(torch.cuda, "get_device_properties",
@@ -508,15 +561,18 @@ def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, ident
 
     coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda: None,
         local_ranks=1 if spans_hosts else 2, spans_hosts=spans_hosts,
-        same_on_every_rank=lambda value: identical and value == "NVIDIA GB10",
+        same_on_every_rank=lambda value: identical and matching_catalog and value ==
+            ("NVIDIA GB10", _local_tuning_catalog((declaration("op"),))),
         share_selections=shared.append, agree_selections=lambda selections: None, prepare=prepare)
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator, compile_workers=workers)
     session.declare((declaration("op"),))
     report = session.tune()
+    assert session.autotune
     assert report["compile_workers"] == (8 if workers is None else workers // coordinator.local_ranks)
     # Sharded races exchange results through the coordinator even in jobs without collectives.
-    assert (shards, shared, coordinated) == (([(1, (0, 1))], [], [("op",)]) if identical
-                                             else ([], ["rank cache"] if spans_hosts else [], []))
+    expected = ([(1, (0, 1))], [], [("op",)]) if identical and matching_catalog else (
+        [], ["rank cache"] if spans_hosts else [], [])
+    assert (shards, shared, coordinated) == expected
 
 
 def test_helpers_preserve_ordinary_session_behavior():
@@ -716,6 +772,65 @@ def test_close_retries_restoration_after_base_session_has_closed(backend, monkey
     session.close()
     session.close()
     assert attempts == ["restore", "restore"]
+    assert session._tune_status == "closed" and not session._benchmark_restorers
+
+
+@pytest.mark.parametrize("failure", [None, "eviction", "restoration"])
+def test_terminal_collection_reclaims_tuning_owners_before_restoration(monkeypatch, failure):
+    import gc
+    from b12x.preparation import DetectedDevice
+    from b12x.preparation import session as preparation
+
+    class Owner:
+        def __init__(self):
+            self.cycle = self
+
+    session = make_session(device=DetectedDevice(None, None), checkpoint="terminal-collection")
+    owner = Owner()
+    reference = weakref.ref(owner)
+    events = []
+    attempts = 0
+
+    def restore():
+        nonlocal attempts
+        attempts += 1
+        events.append(("restore", reference() is None))
+        if failure == "restoration" and attempts == 1:
+            raise RuntimeError("restoration failed")
+
+    session.register_benchmark_resource("borrowed", owner, restore=restore)
+    del owner
+    session._reclaim_programs()
+    assert reference() is not None
+
+    if failure == "eviction":
+        def fail_eviction(keep):
+            raise RuntimeError("eviction failed")
+        monkeypatch.setattr(preparation, "evict_unretained", fail_eviction)
+
+    def observe(phase, info):
+        if phase == "stop" and info["generation"] == 2:
+            events.append(("collect", reference() is None))
+
+    automatic = gc.isenabled()
+    gc.disable()
+    gc.callbacks.append(observe)
+    try:
+        if failure is None:
+            session.close()
+        else:
+            with pytest.raises(RuntimeError, match=f"{failure} failed"):
+                session.close()
+        session.close()
+        session.close()
+    finally:
+        gc.callbacks.remove(observe)
+        if automatic:
+            gc.enable()
+    expected = [("collect", True), ("restore", True)]
+    if failure == "restoration":
+        expected.append(("restore", True))
+    assert events == expected
     assert session._tune_status == "closed" and not session._benchmark_restorers
 
 
@@ -1439,4 +1554,37 @@ def test_clock_lock_released_on_tuning_failure(backend, monkeypatch):
     with pytest.raises(RuntimeError, match="race failed"):
         session.tune()
     assert events == ["lock", "unlock"]
+    session.close()
+
+
+def test_local_tuning_catalog_preserves_semantics_without_bound_device_ordinals():
+    first, peer = declaration("projection"), declaration("projection")
+    first.plan._device, peer.plan._device = 0, 1
+    assert _local_tuning_catalog((first,)) == _local_tuning_catalog((peer,))
+    assert _local_tuning_catalog((first,)) != _local_tuning_catalog(())
+    peer.plan.query = 256
+    assert _local_tuning_catalog((first,)) != _local_tuning_catalog((peer,))
+    collective = declaration("reduce")
+    collective.collective = object()
+    assert _local_tuning_catalog((first, collective)) == _local_tuning_catalog((first,))
+
+
+@pytest.mark.parametrize("mode", ["static", "runtime"])
+def test_collective_selection_is_reported_without_partitioning_operator_cache(backend, tmp_path, mode):
+    from ignition.preparation.collective_ladder import load
+    ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json") if mode == "runtime" else None
+    session = make_session(device=0, checkpoint="collective-policy", collective_tuning=mode, collective_ladder=ladder)
+    assert session.collective_tuning == mode
+    from b12x.preparation._cache import SelectionCache
+
+    static = make_session(device=0, checkpoint="collective-policy")
+    assert session.namespace == static.namespace
+    identity = dict(schema_version=23, tuning_cache_version=1, namespace=session.namespace.to_dict())
+    original = dict(schema_version=23, tuning_cache_version=1,
+                    namespace=dict(checkpoint="collective-policy", workload_schema="test-operators-v1",
+                                   numerical_policy="default"))
+    assert SelectionCache(tmp_path, identity).path == SelectionCache(tmp_path, original).path
+    static.close()
+    session.declare((declaration("op"),))
+    assert session.tune()["collective_tuning"] == mode
     session.close()

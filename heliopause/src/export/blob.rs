@@ -75,6 +75,7 @@ impl BlobStore {
             },
         );
     }
+    #[cfg(test)]
     pub(crate) fn put(
         &self,
         size: u64,
@@ -243,6 +244,7 @@ impl BlobStore {
         self.remember(name.to_owned(), file, identity.clone());
         Ok(identity)
     }
+    #[cfg(test)]
     pub(crate) fn link(&self, name: &str, directory: &Path) -> Result<()> {
         if !archive::blob_name(name) {
             return Err("invalid payload blob name".into());
@@ -278,9 +280,6 @@ impl BlobStore {
             Err(e) => return Err(e.into()),
         }
         Ok(())
-    }
-    pub(crate) fn sync(&self) -> Result<()> {
-        archive::sync_directory(&self.root)
     }
 }
 
@@ -347,9 +346,11 @@ fn readonly(file: &File) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn same_inode(first: &File, second: &File) -> Result<bool> {
     Ok(Identity::of(first)?.same_file(&Identity::of(second)?))
 }
+#[cfg(test)]
 fn same_content_identity(first: &Identity, second: &Identity) -> bool {
     first.same_content(second)
 }
@@ -362,6 +363,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     }
     text
 }
+#[cfg(test)]
 fn decode_digest(text: &str) -> Result<[u8; 32]> {
     let mut digest = [0; 32];
     if text.len() != 64 {

@@ -26,7 +26,8 @@ def test_recipe_declares_sources_storage_cursors_and_frontend(recipe, page, lag,
     contract = module.prepare(signatures, {"page_tables": None, "draft_page_tables": None}, pool,
         page_tokens=page, draft_lag=lag, rows=rows)
     encoded = ParseDict(contract, p.ModelContract())
-    assert encoded.version == 2 and encoded.input_vocabulary >= encoded.vocabulary
+    assert encoded.version == 3 and encoded.input_vocabulary >= encoded.vocabulary
+    assert all(graph["tuned_bindings"] == [] for graph in contract["graphs"])
     assert "schema" not in contract
     for operation in (p.INIT, p.RESTORE):
         producer = next(graph for graph in encoded.graphs if graph.kind == operation)

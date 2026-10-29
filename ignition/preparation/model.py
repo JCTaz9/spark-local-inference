@@ -18,16 +18,33 @@ class PreparedModel(PreparedExecution):
     """
 
     def __init__(self, *, server_config, memory_report, session, close_resources=(), package_data=None,
-                 forwards=None, embedding_catalog=None, rebuild_weights=None, **kwargs):
+                 forwards=None, embedding_catalog=None, rebuild_weights=None,
+                 benchmark_state=None, benchmark_pool=None, benchmark_requests=None, benchmark_rounds=None, **kwargs):
+        registry = getattr(session, "_startup_collectives", None)
+        if registry is not None:
+            buffers, tuners, bindings, owners = registry.catalog(kwargs["graphs"])
+            kwargs["buffers"] = {**kwargs["buffers"], **buffers}
+            kwargs["resources"] = (*kwargs.get("resources", ()), *owners)
+            kwargs["tuning_graphs"] = tuners
+            kwargs["tuned_bindings"] = bindings
         super().__init__(**kwargs)
-        if forwards is not None and set(forwards) != set(self.graphs):
+        if forwards is not None and set(forwards) != set(self.serving_graphs):
             raise ValueError("retained forwards must cover exactly the captured graphs")
-        self.server_config = server_config
-        self.memory_report = memory_report
+        self.server_config = dict(server_config)
+        if self.tuned_bindings:
+            contract = dict(self.server_config["model_contract"])
+            contract["graphs"] = [dict(graph, tuned_bindings=[dict(buffer=value.buffer, tuning_graph=value.tuning_graph)
+                for value in self.tuned_bindings.get(graph["graph"], ())]) for graph in contract["graphs"]]
+            self.server_config["model_contract"] = contract
+        self.memory_report = memory_report if registry is None else {**memory_report, **registry.memory_report()}
         self.session = session
         self.package_data = package_data
         self.rebuild_weights = rebuild_weights
         self.forwards = None if forwards is None else MappingProxyType(dict(forwards))
+        self.benchmark_state = None if benchmark_state is None else MappingProxyType(dict(benchmark_state))
+        self.benchmark_pool = benchmark_pool
+        self.benchmark_requests = benchmark_requests
+        self.benchmark_rounds = None if benchmark_rounds is None else MappingProxyType(dict(benchmark_rounds))
         self.embedding_catalog = embedding_catalog
         self.embedding_tables = self._embedding_binding = None
         self._close_resources = tuple(close_resources)
@@ -132,7 +149,9 @@ class PreparedModel(PreparedExecution):
         self._resources = ()
         self._buffers = MappingProxyType({})
         self._graphs = MappingProxyType({})
+        self.serving_graphs = self.tuning_graphs = self.tuned_bindings = MappingProxyType({})
         self.forwards = None
+        self.benchmark_state = self.benchmark_pool = self.benchmark_requests = self.benchmark_rounds = None
         self.session = None
         self._close_resources = ()
         self.runtime = None

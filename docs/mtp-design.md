@@ -5,7 +5,7 @@ Flare's speculative engine supports the embedded MTP modules in
 `local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD`, and the DSpark drafter in
 `deepseek-ai/DeepSeek-V4.1-Flash` on SM120/121. Python prepares
 weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
-graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI4 token-vector completion contract.
+graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI5 token-vector completion contract.
 Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
 select the draft-token maximum and default verification policy.
 `flare run PACKAGE --history-drafts` augments Qwen's learned MTP proposals
@@ -145,6 +145,14 @@ The block begins with the pending target token and fills the remaining positions
 with the checkpoint's noise token. Sequential Markov logits condition each
 proposal on the preceding sampled token. The target and draft share token
 embeddings and the sharded vocabulary projection.
+
+Batch-one graphs with replicated BF16 Markov weights fuse transition scoring
+and full-vocabulary Gumbel proposals, retaining normalized FP32 proposal
+probabilities. Wider graphs, quantized or sharded transition weights, and
+selector-dependent proposals use the bounded sampler. These proposal
+distributions can produce different seeded text. Target verification applies
+the request's target policy and uses the retained distribution that generated
+each proposal.
 
 Verification with draft tokens stages sliding-window writes and pending compression
 state. Width one uses ordinary decode attention and direct target-cache writes;
@@ -363,7 +371,7 @@ contributes no tokens, RNG advancement, or cache updates to a queued round.
 Rust freezes request epochs, page reservations, and CPU query lengths or GPU
 prefix ceilings before submission. CUDA dependencies serialize model work and
 protect shared scratch independently of completion readback. Rust reserves each
-round's maximum page and output extent before submission. ABI4 uses two transfer
+round's maximum page and output extent before submission. ABI5 uses two transfer
 frames, each containing one 24-field `int64` record per prepared request slot.
 Each record contains request
 identity, token counters, terminal status, emitted/offered/accepted counts,
@@ -405,8 +413,10 @@ All chains use FlashInfer's rejection sampler: accept
 with `min(1, p(token)/q(token))`; on rejection, sample the normalized positive
 residual `max(p-q,0)`, or sample the target bonus distribution after full
 acceptance. `q` must be the distribution that actually generated the proposal.
-Temperature, penalties, grammar and top-k/top-p/min-p filtering must be reflected
-at each conditional prefix. A copied token has a point-mass proposal law:
+The target distribution reflects temperature, penalties, grammar and
+top-k/top-p/min-p filtering at each conditional prefix. The proposal may use a
+different filter when its retained `q` describes the actual draw. A copied token
+has a point-mass proposal law:
 `q(copy_token)=1`, with zero mass elsewhere. Copy substitutions use that law
 at every temperature, including when replacing a native MTP proposal.
 

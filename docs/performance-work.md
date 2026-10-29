@@ -12,6 +12,15 @@ and `--eager` execution, is for fault diagnosis only. Its preparation resources,
 cache backing, and loading lifecycle differ from package serving, so its timings
 cannot establish apples-to-apples serving performance.
 
+`ignition bench qwen3.8-27b` measures complete prepared speculative graph rounds
+for kernel and model iteration without export or HTTP. It uses real tokenized
+contexts, restores complete state outside CUDA event timing, and records raw
+samples by case and seed. Its score is the equal-weight arithmetic mean of
+per-case medians; lower is better. Keep GPU classes separate. The
+[benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines the default
+matrix and timed boundary. Graph latency does not establish serving throughput
+or comparative performance against another runtime.
+
 Before changing model or preparation code, read
 [model development](model-development.md) and
 [preparation development](preparation-development.md). Inspect fusion boundaries,

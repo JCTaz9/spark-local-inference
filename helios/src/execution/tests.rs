@@ -120,6 +120,39 @@ fn completion_wire_decodes_every_configured_lane() {
 use crate::cache::Fence;
 use crate::{Error, ExecutionError};
 
+#[test]
+fn collective_overview_uses_graph_geometry_and_individual_bindings() {
+    let mut value = manifest();
+    let mut packed = value.graphs[0].clone();
+    packed.name = "arbitrary-target-name".into();
+    packed.kind = GraphKind::Speculative;
+    packed.batch_capacity = 4;
+    packed.token_capacity = 6;
+    packed.packed_token_capacity = 16;
+    packed.draft_tokens = 5;
+    packed.tuned_bindings = vec![TunedBinding { buffer: "target-choice".into(), tuning_graph: "choose".into() }];
+    let mut mixed = packed.clone();
+    mixed.name = "arbitrary-mixed-name".into();
+    mixed.kind = GraphKind::Mixed;
+    mixed.token_capacity = 1;
+    mixed.packed_token_capacity = 0;
+    mixed.prefill_capacity = 128;
+    mixed.draft_tokens = 0;
+    mixed.tuned_bindings[0].buffer = "mixed-choice".into();
+    value.graphs[0].name = "arbitrary-decode-name".into();
+    value.graphs[0].tuned_bindings = packed.tuned_bindings.clone();
+    value.graphs.extend([packed, mixed]);
+    let choices = vec![vec![
+        ("target-choice".into(), 4u32.to_ne_bytes().to_vec()),
+        ("mixed-choice".into(), ((1u32 << 16) | 64).to_ne_bytes().to_vec()),
+    ]];
+    let text = super::transport::collective_choices_overview(&value, &choices);
+    assert!(text.contains("Mixed/unknown: 1 group\n"));
+    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Full (4 CTAs)\n"));
+    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Full (4 CTAs)\n"));
+    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Payload RSAG (64 CTAs)\n"));
+}
+
 pub(super) fn manifest() -> ExecutionManifest {
     let buffers = vec![
         BufferDescriptor {
@@ -155,7 +188,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             strides: vec![1],
         },
     ];
-    let graph = GraphDescriptor { confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+    let graph = GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
         name: "decode4".into(),
         kind: GraphKind::Decode,
         sampling_mode: SamplingMode::General,
@@ -182,7 +215,7 @@ pub(super) fn manifest() -> ExecutionManifest {
             },
         ],
     };
-    ExecutionManifest {
+    ExecutionManifest { tuning_graphs: vec![],
         engram: None,
         collectives: None,
         cache: None,
@@ -1175,4 +1208,47 @@ fn scheduler_width_one_round_has_no_proposal_work() {
 #[should_panic(expected = "completion serialization requires a token vector")]
 fn completion_serialization_rejects_missing_vector_storage() {
     CompletionRecord::default().fields();
+}
+
+pub(super) fn tuning_manifest() -> ExecutionManifest {
+    let mut value = manifest();
+    for (name, address, dtype, nbytes) in [
+        ("choice", 0x10000, Dtype::Int64, 8),
+        ("tuning_status", 0x10010, Dtype::Int32, 4),
+    ] {
+        value.buffers.push(BufferDescriptor { name: name.into(), address, dtype, nbytes,
+            shape: vec![1], strides: vec![1] });
+    }
+    value.tuning_graphs.push(TuningGraphDescriptor { name: "select".into(), handle: 0x90000,
+        outputs: vec!["choice".into()], status_buffer: "tuning_status".into() });
+    value.graphs[0].tuned_bindings.push(TunedBinding { buffer: "choice".into(), tuning_graph: "select".into() });
+    value
+}
+
+#[test]
+fn tuning_outputs_have_exact_producers_and_no_host_writers() {
+    let valid = tuning_manifest();
+    valid.validate().unwrap();
+    for mutation in 0..7 {
+        let mut value = valid.clone();
+        match mutation {
+            0 => value.graphs[0].tuned_bindings[0].tuning_graph = "missing".into(),
+            1 => value.graphs[0].tuned_bindings[0].buffer = "missing".into(),
+            2 => value.tuning_graphs[0].outputs.push("choice".into()),
+            3 => value.tuning_graphs[0].status_buffer = "choice".into(),
+            4 => value.tuning_graphs[0].outputs = vec!["frame_index".into()],
+            5 => value.tuning_graphs[0].handle = value.graphs[0].handle,
+            _ => { let duplicate = value.graphs[0].tuned_bindings[0].clone(); value.graphs[0].tuned_bindings.push(duplicate); },
+        }
+        assert!(value.validate().is_err(), "mutation {mutation}");
+    }
+}
+
+#[test]
+fn tuning_order_is_manifest_order_and_deduplicates_consumers() {
+    let mut value = tuning_manifest();
+    value.graphs.push(value.graphs[0].clone());
+    assert_eq!(value.referenced_tuning_graphs(), vec![0]);
+    value.graphs.iter_mut().for_each(|graph| graph.tuned_bindings.clear());
+    assert!(value.referenced_tuning_graphs().is_empty());
 }

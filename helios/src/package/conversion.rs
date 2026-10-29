@@ -2646,6 +2646,7 @@ fn rebuild_compatible(
                 s.history_drafts,
                 s.draft_head_quantization.clone(),
                 s.markov_head_quantization.clone(),
+                s.vocabulary_parallel_sampling,
             )
         })
     };
@@ -5215,7 +5216,7 @@ mod tests {
         }
         let rank = &authorized.verified().ranks()[0];
         assert_eq!(rank.resources.len(), before_ids.len());
-        for (resource, before_id) in rank.resources.iter().zip(before_ids) {
+        for (resource, _before_id) in rank.resources.iter().zip(before_ids) {
             let slice = resource.stored.as_ref().unwrap();
             let payloads = after
                 .payloads(&catalog, [slice.payload_id.as_slice()])
@@ -6379,7 +6380,7 @@ mod tests {
         let (source, _, _, _) = publish_split_owner_source(&scratch, &key, &publisher, true, false, false, false);
         let base = prepared_ranks(&source, 0).unwrap();
         let target = prepared_ranks(&source, 1).unwrap();
-        let reject = |mut target: PreparedRank| {
+        let reject = |target: PreparedRank| {
             let plan = plan_rank(&base[0], &target, &derivation::Limits::default()).unwrap();
             assert!(
                 plan.recipes.is_empty(),
@@ -6427,7 +6428,7 @@ mod tests {
             public_key,
             development: false,
         };
-        let (source, source_id, target_id, target) =
+        let (source, _source_id, target_id, target) =
             publish_split_owner_source(&scratch, &key, &publisher, true, false, false, false);
         let canonical = prepared_ranks(&source, 0).unwrap();
         let target_rank = prepared_ranks(&source, 1).unwrap();
@@ -7174,7 +7175,7 @@ mod tests {
         }
 
         let mut emissions = Vec::new();
-        for (rank, state) in [(0u32, b"state-2-0".to_vec()), (1u32, b"state-2-1".to_vec())] {
+        for (_rank, state) in [(0u32, b"state-2-0".to_vec()), (1u32, b"state-2-1".to_vec())] {
             let source = combined.clone();
             let recipe = derivation::Derivation {
                 target: PayloadId::of(&state),

@@ -211,7 +211,7 @@ fn prepare_packets_preserve_large_and_partial_uploads_on_both_transports() {
     manifest.graphs[0].input_bindings[2].nbytes = buffer.nbytes;
     manifest.input_frame_bytes = 16 + buffer.nbytes;
     manifest.validate().unwrap();
-    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 5);
+    assert_eq!(u64::from_le_bytes(layout(&manifest)[..8].try_into().unwrap()), 6);
     for (sender, receiver) in [crate::execution::rank_stream::test_pair().unwrap(),
                                (client.into(), server.into())] {
         let mut sender = Channel::new(sender).unwrap();
@@ -615,4 +615,24 @@ fn rank_commit_identity_rejects_truncation_and_trailing_bytes() {
     let mut trailing = bytes;
     trailing.push(0);
     assert!(read_identity(&trailing).is_err());
+}
+
+#[test]
+fn startup_tuning_rank_agreement_includes_producers_bindings_and_buffer_schemas() {
+    let value = super::super::tests::tuning_manifest();
+    let expected = layout(&value);
+    let mut moved = value.clone();
+    moved.tuning_graphs[0].handle += 32;
+    assert_eq!(layout(&moved), expected);
+    for mutation in 0..5 {
+        let mut peer = value.clone();
+        match mutation {
+            0 => peer.tuning_graphs[0].name.push('x'),
+            1 => peer.tuning_graphs[0].outputs[0].push('x'),
+            2 => peer.tuning_graphs[0].status_buffer.push('x'),
+            3 => peer.graphs[0].tuned_bindings[0].tuning_graph.push('x'),
+            _ => peer.buffers.last_mut().unwrap().dtype = super::super::Dtype::Float32,
+        }
+        assert_ne!(layout(&peer), expected, "mutation {mutation}");
+    }
 }

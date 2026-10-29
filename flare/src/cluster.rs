@@ -78,12 +78,14 @@ fn connected(transport: &RoceTransport) -> String {
 }
 
 /// The transport shape a rank was started with, as the ranks exchange it before planning routes.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn shape_record(shape: Shape) -> Vec<u8> {
     shape.name().as_bytes().to_vec()
 }
 
 /// Every rank must select the same shape: a chain rank plans no route to the far end that a ring
 /// rank would wait for.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 fn agree_shape(records: &[Vec<u8>], shape: Shape) -> Result<(), Failure> {
     let local = shape_record(shape);
     if let Some(rank) = records.iter().position(|record| *record != local) {
@@ -129,13 +131,14 @@ impl Membership {
 /// transport is connected.
 pub fn rank_zero(
     owner: &NativeModel,
-    mut streams: Vec<RankStream>,
+    streams: Vec<RankStream>,
     progress: &StartupProgress,
     shape: Shape,
 ) -> Result<Joined<Vec<RankStream>>, Failure> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         use flare_helios::execution::{rendezvous, roce_fabric};
+        let mut streams = streams;
 
         let phase = progress.phase("Connect RoCE transport", None);
         // Every rank learns every rank's devices and the shape, then plans the same routes from them.
@@ -171,13 +174,14 @@ pub fn rank_zero(
 pub fn peer(
     owner: &NativeModel,
     cluster: &ClusterRank,
-    mut stream: RankStream,
+    stream: RankStream,
     progress: &StartupProgress,
     shape: Shape,
 ) -> Result<Joined<RankStream>, Failure> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         use flare_helios::execution::{rendezvous, roce_fabric};
+        let mut stream = stream;
 
         let phase = progress.phase("Connect RoCE transport", None);
         let fabric = roce_fabric::discover()?;

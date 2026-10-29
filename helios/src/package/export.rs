@@ -780,26 +780,6 @@ fn write_primary(root: &Path, bytes: &[u8]) -> Result<(), crate::Error> {
     Ok(())
 }
 
-fn read_file(path: &Path, nbytes: u64) -> Result<Vec<u8>, crate::Error> {
-    let mut bytes = Vec::with_capacity(schema::size(nbytes)?);
-    File::open(path)
-        .map_err(|e| io("open payload", e))?
-        .read_to_end(&mut bytes)
-        .map_err(|e| io("read payload", e))?;
-    if bytes.len() as u64 != nbytes {
-        return Err(invalid("payload length disagrees with its declared size"));
-    }
-    Ok(bytes)
-}
-
-fn verify_payload(path: &Path, id: PayloadId, nbytes: u64) -> Result<PayloadId, crate::Error> {
-    let actual = hash_file(path, nbytes)?;
-    if actual != id {
-        return Err(invalid("payload bytes do not match the assigned identity"));
-    }
-    Ok(id)
-}
-
 fn hash_file(path: &Path, nbytes: u64) -> Result<PayloadId, crate::Error> {
     hash_reader(File::open(path).map_err(|e| io("open payload", e))?, nbytes)
 }
@@ -1913,7 +1893,7 @@ mod tests {
             id,
             tensor: None,
         };
-        let key = ring::signature::Ed25519KeyPair::from_pkcs8(
+        let _key = ring::signature::Ed25519KeyPair::from_pkcs8(
             ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
                 .unwrap()
                 .as_ref(),

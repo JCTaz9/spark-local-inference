@@ -12,7 +12,10 @@ use serde::Deserialize;
 use std::{ffi::c_void, path::PathBuf, thread, time::{Duration, Instant}};
 
 #[derive(Deserialize)]
-struct Expected { ranks: Vec<Rank>, preparation_processes: Vec<Process> }
+struct Expected {
+    ranks: Vec<Rank>, preparation_processes: Vec<Process>,
+    #[serde(default)] startup_tuning: bool,
+}
 #[derive(Deserialize)]
 struct Process { pid: u32, start_ticks: u64 }
 #[derive(Deserialize)]
@@ -66,6 +69,21 @@ fn buffer<'a>(manifest: &'a ExecutionManifest, name: &str) -> &'a BufferDescript
     manifest.buffers.iter().find(|buffer| buffer.name == name).expect("fixture buffer missing")
 }
 
+fn scalar(driver: &Driver, manifest: &ExecutionManifest, name: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    driver.select(manifest)?;
+    Ok(i32::from_ne_bytes(driver.read(buffer(manifest, name))?.try_into().unwrap()))
+}
+
+fn check_startup(driver: &Driver, manifests: &[ExecutionManifest]) -> Result<(), Box<dyn std::error::Error>> {
+    for manifest in manifests {
+        assert_eq!(scalar(driver, manifest, "startup-count")?, 1, "shared producer must run once");
+        assert_eq!(scalar(driver, manifest, "startup-selector")?, 3);
+        assert_eq!(scalar(driver, manifest, "startup-bias")?, 7);
+        assert_eq!(scalar(driver, manifest, "unused-count")?, 0, "unreferenced producer ran");
+    }
+    Ok(())
+}
+
 pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let expected: Expected = serde_json::from_slice(&std::fs::read(root.join("collective-expected.json"))?)?;
     assert_eq!(expected.ranks.len(), 4);
@@ -84,8 +102,43 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let manifests = owner.manifests()?;
     assert_eq!(manifests.len(), 4);
     let driver = Driver::new()?;
-    let workers = manifests.iter().map(|manifest| unsafe { ExecutionWorker::new(manifest.clone()) })
-        .collect::<Result<Vec<_>, _>>()?;
+    let fail_startup = std::env::args().any(|argument| argument == "--startup-failure");
+    let workers = if expected.startup_tuning {
+        for manifest in &manifests {
+            assert_eq!(scalar(&driver, manifest, "startup-count")?, 0);
+            assert_eq!(scalar(&driver, manifest, "startup-selector")?, 0);
+            assert_eq!(scalar(&driver, manifest, "startup-bias")?, 0);
+            assert_eq!(scalar(&driver, manifest, "startup-observed")?, 0);
+        }
+        if fail_startup {
+            driver.select(&manifests[1])?;
+            driver.write(buffer(&manifests[1], "startup-failure"), &17i32.to_ne_bytes())?;
+        }
+        let opened = unsafe { ExecutionWorker::new_threaded(manifests[0].clone(), manifests[1..].to_vec()) };
+        if fail_startup {
+            let error = match opened {
+                Ok(worker) => {
+                    assert!(worker.close().drained);
+                    return Err("startup accepted a failing rank".into());
+                }
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("status 17"), "{error}");
+            check_startup(&driver, &manifests)?;
+            for manifest in &manifests {
+                assert_eq!(scalar(&driver, manifest, "startup-observed")?, 0, "request graph ran before rejection");
+            }
+            println!("native startup tuning rejected failing rank before request readiness: {error}");
+            return Ok(());
+        }
+        let worker = opened?;
+        check_startup(&driver, &manifests)?;
+        vec![worker]
+    } else {
+        assert!(!fail_startup, "startup failure requires the startup fixture");
+        manifests.iter().map(|manifest| unsafe { ExecutionWorker::new(manifest.clone()) })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let baseline = allocations.count();
     for case in &expected.ranks[0].cases {
         let mut inputs = Vec::new();
@@ -98,6 +151,9 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             driver.write(buffer(manifest, &local.source), &input)?;
             let output = buffer(manifest, &local.output);
             driver.write(output, &vec![0xff; output.nbytes])?;
+            if expected.startup_tuning && matches!(case.graph.as_str(), "init" | "decode") {
+                driver.write(buffer(manifest, "startup-observed"), &(-99i32).to_ne_bytes())?;
+            }
             unsafe { Driver::check((driver.synchronize)())?; }
             inputs.push(input);
             graph_indices.push(manifest.graphs.iter().position(|graph| graph.name == local.graph).unwrap());
@@ -128,7 +184,12 @@ pub fn run(root: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(driver.read(buffer(manifest, &local.source))?, inputs[rank], "source mutated");
             assert_eq!(driver.read(buffer(manifest, &local.output))?, std::fs::read(root.join(&local.expected))?,
                 "rank {rank} output differs for {} step {}", local.graph, local.step);
+            if expected.startup_tuning && matches!(case.graph.as_str(), "init" | "decode") {
+                assert_eq!(scalar(&driver, manifest, "startup-observed")?, 40,
+                    "compiled consumer did not read both persistent startup outputs");
+            }
         }
+        if expected.startup_tuning { check_startup(&driver, &manifests)?; }
     }
     assert_eq!(allocations.count(), baseline, "CUDA allocation during native collective replay");
     for worker in &workers {

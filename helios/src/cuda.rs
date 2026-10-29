@@ -29,6 +29,8 @@ type StreamCreatePriority = unsafe extern "C" fn(*mut Handle, c_uint, c_int) -> 
 type PriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;
 type HostRegister = unsafe extern "C" fn(Handle, usize, c_uint) -> c_int;
 type HostUnregister = unsafe extern "C" fn(Handle) -> c_int;
+#[cfg(feature = "runtime-package")]
+type DeviceUuid = unsafe extern "C" fn(*mut [u8; 16], c_int) -> c_int;
 type DeviceAttribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int;
 type AddressReserve = unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> c_int;
 type AddressFree = unsafe extern "C" fn(u64, usize) -> c_int;
@@ -110,8 +112,6 @@ struct AccessDescriptor {
 const SOURCE_ORDER_STREAM: c_int = 1;
 /// `CU_MEMHOSTREGISTER_PORTABLE`: the registration is visible to every context.
 const HOST_REGISTER_PORTABLE: c_uint = 0x1;
-/// `CU_DEVICE_ATTRIBUTE_INTEGRATED`.
-const ATTRIBUTE_INTEGRATED: c_int = 18;
 /// `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`: the host NUMA node closest to the device, or -1.
 const ATTRIBUTE_HOST_NUMA_ID: c_int = 134;
 /// `CU_MEM_ALLOCATION_TYPE_PINNED`.
@@ -166,6 +166,8 @@ struct Driver {
     host_register: HostRegister,
     host_unregister: HostUnregister,
     device_attribute: DeviceAttribute,
+    #[cfg(feature = "runtime-package")]
+    device_uuid: DeviceUuid,
     event_synchronize: StreamOperation,
     memcpy_batch: MemcpyBatch,
     address_reserve: AddressReserve,
@@ -228,6 +230,8 @@ impl Driver {
                 host_register: symbol!("cuMemHostRegister_v2"),
                 host_unregister: symbol!("cuMemHostUnregister"),
                 device_attribute: symbol!("cuDeviceGetAttribute"),
+                #[cfg(feature = "runtime-package")]
+                device_uuid: symbol!("cuDeviceGetUuid"),
                 event_synchronize: symbol!("cuEventSynchronize"),
                 memcpy_batch: symbol!("cuMemcpyBatchAsync_v2"),
                 address_reserve: symbol!("cuMemAddressReserve"),
@@ -291,20 +295,16 @@ pub fn current_context() -> Result<(usize, i32)> {
     Driver::load()?.current()
 }
 
-/// Whether the device owning `context` shares physical memory with the host.
-pub(crate) fn device_integrated(context: usize) -> Result<bool> {
+/// The UUID of the device with this ordinal, which names the GPU across restarts.
+#[cfg(feature = "runtime-package")]
+pub(crate) fn device_uuid(device: i32) -> Result<[u8; 16]> {
     let driver = Driver::load()?;
-    // SAFETY: The context handle was produced by the driver and outlives this call.
-    driver.check("cuCtxSetCurrent", unsafe {
-        (driver.set_context)(context as Handle)
+    let mut uuid = [0u8; 16];
+    // SAFETY: `uuid` is a valid 16-byte output for the call.
+    driver.check("cuDeviceGetUuid", unsafe {
+        (driver.device_uuid)(&mut uuid, device)
     })?;
-    let (_, device) = driver.current()?;
-    let mut value = 0;
-    // SAFETY: `value` is a valid output pointer and `device` came from the current context.
-    driver.check("cuDeviceGetAttribute", unsafe {
-        (driver.device_attribute)(&mut value, ATTRIBUTE_INTEGRATED, device)
-    })?;
-    Ok(value != 0)
+    Ok(uuid)
 }
 
 /// Page-locked registration of process memory, released on drop.
@@ -312,13 +312,16 @@ pub(crate) struct HostRegistration {
     driver: Arc<Driver>,
     address: usize,
     device_address: u64,
+    #[cfg(all(test, feature = "runtime-package"))]
     nbytes: usize,
 }
 
 impl HostRegistration {
+    #[cfg(all(test, feature = "runtime-package"))]
     pub(crate) fn address(&self) -> usize {
         self.address
     }
+    #[cfg(all(test, feature = "runtime-package"))]
     pub(crate) fn nbytes(&self) -> usize {
         self.nbytes
     }
@@ -371,6 +374,7 @@ pub(crate) unsafe fn register_host(
         driver,
         address,
         device_address: 0,
+        #[cfg(all(test, feature = "runtime-package"))]
         nbytes,
     };
     // SAFETY: The context is still current, the range is registered and live,
@@ -1026,6 +1030,7 @@ mod tests {
 
     /// Scattered entries: device offsets ascend with odd gaps while host
     /// offsets descend, so neither side is contiguous or aligned.
+    #[cfg(feature = "runtime-package")]
     fn scattered_entries(capacity: usize) -> Vec<(usize, usize, usize)> {
         let sizes: Vec<usize> = (0..220)
             .map(|i| match i % 50 {
@@ -1057,11 +1062,13 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "runtime-package")]
     fn pattern(offset: usize) -> u8 {
         ((offset * 7) ^ (offset >> 9)) as u8
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "runtime-package")]
     fn thread_cpu_time() -> std::time::Duration {
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -1078,6 +1085,7 @@ mod tests {
     /// Read a patterned file with `O_DIRECT` into the registered mapping and
     /// compare. Returns `false` when the directory refuses direct I/O.
     #[cfg(unix)]
+    #[cfg(feature = "runtime-package")]
     fn direct_read_matches(host: *mut u8, capacity: usize) -> bool {
         use std::os::unix::ffi::OsStrExt;
         const FILE_BYTES: usize = 4 << 20;

@@ -37,6 +37,20 @@ def stage_windows(history, values, output, metadata, *, counts=None, first_posit
     output.view(rows, capacity, *values.shape[1:]).copy_(staged)
 
 
+def commit_window(history, values, row, start, length):
+    """Retain the final window with token positions selecting their circular slots."""
+    offsets = torch.arange(history.shape[1], device=values.device)
+    end = start + length
+    positions = end - 1 - (end - 1 - offsets).remainder(history.shape[1])
+    current = values[(positions - start).clamp(0, values.shape[0] - 1)]
+    rows = row.expand_as(offsets)
+    previous = history[rows, offsets].to(values.dtype)
+    committed = torch.where(((positions >= start) & (positions < end))[:, None, None], current, previous)
+    if history.dtype == torch.float8_e4m3fn:
+        committed = committed.clamp(-448, 448)
+    history[rows, offsets] = committed.to(history.dtype)
+
+
 @dataclass(frozen=True)
 class Query:
     operands: tuple

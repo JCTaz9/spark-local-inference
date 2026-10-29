@@ -1361,7 +1361,7 @@ mod native_prompt_tests {
     #[test]
     fn prompt_only_completions_and_chat_zero_limit_follow_endpoint_rules() {
         let (frontend, compiler, mut config) = native(PromptEncoder::DeepseekV41);
-        config.contract.graphs.push(crate::model::contract::GraphContract {
+        config.contract.graphs.push(crate::model::contract::GraphContract { tuned_bindings: vec![],
             graph: "score".into(), kind: crate::model::contract::GraphOperation::ScoredPrefill,
             inputs: vec![], state: vec![], state_rows_per_request: 1,
             draft_cursor: None, embedding_tables: vec![], pending_token: None,

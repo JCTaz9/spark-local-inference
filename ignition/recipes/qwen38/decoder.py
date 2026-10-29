@@ -14,7 +14,7 @@ from ignition.preparation.host_memory import device_memory_info
 from ignition.preparation.qwen38 import TEXT_PREFIX
 from ignition.preparation.scratch import ScratchArena
 
-from .hyperconnection import packed_down_projection
+from .hyperconnection import packed_down_projection, hyperconnection_extents
 from .model import create_model_tree
 from .moe import QwenMoeWeights
 from .vision import VisionWeights
@@ -46,7 +46,8 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest: CheckpointManifest, device: torch.device,
              *, progress: Callable[[str], None] | None = None,
-             shard: TensorParallelShard = TensorParallelShard(0, 1)) -> ModelWeights:
+             shard: TensorParallelShard = TensorParallelShard(0, 1),
+             shard_hyperconnections: bool = False) -> ModelWeights:
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("model weights require a CUDA device")
@@ -72,7 +73,9 @@ class ModelWeights:
                 names = ("hc_norm", "input_mix_weight_down", "input_mix_weight_up")
                 if tree.get_submodule(prefix).block_inject_weight is not None:
                     names += ("block_inject_weight",)
-                parameters(tuple(f"{prefix}.{name}.weight" for name in names))
+                extents = hyperconnection_extents(shard, shard_hyperconnections)
+                parameters(tuple(f"{prefix}.{name}.weight" for name in names),
+                           tuple(extents.get(f"{name}.weight") for name in names))
                 packed_down_projection(tree.get_submodule(prefix))
 
             parameters((f"{TEXT_PREFIX}.embed_tokens.weight", "lm_head.weight"),
@@ -139,7 +142,8 @@ class DecoderScratch:
     local_logits: torch.Tensor | None = None
 
     @classmethod
-    def allocate(cls, tokens: int, device, *, sample_rows: int = 4, world_size: int = 1, buffers=None):
+    def allocate(cls, tokens: int, device, *, sample_rows: int = 4, world_size: int = 1, buffers=None,
+                 hyperconnection_lowrank: int = 320):
         if type(tokens) is not int or tokens <= 0:
             raise ValueError("decoder token capacity must be a positive integer")
         if type(sample_rows) is not int or sample_rows <= 0:
@@ -161,7 +165,8 @@ class DecoderScratch:
         embedding, residual, hidden = zeros(tokens, 2560), zeros(tokens, 10240), zeros(tokens, 2560)
         sample_hidden, logits = zeros(sample_rows, 2560), zeros(sample_rows, 248320)
         local_logits = zeros(sample_rows, 248320 // world_size) if world_size > 1 else None
-        block_input, block_output, projected = zeros(tokens, 2560), zeros(tokens, 2560), zeros(tokens, 336)
+        block_input, block_output = zeros(tokens, 2560), zeros(tokens, 2560)
+        projected = zeros(tokens, (hyperconnection_lowrank + 4 + 15) // 16 * 16)
         stages = [buffers.fork() for _ in range(5)]
         # Reserve PLE's wide buffers before other stages divide the shared chunks.
         ple = PLEScratch.allocate(tokens, device, buffers=stages[2])
@@ -170,7 +175,7 @@ class DecoderScratch:
         moe = QwenMoeScratch.allocate(tokens, device, intermediate=640 // world_size,
                                     buffers=stages[3], output=block_output)
         hc = HyperconnectionScratch.allocate(tokens, device, buffers=stages[4],
-                                            projected=projected, block_input=block_input)
+                                            projected=projected, block_input=block_input, lowrank=hyperconnection_lowrank)
         buffers.join(*stages)
         return cls(embedding, residual, hidden, sample_hidden, logits, hc, gdn, qsa, ple, moe, local_logits)
 
@@ -245,9 +250,11 @@ class PreparedDecoder:
         for index, (module, layer_weights) in enumerate(zip(language.layers, weights.layers, strict=True)):
             prefix = f"{name}.layer{index}"
             attn_hc = PreparedHyperconnection(module.attn_hyper_connection, scratch.hyperconnection,
-                priming_state=scratch.residual, session=session, name=f"{prefix}.attn_hc")
+                priming_state=scratch.residual, session=session, name=f"{prefix}.attn_hc",
+                runtime=runtime, coordinator=coordinator)
             mlp_hc = PreparedHyperconnection(module.mlp_hyper_connection, scratch.hyperconnection,
-                priming_state=scratch.residual, session=session, name=f"{prefix}.mlp_hc")
+                priming_state=scratch.residual, session=session, name=f"{prefix}.mlp_hc",
+                runtime=runtime, coordinator=coordinator)
             if index % 4 == 3:
                 attention = PreparedAttention(module.self_attn, layer_weights.attention, source,
                     scratch.qsa, qsa_states[index], state.qsa, rotary, session=session, name=f"{prefix}.qsa",
@@ -280,7 +287,7 @@ class PreparedDecoder:
             partitions=getattr(state, "ple_partitions", None), runtime=runtime, coordinator=coordinator)
         self.final_mixer = PreparedHyperconnection(language.hyper_connection_mixer,
             replace(scratch.hyperconnection, block_input=scratch.hidden), priming_state=scratch.residual,
-            session=session, name=f"{name}.final_mixer")
+            session=session, name=f"{name}.final_mixer", runtime=runtime, coordinator=coordinator)
         for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=scratch.residual,
                 session=session, name=f"{name}.layer{index}.attn_combine_norm")

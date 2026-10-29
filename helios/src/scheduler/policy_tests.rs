@@ -1735,7 +1735,7 @@ fn mixed_engine(
             .unwrap();
     }
     for &(batch, width, prefill, nanos) in shapes {
-        graphs.push(crate::execution::GraphDescriptor { confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
+        graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0, draft_tokens: 0, packed_token_capacity: 0,
             name: format!("mixed-{batch}-{prefill}-{width}"),
             kind: GraphKind::Mixed,
             sampling_mode: SamplingMode::General,
@@ -3168,7 +3168,7 @@ fn joined_round_engine(allocation: crate::execution::PrefixAllocation) -> Reques
     let mut scheduler = engine(2, true);
     let mut graphs = super::tests::duration_graphs(2);
     graphs.iter_mut().for_each(|graph| graph.estimated_duration_ns = 10 * MS);
-    let graph = crate::execution::GraphDescriptor {
+    let graph = crate::execution::GraphDescriptor { tuned_bindings: vec![],
         confidence_width: if allocation == crate::execution::PrefixAllocation::Gpu { 7 } else { 0 },
         name: "speculative-b2-d7-w8-p5".into(),
         kind: GraphKind::Speculative, sampling_mode: SamplingMode::General,
@@ -3287,7 +3287,7 @@ fn funded_acceptance_probe_compares_offered_prefixes_across_equal_width_budgets(
     let mut graphs = super::tests::duration_graphs(2);
     graphs.iter_mut().for_each(|graph| graph.estimated_duration_ns = 10 * MS);
     for (packed, duration) in [(4, MS), (7, 13 * MS / 10)] {
-        graphs.push(crate::execution::GraphDescriptor { confidence_width: 0,
+        graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
             name: format!("speculative-b2-d7-w8-p{packed}"), kind: GraphKind::Speculative,
             sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
             batch_capacity: 2, token_capacity: 8, packed_token_capacity: packed,
@@ -3425,7 +3425,7 @@ fn registered_ragged_graphs_preserve_physical_width_above_average_row_budget() {
             let mut graphs = super::tests::duration_graphs(batch);
             graphs.retain(|graph| graph.kind != GraphKind::Speculative || graph.token_capacity == 1);
             for graph in &mut graphs { graph.estimated_duration_ns = 10 * MS; }
-            graphs.push(crate::execution::GraphDescriptor {
+            graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![],
                 name: format!("speculative-b{batch}-d7-w8-p{packed}"),
                 kind: GraphKind::Speculative, sampling_mode: SamplingMode::General,
                 confidence_width: if allocation == PrefixAllocation::Gpu { 7 } else { 0 },
@@ -3480,7 +3480,7 @@ fn fixed_host_round_engine(batch: usize, packed: usize) -> RequestScheduler {
     scheduler.fixed_speculative_width(Some(8)).unwrap();
     let mut graphs = super::tests::duration_graphs(4);
     for graph in &mut graphs { graph.estimated_duration_ns = 10 * MS; }
-    graphs.push(crate::execution::GraphDescriptor { confidence_width: 0,
+    graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 0,
         name: format!("speculative-b{batch}-d7-w8-p{packed}"), kind: GraphKind::Speculative,
         sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
         batch_capacity: batch, token_capacity: 8, packed_token_capacity: packed,
@@ -3565,7 +3565,7 @@ fn mixed_tail_planning_cpu_measurement() {
         let mut graphs = super::tests::duration_graphs(active);
         graphs.retain(|graph| graph.kind != GraphKind::Speculative || graph.token_capacity == 1);
         for &(batch, packed) in &shapes {
-            graphs.push(crate::execution::GraphDescriptor { confidence_width: if mode == "adaptive_gpu" { 7 } else { 0 },
+            graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: if mode == "adaptive_gpu" { 7 } else { 0 },
                 name: format!("speculative-b{batch}-d7-w8-p{packed}"), kind: GraphKind::Speculative,
                 sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
                 batch_capacity: batch, token_capacity: 8, packed_token_capacity: packed,
@@ -3694,7 +3694,7 @@ fn single_lane_packed_engine(page_tokens: usize) -> RequestScheduler {
     scheduler.enable_speculation(&[1, 8]).unwrap();
     let mut graphs = super::tests::duration_graphs(1);
     for graph in &mut graphs { graph.estimated_duration_ns = 10 * MS; }
-    graphs.push(crate::execution::GraphDescriptor { confidence_width: 7,
+    graphs.push(crate::execution::GraphDescriptor { tuned_bindings: vec![], confidence_width: 7,
         name: "speculative-b1-d7-w8-p3".into(), kind: GraphKind::Speculative,
         sampling_mode: SamplingMode::General, draft_tokens: 7, handle: 1,
         batch_capacity: 1, token_capacity: 8, packed_token_capacity: 3,

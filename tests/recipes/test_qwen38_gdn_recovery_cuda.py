@@ -107,7 +107,10 @@ def _recurrence(case, state, records):
     return gated.view_as(case["expected"])
 
 
-@pytest.mark.parametrize(("lengths", "accepted"), [((4,), (3,)), ((6, 6, 0, 6), (1, 6, 0, 2)), ((5, 2), (5, 1))])
+@pytest.mark.parametrize(("lengths", "accepted"), [
+    ((4,), (3,)), ((6, 6, 0, 6), (1, 6, 0, 2)), ((5, 2), (5, 1)),
+    *[((8,), (accepted,)) for accepted in range(1, 9)],
+])
 def test_recorded_verification_and_commit_match_checkpointing_decode(lengths, accepted):
     from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
 

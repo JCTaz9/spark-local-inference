@@ -71,6 +71,7 @@ impl CompiledTemplate {
     }
 
     #[cfg(test)]
+    #[cfg_attr(test, allow(dead_code))]
     pub fn bytecode_bytes(&self) -> usize {
         self.code.len() * std::mem::size_of::<Instruction>()
     }
